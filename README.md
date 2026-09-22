@@ -16,6 +16,11 @@ own device key instead of the shared device token, and keys are shown once at
 creation. Agent file downloads are restricted to an allowed path root (home by
 default) instead of allowing arbitrary paths.
 
+Device-to-device forwarding is direct-first: agents use WebRTC/ICE with STUN
+to establish a peer-to-peer DataChannel, then automatically fall back to the
+server relay if no direct path is found after 5 seconds. This keeps VPS
+bandwidth low while still working behind restrictive NATs.
+
 The design intentionally borrows ideas from mature open-source projects:
 MeshCentral-style web remote management, RustDesk-style lightweight outbound
 agents, and Tailscale-style "device identity plus relay" thinking. The code is

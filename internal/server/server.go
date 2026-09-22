@@ -30,9 +30,11 @@ type Config struct {
 }
 
 type agentConn struct {
-	deviceID string
-	ws       *websocket.Conn
-	writeMu  sync.Mutex
+	deviceID   string
+	publicIP   string
+	directPort int
+	ws         *websocket.Conn
+	writeMu    sync.Mutex
 }
 
 type termSession struct {
@@ -44,6 +46,13 @@ type fileSession struct {
 	deviceID string
 	browser  *websocket.Conn
 	op       string
+}
+
+type forwardSession struct {
+	source string
+	target string
+	direct bool
+	timer  *time.Timer
 }
 
 type sessionEntry struct {
@@ -71,6 +80,7 @@ type Server struct {
 	sessionsMu    sync.RWMutex
 	terms         map[string]*termSession
 	files         map[string]*fileSession
+	forwards      map[string]*forwardSession
 	sessions      map[string]sessionEntry
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
@@ -96,6 +106,7 @@ func NewServer(cfg Config) (*Server, error) {
 		agents:        make(map[string]*agentConn),
 		terms:         make(map[string]*termSession),
 		files:         make(map[string]*fileSession),
+		forwards:      make(map[string]*forwardSession),
 		sessions:      make(map[string]sessionEntry),
 		loginAttempts: make(map[string]loginAttempt),
 	}, nil
@@ -118,6 +129,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/ws/file", s.handleFileWS)
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
+}
+
+// Close releases server-owned resources.
+func (s *Server) Close() error {
+	return s.reg.Close()
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

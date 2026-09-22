@@ -23,6 +23,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
@@ -130,6 +131,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -236,6 +238,7 @@ func TestLoginRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -269,6 +272,7 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -305,6 +309,180 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 	_ = statsResp.Body.Close()
 	if statsResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 after logout, got %d", statsResp.StatusCode)
+	}
+}
+
+func TestDeviceToDeviceForwardRelay(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken:  "admin-token",
+		DeviceToken: "device-token",
+		DataDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	dialAgent := func(deviceID string) *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ws.WriteJSON(protocol.Message{
+			Type:     protocol.TypeHello,
+			DeviceID: deviceID,
+			Name:     deviceID,
+			Hostname: deviceID,
+			OS:       "linux",
+			Arch:     "amd64",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return ws
+	}
+
+	agentA := dialAgent("dev-a")
+	defer agentA.Close()
+	agentB := dialAgent("dev-b")
+	defer agentB.Close()
+
+	if err := agentA.WriteJSON(protocol.Message{
+		Type:      protocol.TypeForwardConnect,
+		SessionID: "s1",
+		Target:    "dev-b",
+		Port:      22,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var connectB protocol.Message
+	if err := agentB.ReadJSON(&connectB); err != nil {
+		t.Fatal(err)
+	}
+	if connectB.Type != protocol.TypeForwardConnect || connectB.SessionID != "s1" || connectB.Port != 22 {
+		t.Fatalf("unexpected connect for target: %+v", connectB)
+	}
+
+	if err := agentB.WriteJSON(protocol.Message{Type: protocol.TypeForwardOpen, SessionID: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	var openA protocol.Message
+	if err := agentA.ReadJSON(&openA); err != nil {
+		t.Fatal(err)
+	}
+	if openA.Type != protocol.TypeForwardOpen {
+		t.Fatalf("expected forward:open, got %+v", openA)
+	}
+
+	if err := agentA.WriteJSON(protocol.Message{
+		Type:      protocol.TypeForwardData,
+		SessionID: "s1",
+		Data:      protocol.EncodeData([]byte("ping")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var dataB protocol.Message
+	if err := agentB.ReadJSON(&dataB); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := protocol.DecodeData(dataB.Data)
+	if dataB.Type != protocol.TypeForwardData || string(raw) != "ping" {
+		t.Fatalf("unexpected data at target: %+v", dataB)
+	}
+
+	if err := agentB.WriteJSON(protocol.Message{
+		Type:      protocol.TypeForwardData,
+		SessionID: "s1",
+		Data:      protocol.EncodeData([]byte("pong")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var dataA protocol.Message
+	if err := agentA.ReadJSON(&dataA); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = protocol.DecodeData(dataA.Data)
+	if dataA.Type != protocol.TypeForwardData || string(raw) != "pong" {
+		t.Fatalf("unexpected data at source: %+v", dataA)
+	}
+
+	if err := agentA.WriteJSON(protocol.Message{Type: protocol.TypeForwardClose, SessionID: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	var closeB protocol.Message
+	if err := agentB.ReadJSON(&closeB); err != nil {
+		t.Fatal(err)
+	}
+	if closeB.Type != protocol.TypeForwardClose {
+		t.Fatalf("expected forward:close, got %+v", closeB)
+	}
+}
+
+func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken:  "admin-token",
+		DeviceToken: "device-token",
+		DataDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	dialAgent := func(deviceID string) *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ws.WriteJSON(protocol.Message{
+			Type:     protocol.TypeHello,
+			DeviceID: deviceID,
+			Name:     deviceID,
+			Hostname: deviceID,
+			OS:       "linux",
+			Arch:     "amd64",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return ws
+	}
+
+	agentA := dialAgent("dev-a")
+	defer agentA.Close()
+	agentB := dialAgent("dev-b")
+	defer agentB.Close()
+
+	if err := agentA.WriteJSON(protocol.Message{
+		Type:      protocol.TypeForwardConnect,
+		SessionID: "s-direct",
+		Target:    "dev-b",
+		Port:      22,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		srv.sessionsMu.RLock()
+		_, ok := srv.forwards["s-direct"]
+		srv.sessionsMu.RUnlock()
+		return ok
+	})
+
+	if err := agentB.WriteJSON(protocol.Message{Type: protocol.TypeForwardDirectOK, SessionID: "s-direct"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The direct-ok must cancel the relay fallback: no forward:connect should
+	// reach the target within the timeout window.
+	_ = agentB.SetReadDeadline(time.Now().Add(directAttemptTimeout + 2*time.Second))
+	var unexpected protocol.Message
+	if err := agentB.ReadJSON(&unexpected); err == nil {
+		t.Fatalf("relay fallback should be cancelled after direct-ok, got %+v", unexpected)
 	}
 }
 

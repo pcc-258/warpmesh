@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -17,30 +18,82 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 
 	"github.com/pcc-258/pylon/internal/protocol"
 )
 
 // Config configures a device agent.
 type Config struct {
-	ServerURL  string
-	Token      string
-	DeviceID   string
-	Name       string
-	Shell      string
-	DataDir    string
-	Insecure   bool
-	AllowPaths []string
+	ServerURL   string
+	Token       string
+	DeviceID    string
+	Name        string
+	Shell       string
+	DataDir     string
+	Insecure    bool
+	AllowPaths  []string
+	Forwards    []ForwardSpec
+	STUNServers []string
+}
+
+// ForwardSpec exposes a local TCP listener that reaches a port on another
+// device, direct-first with server relay fallback.
+type ForwardSpec struct {
+	LocalPort      int
+	TargetDeviceID string
+	TargetPort     int
+}
+
+type forwardConn struct {
+	mu     sync.Mutex
+	conn   net.Conn
+	closed bool
+}
+
+func (f *forwardConn) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, net.ErrClosed
+	}
+	return f.conn.Read(p)
+}
+
+func (f *forwardConn) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, net.ErrClosed
+	}
+	return f.conn.Write(p)
+}
+
+func (f *forwardConn) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+	return f.conn.Close()
 }
 
 // Agent maintains one control connection to the relay server.
 type Agent struct {
-	cfg      Config
-	sessions map[string]*TermSession
-	uploads  map[string]*os.File
-	mu       sync.Mutex
-	ws       *websocket.Conn
-	writeMu  sync.Mutex
+	cfg            Config
+	sessions       map[string]*TermSession
+	uploads        map[string]*os.File
+	forwards       map[string]*forwardConn
+	forwardPending map[string]chan protocol.Message
+	directPending  map[string]chan struct{}
+	peerConns      map[string]*webrtc.PeerConnection
+	dataChannels   map[string]*webrtc.DataChannel
+	localConns     map[string]net.Conn
+	pendingData    map[string][][]byte
+	mu             sync.Mutex
+	ws             *websocket.Conn
+	writeMu        sync.Mutex
 }
 
 // New creates an agent and ensures a stable device identity.
@@ -68,11 +121,23 @@ func New(cfg Config) (*Agent, error) {
 			cfg.AllowPaths = []string{home}
 		}
 	}
-	return &Agent{
-		cfg:      cfg,
-		sessions: make(map[string]*TermSession),
-		uploads:  make(map[string]*os.File),
-	}, nil
+	if len(cfg.STUNServers) == 0 {
+		cfg.STUNServers = []string{"stun:stun.l.google.com:19302"}
+	}
+	a := &Agent{
+		cfg:            cfg,
+		sessions:       make(map[string]*TermSession),
+		uploads:        make(map[string]*os.File),
+		forwards:       make(map[string]*forwardConn),
+		forwardPending: make(map[string]chan protocol.Message),
+		directPending:  make(map[string]chan struct{}),
+		peerConns:      make(map[string]*webrtc.PeerConnection),
+		dataChannels:   make(map[string]*webrtc.DataChannel),
+		localConns:     make(map[string]net.Conn),
+		pendingData:    make(map[string][][]byte),
+	}
+	a.startForwardListeners()
+	return a, nil
 }
 
 // Run connects and reconnects until the process exits.
@@ -162,21 +227,9 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		a.mu.Unlock()
 		return nil
 	case protocol.TypeTermInput:
-		a.mu.Lock()
-		session := a.sessions[msg.SessionID]
-		a.mu.Unlock()
-		if session == nil {
-			return nil
-		}
-		return session.Input(msg.Data)
+		return a.writeSession(msg.SessionID, func(s *TermSession) error { return s.Input(msg.Data) })
 	case protocol.TypeTermResize:
-		a.mu.Lock()
-		session := a.sessions[msg.SessionID]
-		a.mu.Unlock()
-		if session == nil {
-			return nil
-		}
-		return session.Resize(msg.Cols, msg.Rows)
+		return a.writeSession(msg.SessionID, func(s *TermSession) error { return s.Resize(msg.Cols, msg.Rows) })
 	case protocol.TypeTermStop:
 		a.mu.Lock()
 		session := a.sessions[msg.SessionID]
@@ -220,7 +273,205 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		return f.Close()
 	case protocol.TypeFileDownload:
 		return a.streamFile(msg)
+	case protocol.TypeForwardConnect:
+		return a.handleForwardTarget(msg)
+	case protocol.TypeForwardOffer:
+		go a.handleDirectOffer(msg)
+		return nil
+	case protocol.TypeForwardAnswer:
+		a.handleDirectAnswer(msg)
+		return nil
+	case protocol.TypeForwardICE:
+		a.handleDirectICE(msg)
+		return nil
+	case protocol.TypeForwardDirectOK:
+		return nil
+	case protocol.TypeForwardOpen, protocol.TypeForwardError:
+		a.mu.Lock()
+		pending := a.forwardPending[msg.SessionID]
+		a.mu.Unlock()
+		if pending != nil {
+			pending <- msg
+		}
+		return nil
+	case protocol.TypeForwardData:
+		raw, err := protocol.DecodeData(msg.Data)
+		if err != nil {
+			return err
+		}
+		a.mu.Lock()
+		fc := a.forwards[msg.SessionID]
+		a.mu.Unlock()
+		if fc != nil {
+			_, _ = fc.Write(raw)
+		}
+		return nil
+	case protocol.TypeForwardClose:
+		a.mu.Lock()
+		fc := a.forwards[msg.SessionID]
+		delete(a.forwards, msg.SessionID)
+		a.mu.Unlock()
+		if fc != nil {
+			_ = fc.Close()
+		}
+		return nil
 	}
+	return nil
+}
+
+func (a *Agent) writeSession(sessionID string, fn func(*TermSession) error) error {
+	a.mu.Lock()
+	session := a.sessions[sessionID]
+	a.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	return fn(session)
+}
+
+func (a *Agent) startForwardListeners() {
+	for _, spec := range a.cfg.Forwards {
+		go a.serveForwardListener(spec)
+	}
+}
+
+func (a *Agent) serveForwardListener(spec ForwardSpec) {
+	addr := fmt.Sprintf("127.0.0.1:%d", spec.LocalPort)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("forward listener %s failed: %v", addr, err)
+		return
+	}
+	log.Printf("forward %s -> %s:%d", addr, spec.TargetDeviceID, spec.TargetPort)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go a.handleForwardClient(conn, spec)
+	}
+}
+
+func (a *Agent) handleForwardClient(conn net.Conn, spec ForwardSpec) {
+	sessionID := newSessionID()
+	relayReady := make(chan protocol.Message, 2)
+	directReady := make(chan struct{}, 1)
+	a.mu.Lock()
+	a.forwardPending[sessionID] = relayReady
+	a.directPending[sessionID] = directReady
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.forwardPending, sessionID)
+		delete(a.directPending, sessionID)
+		a.mu.Unlock()
+	}()
+
+	if err := a.send(protocol.Message{
+		Type:      protocol.TypeForwardConnect,
+		SessionID: sessionID,
+		Target:    spec.TargetDeviceID,
+		Port:      spec.TargetPort,
+	}); err != nil {
+		_ = conn.Close()
+		return
+	}
+	// Direct path uses WebRTC ICE; the server stays on standby to fall back.
+	if err := a.startDirectOffer(sessionID, spec.TargetPort); err != nil {
+		log.Printf("forward %s: direct offer failed, waiting for relay: %v", sessionID, err)
+	}
+
+	select {
+	case msg := <-relayReady:
+		if msg.Type == protocol.TypeForwardError || msg.Type == protocol.TypeForwardClose {
+			_ = conn.Close()
+			return
+		}
+	case <-directReady:
+		a.mu.Lock()
+		dc := a.dataChannels[sessionID]
+		a.localConns[sessionID] = conn
+		a.mu.Unlock()
+		if dc == nil {
+			_ = conn.Close()
+			return
+		}
+		a.copyLocalToChannel(sessionID, conn, dc)
+		return
+	case <-time.After(10 * time.Second):
+		_ = conn.Close()
+		return
+	}
+
+	fc := &forwardConn{conn: conn}
+	a.mu.Lock()
+	a.forwards[sessionID] = fc
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.forwards, sessionID)
+		a.mu.Unlock()
+		_ = fc.Close()
+	}()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			if serr := a.send(protocol.Message{
+				Type:      protocol.TypeForwardData,
+				SessionID: sessionID,
+				Data:      protocol.EncodeData(buf[:n]),
+			}); serr != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = a.send(protocol.Message{Type: protocol.TypeForwardClose, SessionID: sessionID})
+}
+
+func (a *Agent) handleForwardTarget(msg protocol.Message) error {
+	if msg.SessionID == "" || msg.Port <= 0 {
+		return a.send(protocol.Message{Type: protocol.TypeForwardError, SessionID: msg.SessionID, Error: "invalid forward request"})
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", msg.Port), 5*time.Second)
+	if err != nil {
+		return a.send(protocol.Message{Type: protocol.TypeForwardError, SessionID: msg.SessionID, Error: err.Error()})
+	}
+	fc := &forwardConn{conn: conn}
+	a.mu.Lock()
+	a.forwards[msg.SessionID] = fc
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.forwards, msg.SessionID)
+		a.mu.Unlock()
+		_ = fc.Close()
+	}()
+
+	if err := a.send(protocol.Message{Type: protocol.TypeForwardOpen, SessionID: msg.SessionID}); err != nil {
+		return err
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			if serr := a.send(protocol.Message{
+				Type:      protocol.TypeForwardData,
+				SessionID: msg.SessionID,
+				Data:      protocol.EncodeData(buf[:n]),
+			}); serr != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	_ = a.send(protocol.Message{Type: protocol.TypeForwardClose, SessionID: msg.SessionID})
 	return nil
 }
 
@@ -274,9 +525,15 @@ func (a *Agent) pathAllowed(path string) bool {
 }
 
 func (a *Agent) send(v any) error {
+	a.mu.Lock()
+	ws := a.ws
+	a.mu.Unlock()
+	if ws == nil {
+		return net.ErrClosed
+	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
-	return a.ws.WriteJSON(v)
+	return ws.WriteJSON(v)
 }
 
 func (a *Agent) cleanupSessions() {
@@ -290,6 +547,39 @@ func (a *Agent) cleanupSessions() {
 		_ = f.Close()
 		delete(a.uploads, id)
 	}
+	for id, fc := range a.forwards {
+		_ = fc.Close()
+		delete(a.forwards, id)
+	}
+	for id, pc := range a.peerConns {
+		_ = pc.Close()
+		delete(a.peerConns, id)
+	}
+	for id, dc := range a.dataChannels {
+		_ = dc.Close()
+		delete(a.dataChannels, id)
+	}
+	for id, conn := range a.localConns {
+		_ = conn.Close()
+		delete(a.localConns, id)
+	}
+	for id := range a.pendingData {
+		delete(a.pendingData, id)
+	}
+	for id := range a.forwardPending {
+		delete(a.forwardPending, id)
+	}
+	for id := range a.directPending {
+		delete(a.directPending, id)
+	}
+}
+
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
 }
 
 func loadOrCreateID(cfg Config) (string, error) {

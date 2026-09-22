@@ -39,7 +39,10 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.reg.RecordAudit(hello.DeviceID, "agent.online", hello.DeviceID, hello.OS+"/"+hello.Arch)
 
-	conn := &agentConn{deviceID: hello.DeviceID, ws: ws}
+	conn := &agentConn{deviceID: hello.DeviceID, ws: ws, directPort: hello.DirectPort}
+	if host, _, err := net.SplitHostPort(ws.RemoteAddr().String()); err == nil {
+		conn.publicIP = host
+	}
 	s.agentsMu.Lock()
 	old := s.agents[hello.DeviceID]
 	s.agents[hello.DeviceID] = conn
@@ -77,6 +80,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 	close(done)
 	s.removeAgent(hello.DeviceID)
+	s.closeAgentForwards(hello.DeviceID)
 	_ = s.reg.RecordAudit(hello.DeviceID, "agent.offline", hello.DeviceID, "")
 	s.logf("agent offline: %s", hello.DeviceID)
 }
@@ -123,6 +127,13 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 			s.sessionsMu.Unlock()
 			_ = sess.browser.Close()
 		}
+	case protocol.TypeForwardConnect:
+		s.handleForwardConnect(deviceID, msg)
+	case protocol.TypeForwardDirectOK:
+		s.handleDirectOK(deviceID, msg)
+	case protocol.TypeForwardOpen, protocol.TypeForwardData, protocol.TypeForwardClose, protocol.TypeForwardError,
+		protocol.TypeForwardOffer, protocol.TypeForwardAnswer, protocol.TypeForwardICE:
+		s.relayForward(deviceID, msg)
 	}
 }
 

@@ -56,11 +56,11 @@ func main() {
 	case *domain != "":
 		runAutomaticHTTPS(handler, *domain, *acmeEmail, *dataDir, *httpsListen, *httpListen, *adminToken)
 	case *tlsCert != "" && *tlsKey != "":
-		log.Printf("device relay serving HTTPS on %s", *httpsListen)
+		log.Printf("pylon serving HTTPS on %s", *httpsListen)
 		httpSrv := &http.Server{Addr: *httpsListen, Handler: handler}
 		log.Fatal(httpSrv.ListenAndServeTLS(*tlsCert, *tlsKey))
 	default:
-		log.Printf("device relay serving HTTP on %s (enable -domain or -tls-cert/-tls-key for HTTPS)", *listen)
+		log.Printf("pylon serving HTTP on %s (enable -domain or -tls-cert/-tls-key for HTTPS)", *listen)
 		log.Printf("web ui: http://%s/ (admin token: %s)", displayHost(*listen), *adminToken)
 		httpSrv := &http.Server{Addr: *listen, Handler: handler}
 		log.Fatal(httpSrv.ListenAndServe())
@@ -93,7 +93,7 @@ func runAutomaticHTTPS(handler http.Handler, domain, acmeEmail, dataDir, httpsLi
 		log.Fatal(challengeSrv.ListenAndServe())
 	}()
 
-	log.Printf("device relay serving HTTPS on %s for %s", httpsListen, domain)
+	log.Printf("pylon serving HTTPS on %s for %s", httpsListen, domain)
 	log.Printf("web ui: https://%s/ (admin token: %s)", domain, adminToken)
 	log.Fatal(httpsSrv.ListenAndServeTLS("", ""))
 }

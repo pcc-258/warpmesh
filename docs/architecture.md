@@ -225,7 +225,46 @@ sequenceDiagram
 The agent rejects paths outside its configured roots (home directory by
 default), so a compromised web session cannot read arbitrary server files.
 
-## 9. Data Model
+## 9. Device-to-Device Forwarding
+
+Agents can expose a local TCP listener that reaches a port on another device.
+The direct path uses WebRTC/ICE with STUN: agents exchange SDP and ICE
+candidates through the server, then try to establish a peer-to-peer
+DataChannel. If no direct path is found in 5 seconds, the server falls back to
+relaying through itself. This keeps VPS bandwidth usage low while still
+guaranteeing connectivity through restrictive NATs.
+
+```mermaid
+sequenceDiagram
+    participant A as Agent A (source)
+    participant S as Relay Server
+    participant B as Agent B (target)
+
+    A->>S: forward:connect {target, port, directPort}
+    A->>S: forward:offer (SDP)
+    S->>B: forward:offer (SDP)
+    B->>S: forward:answer (SDP)
+    S->>A: forward:answer (SDP)
+    par direct attempt
+        A->>B: WebRTC ICE + DataChannel
+        B-->>A: DataChannel open
+    end
+    A-->>S: forward:direct-ok
+    B-->>S: forward:direct-ok
+    Note over A,B: data flows directly, VPS only coordinated setup
+
+    opt direct attempt times out
+        S->>B: forward:connect {port}
+        B-->>S: forward:open
+        Note over A,B: data flows through server relay
+    end
+```
+
+The implementation is built on pion/webrtc, the mature Go WebRTC stack also
+used by many production remote-control products. Symmetric NATs that cannot be
+traversed without TURN automatically fall back to the server relay.
+
+## 10. Data Model
 
 ```mermaid
 erDiagram
@@ -267,7 +306,7 @@ erDiagram
 Operator sessions are kept in server memory with a 24-hour expiry. Everything
 else is persisted in `devices.db`.
 
-## 10. Protocol
+## 11. Protocol
 
 All control traffic is JSON over WebSocket. The envelope is:
 
@@ -290,10 +329,15 @@ All control traffic is JSON over WebSocket. The envelope is:
 | `terminal:stop` / `terminal:exit` | both | end a session |
 | `file:upload:start` | server -> agent | begin upload |
 | `file:chunk` | both | base64 payload |
+| `forward:connect` | source agent -> server, server -> target | begin device-to-device forwarding |
+| `forward:offer` / `forward:answer` | both | WebRTC SDP signaling through the server |
+| `forward:ice` | both | WebRTC ICE candidate exchange |
+| `forward:direct-ok` | agent -> server | direct connection established |
+| `forward:open` / `forward:data` / `forward:close` | both | relayed device-to-device stream |
 | `file:upload:done` / `file:done` / `file:error` | both | finish or fail |
 | `file:download` | server -> agent | read a device path |
 
-## 11. Security Properties
+## 12. Security Properties
 
 - Operator and device credentials are separated.
 - Device tokens are stored as SHA-256 hashes and shown once at creation.
@@ -307,7 +351,7 @@ All control traffic is JSON over WebSocket. The envelope is:
   reverse proxy.
 - Default deployment does not expose plain HTTP beyond localhost.
 
-## 12. Directory Layout
+## 13. Directory Layout
 
 ```text
 cmd/server/            server entrypoint (HTTP, HTTPS/ACME)
@@ -319,9 +363,9 @@ web/                   React + TypeScript console (embedded into server)
 docs/architecture.md   this document
 ```
 
-## 13. Extension Points
+## 14. Extension Points
 
-- Device-to-device TCP port forwarding through the relay.
+- UDP-based hole punching for symmetric NAT support.
 - Remote desktop via an agent-side screen streaming endpoint.
 - User roles and per-device access policies.
 - Power actions (reboot, shutdown) and agent updates.
