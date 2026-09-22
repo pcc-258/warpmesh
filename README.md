@@ -47,6 +47,38 @@ ADMIN_TOKEN=admin DEVICE_TOKEN=device ./bin/devicerelay-server -listen :8080
 For a public server, put a TLS terminator in front (Caddy, Nginx) or pass
 `-tls-cert` and `-tls-key` to the server, then agents use `wss://`.
 
+## HTTPS
+
+Three options, from easiest to most manual:
+
+1. Automatic Let's Encrypt. Point a domain at the server, open TCP 80 and 443,
+   then run:
+
+   ```bash
+   ./bin/devicerelay-server \
+     -domain relay.example.com \
+     -acme-email you@example.com \
+     -data-dir ./data
+   ```
+
+   The server obtains and renews certificates automatically, the web UI is
+   `https://relay.example.com`, and agents connect with
+   `wss://relay.example.com/ws/agent`.
+
+2. Bring your own certificate:
+
+   ```bash
+   ./bin/devicerelay-server \
+     -tls-cert fullchain.pem -tls-key privkey.pem \
+     -https-listen :443 -http-listen :80
+   ```
+
+3. Reverse proxy (Caddy or Nginx) in front of the server on `:8080`. The server
+   itself stays plain HTTP on localhost and the proxy terminates TLS.
+
+Use `DEVICE_RELAY_DOMAIN` / `DEVICE_RELAY_ACME_EMAIL` environment variables for
+the same automatic mode.
+
 ## Protocol
 
 All control messages are JSON over WebSocket:
