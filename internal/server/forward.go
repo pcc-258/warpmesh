@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pcc-258/pylon/internal/protocol"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 const directAttemptTimeout = 5 * time.Second

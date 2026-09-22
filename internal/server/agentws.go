@@ -7,7 +7,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/pcc-258/pylon/internal/protocol"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {

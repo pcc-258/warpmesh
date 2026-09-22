@@ -20,7 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 
-	"github.com/pcc-258/pylon/internal/protocol"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 // Config configures a device agent.

@@ -1,6 +1,6 @@
-# Pylon Architecture
+# WarpMesh Architecture
 
-Pylon is a self-hosted control plane for a fleet of devices behind NAT.
+WarpMesh is a self-hosted control plane for a fleet of devices behind NAT.
 It combines a Linux relay server, outbound device agents and a browser-based
 management console. This document describes the design so the project can be
 understood, extended and audited without reading every source file.
@@ -34,8 +34,8 @@ The three binaries are:
 
 | Binary | Platform | Responsibility |
 | --- | --- | --- |
-| `pylon-server` | Linux | HTTP API, WebSocket relay, static web UI, SQLite persistence, Let's Encrypt |
-| `pylon-agent` | Windows / macOS / Linux | Outbound registration, heartbeat, PTY/ConPTY terminal, file transfer |
+| `warpmesh-server` | Linux | HTTP API, WebSocket relay, static web UI, SQLite persistence, Let's Encrypt |
+| `warpmesh-agent` | Windows / macOS / Linux | Outbound registration, heartbeat, PTY/ConPTY terminal, file transfer |
 | Web UI | embedded into server | Dashboard, device management, terminal, file transfer, device keys |
 
 ## 3. Deployment
@@ -48,7 +48,7 @@ flowchart TB
     end
     subgraph VPS["Relay VPS (Linux)"]
         Caddy[Optional Caddy / Nginx<br/>or built-in autocert]
-        Server[pylon-server]
+        Server[warpmesh-server]
         SQLite[(devices.db)]
         Certs[(/data/certs)]
     end
@@ -75,10 +75,10 @@ flowchart TB
 Recommended deployment:
 
 ```bash
-./bin/pylon-server \
+./bin/warpmesh-server \
   -domain relay.example.com \
   -acme-email you@example.com \
-  -data-dir /var/lib/pylon
+  -data-dir /var/lib/warpmesh
 ```
 
 TCP 80 and 443 must be open. The server redirects HTTP to HTTPS and
@@ -268,7 +268,7 @@ traversed without TURN automatically fall back to the server relay.
 
 Remote desktop does not reimplement screen capture or encoding. The managed
 device runs a VNC server bound to localhost (TigerVNC, TightVNC or similar),
-the Pylon agent bridges that VNC port into a dedicated WebSocket, and the web
+the WarpMesh agent bridges that VNC port into a dedicated WebSocket, and the web
 console embeds noVNC. The operator only needs a browser.
 
 ```mermaid

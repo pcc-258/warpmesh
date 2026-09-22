@@ -11,7 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/pcc-258/pylon/internal/protocol"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 func TestTerminalRelay(t *testing.T) {
@@ -43,6 +43,10 @@ func TestTerminalRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, func() bool {
+		dev, ok := srv.reg.Get("dev-1")
+		return ok && dev.Online
+	})
 
 	waitFor(t, func() bool {
 		resp, err := http.Get(ts.URL + "/api/health")
@@ -72,10 +76,7 @@ func TestTerminalRelay(t *testing.T) {
 	}
 	defer browserWS.Close()
 
-	var start protocol.Message
-	if err := agentWS.ReadJSON(&start); err != nil {
-		t.Fatal(err)
-	}
+	start := readAgentMessage(t, agentWS)
 	if start.Type != protocol.TypeTermStart || start.SessionID == "" || start.Cols != 80 {
 		t.Fatalf("unexpected start message: %+v", start)
 	}
@@ -100,10 +101,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeTermInput, Data: "ls\r"}); err != nil {
 		t.Fatal(err)
 	}
-	var input protocol.Message
-	if err := agentWS.ReadJSON(&input); err != nil {
-		t.Fatal(err)
-	}
+	input := readAgentMessage(t, agentWS)
 	if input.Type != protocol.TypeTermInput || input.Data != "ls\r" {
 		t.Fatalf("unexpected input message: %+v", input)
 	}
@@ -358,10 +356,7 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var connectB protocol.Message
-	if err := agentB.ReadJSON(&connectB); err != nil {
-		t.Fatal(err)
-	}
+	connectB := readAgentMessage(t, agentB)
 	if connectB.Type != protocol.TypeForwardConnect || connectB.SessionID != "s1" || connectB.Port != 22 {
 		t.Fatalf("unexpected connect for target: %+v", connectB)
 	}
@@ -369,10 +364,7 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	if err := agentB.WriteJSON(protocol.Message{Type: protocol.TypeForwardOpen, SessionID: "s1"}); err != nil {
 		t.Fatal(err)
 	}
-	var openA protocol.Message
-	if err := agentA.ReadJSON(&openA); err != nil {
-		t.Fatal(err)
-	}
+	openA := readAgentMessage(t, agentA)
 	if openA.Type != protocol.TypeForwardOpen {
 		t.Fatalf("expected forward:open, got %+v", openA)
 	}
@@ -384,10 +376,7 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var dataB protocol.Message
-	if err := agentB.ReadJSON(&dataB); err != nil {
-		t.Fatal(err)
-	}
+	dataB := readAgentMessage(t, agentB)
 	raw, _ := protocol.DecodeData(dataB.Data)
 	if dataB.Type != protocol.TypeForwardData || string(raw) != "ping" {
 		t.Fatalf("unexpected data at target: %+v", dataB)
@@ -400,10 +389,7 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var dataA protocol.Message
-	if err := agentA.ReadJSON(&dataA); err != nil {
-		t.Fatal(err)
-	}
+	dataA := readAgentMessage(t, agentA)
 	raw, _ = protocol.DecodeData(dataA.Data)
 	if dataA.Type != protocol.TypeForwardData || string(raw) != "pong" {
 		t.Fatalf("unexpected data at source: %+v", dataA)
@@ -412,10 +398,7 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	if err := agentA.WriteJSON(protocol.Message{Type: protocol.TypeForwardClose, SessionID: "s1"}); err != nil {
 		t.Fatal(err)
 	}
-	var closeB protocol.Message
-	if err := agentB.ReadJSON(&closeB); err != nil {
-		t.Fatal(err)
-	}
+	closeB := readAgentMessage(t, agentB)
 	if closeB.Type != protocol.TypeForwardClose {
 		t.Fatalf("expected forward:close, got %+v", closeB)
 	}
@@ -480,8 +463,15 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	// The direct-ok must cancel the relay fallback: no forward:connect should
 	// reach the target within the timeout window.
 	_ = agentB.SetReadDeadline(time.Now().Add(directAttemptTimeout + 2*time.Second))
-	var unexpected protocol.Message
-	if err := agentB.ReadJSON(&unexpected); err == nil {
+	for {
+		var unexpected protocol.Message
+		err := agentB.ReadJSON(&unexpected)
+		if err != nil {
+			break
+		}
+		if unexpected.Type == protocol.TypePing {
+			continue
+		}
 		t.Fatalf("relay fallback should be cancelled after direct-ok, got %+v", unexpected)
 	}
 }
@@ -515,6 +505,10 @@ func TestScreenRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, func() bool {
+		dev, ok := srv.reg.Get("dev-s")
+		return ok && dev.Online
+	})
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/screen?token=admin-token&device=dev-s", nil,
@@ -524,10 +518,7 @@ func TestScreenRelay(t *testing.T) {
 	}
 	defer browserWS.Close()
 
-	var start protocol.Message
-	if err := agentWS.ReadJSON(&start); err != nil {
-		t.Fatal(err)
-	}
+	start := readAgentMessage(t, agentWS)
 	if start.Type != protocol.TypeScreenStart || start.SessionID == "" {
 		t.Fatalf("unexpected screen start: %+v", start)
 	}
@@ -567,4 +558,17 @@ func waitFor(t *testing.T, fn func() bool) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("condition not met in time")
+}
+
+func readAgentMessage(t *testing.T, ws *websocket.Conn) protocol.Message {
+	t.Helper()
+	for {
+		var msg protocol.Message
+		if err := ws.ReadJSON(&msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type != protocol.TypePing {
+			return msg
+		}
+	}
 }

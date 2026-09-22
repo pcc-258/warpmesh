@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 
-	"github.com/pcc-258/pylon/internal/protocol"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {

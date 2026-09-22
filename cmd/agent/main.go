@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pcc-258/pylon/internal/agent"
+	"github.com/pcc-258/warpmesh/internal/agent"
 )
 
 func main() {

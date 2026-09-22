@@ -1,4 +1,4 @@
-module github.com/pcc-258/pylon
+module github.com/pcc-258/warpmesh
 
 go 1.26.0
 

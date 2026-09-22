@@ -1,6 +1,6 @@
-# Pylon
+# WarpMesh
 
-Pylon is a self-hosted control plane for devices behind NAT. Agents
+WarpMesh is a self-hosted control plane for devices behind NAT. Agents
 connect outbound to one relay server, the server keeps a device catalog, and a
 web console provides remote terminals, file transfer and device management.
 The server and agent are single Go binaries; the web UI is a React single-page
@@ -63,10 +63,10 @@ make cross
 Outputs:
 
 ```text
-bin/pylon-server-linux-amd64
-bin/pylon-agent-linux-amd64
-bin/pylon-agent-windows-amd64.exe
-bin/pylon-agent-darwin-arm64
+bin/warpmesh-server-linux-amd64
+bin/warpmesh-agent-linux-amd64
+bin/warpmesh-agent-windows-amd64.exe
+bin/warpmesh-agent-darwin-arm64
 ```
 
 Windows terminals are backed by Windows ConPTY, so interactive `cmd.exe` and
@@ -78,10 +78,10 @@ PowerShell sessions work the same as Unix PTY sessions.
 make build
 
 # Terminal 1: server
-ADMIN_TOKEN=admin DEVICE_TOKEN=device ./bin/pylon-server -listen :8080
+ADMIN_TOKEN=admin DEVICE_TOKEN=device ./bin/warpmesh-server -listen :8080
 
 # Terminal 2: agent on a device
-./bin/pylon-agent -server ws://127.0.0.1:8080/ws/agent \
+./bin/warpmesh-agent -server ws://127.0.0.1:8080/ws/agent \
   -token device -name home-pc
 
 # Open http://127.0.0.1:8080 and sign in with the admin token.
@@ -104,7 +104,7 @@ Three options, from easiest to most manual:
    then run:
 
    ```bash
-   ./bin/pylon-server \
+   ./bin/warpmesh-server \
      -domain relay.example.com \
      -acme-email you@example.com \
      -data-dir ./data
@@ -117,7 +117,7 @@ Three options, from easiest to most manual:
 2. Bring your own certificate:
 
    ```bash
-   ./bin/pylon-server \
+   ./bin/warpmesh-server \
      -tls-cert fullchain.pem -tls-key privkey.pem \
      -https-listen :443 -http-listen :80
    ```

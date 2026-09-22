@@ -10,7 +10,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
-	"github.com/pcc-258/pylon/internal/protocol"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 // startDirectOffer creates the WebRTC offer side for a forward session.
@@ -29,7 +29,7 @@ func (a *Agent) startDirectOffer(sessionID string, servicePort int) error {
 		}
 		a.sendICE(sessionID, c)
 	})
-	dc, err := pc.CreateDataChannel("pylon", nil)
+	dc, err := pc.CreateDataChannel("warpmesh", nil)
 	if err != nil {
 		return err
 	}
