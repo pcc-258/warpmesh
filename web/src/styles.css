@@ -556,6 +556,10 @@ input:focus {
   height: 100%;
 }
 
+.desktop-page {
+  height: 100%;
+}
+
 .terminal-title {
   gap: 8px;
   color: var(--muted);
@@ -574,6 +578,33 @@ input:focus {
   border-radius: 8px;
   padding: 12px;
   overflow: hidden;
+}
+
+.desktop-host {
+  flex: 1;
+  min-height: 0;
+  padding: 16px;
+}
+
+.desktop-canvas {
+  height: 100%;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.desktop-canvas canvas {
+  display: block;
+}
+
+.screen-status {
+  color: var(--amber);
+  font-size: 13px;
+}
+
+.screen-status.ok {
+  color: var(--green);
 }
 
 .files-content {

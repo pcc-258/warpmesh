@@ -8,6 +8,7 @@ import {
   KeyRound,
   Layers,
   LogOut,
+  Monitor,
   MonitorSmartphone,
   Pencil,
   RefreshCw,
@@ -43,6 +44,7 @@ import {
 type View =
   | { name: "dashboard" }
   | { name: "terminal"; device: Device }
+  | { name: "desktop"; device: Device }
   | { name: "files"; device: Device };
 
 export default function App() {
@@ -55,6 +57,10 @@ export default function App() {
 
   if (view.name === "terminal") {
     return <TerminalView device={view.device} onBack={() => setView({ name: "dashboard" })} />;
+  }
+
+  if (view.name === "desktop") {
+    return <DesktopView device={view.device} onBack={() => setView({ name: "dashboard" })} />;
   }
 
   if (view.name === "files") {
@@ -73,6 +79,7 @@ export default function App() {
         setTokenState("");
       }}
       onTerminal={(d) => setView({ name: "terminal", device: d })}
+      onDesktop={(d) => setView({ name: "desktop", device: d })}
       onFiles={(d) => setView({ name: "files", device: d })}
     />
   );
@@ -132,10 +139,12 @@ function Login({ onLogin }: { onLogin: () => void }) {
 function Dashboard({
   onLogout,
   onTerminal,
+  onDesktop,
   onFiles,
 }: {
   onLogout: () => void;
   onTerminal: (d: Device) => void;
+  onDesktop: (d: Device) => void;
   onFiles: (d: Device) => void;
 }) {
   const [devices, setDevices] = useState<Device[]>([]);
@@ -332,6 +341,10 @@ function Dashboard({
                   )}
                 </div>
                 <div className="device-actions">
+                  <button className="action-btn" disabled={!device.online} onClick={() => onDesktop(device)}>
+                    <Monitor size={15} />
+                    Desktop
+                  </button>
                   <button className="action-btn" disabled={!device.online} onClick={() => onTerminal(device)}>
                     <TerminalSquare size={15} />
                     Terminal
@@ -499,6 +512,62 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
       </header>
       <main className="terminal-host">
         <div ref={hostRef} className="terminal" />
+      </main>
+    </div>
+  );
+}
+
+function DesktopView({ device, onBack }: { device: Device; onBack: () => void }) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const rfbRef = useRef<{ disconnect: () => void } | null>(null);
+  const [status, setStatus] = useState("connecting");
+
+  useEffect(() => {
+    let disposed = false;
+    const connect = async () => {
+      try {
+        const RFB = (await import("@novnc/novnc")).default;
+        const url = wsUrl("/ws/screen", { token: getToken(), device: device.id });
+        const rfb = new RFB(hostRef.current!, url, { credentials: { password: "" } });
+        rfbRef.current = rfb;
+        rfb.scaleViewport = true;
+        rfb.resizeSession = false;
+        rfb.addEventListener("connect", () => !disposed && setStatus("connected"));
+        rfb.addEventListener("disconnect", () => !disposed && setStatus("disconnected"));
+        rfb.addEventListener("credentialsrequired", () => {
+          const password = prompt("VNC password (leave empty if not set)") || "";
+          rfb.sendCredentials({ password });
+        });
+        rfb.addEventListener("securityfailure", (event: CustomEvent) => {
+          const reason = (event.detail as { reason?: string })?.reason || "authentication failed";
+          if (!disposed) setStatus(reason);
+        });
+      } catch (err) {
+        if (!disposed) setStatus(String(err));
+      }
+    };
+    connect();
+    return () => {
+      disposed = true;
+      rfbRef.current?.disconnect();
+    };
+  }, [device.id]);
+
+  return (
+    <div className="app-shell desktop-page">
+      <header className="topbar">
+        <button className="back-btn" onClick={onBack}>
+          <ArrowLeft size={16} />
+          Back
+        </button>
+        <div className="terminal-title">
+          <Monitor size={16} />
+          {device.name} - remote desktop
+        </div>
+        <div className={`screen-status ${status === "connected" ? "ok" : ""}`}>{status}</div>
+      </header>
+      <main className="desktop-host">
+        <div ref={hostRef} className="desktop-canvas" />
       </main>
     </div>
   );

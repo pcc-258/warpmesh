@@ -22,6 +22,7 @@ func main() {
 	allowPaths := flag.String("allow-paths", os.Getenv("DEVICE_RELAY_ALLOW_PATHS"), "comma-separated download path roots, defaults to home")
 	forwardList := flag.String("forward", os.Getenv("DEVICE_RELAY_FORWARD"), "comma-separated localPort:targetDeviceId:targetPort forwards")
 	stunList := flag.String("stun", os.Getenv("DEVICE_RELAY_STUN"), "comma-separated STUN server URLs for direct connections")
+	vncPort := flag.Int("vnc-port", envInt("DEVICE_RELAY_VNC_PORT", 5900), "local VNC server port used for remote desktop")
 	flag.Parse()
 
 	var paths []string
@@ -51,6 +52,7 @@ func main() {
 		AllowPaths:  paths,
 		Forwards:    forwards,
 		STUNServers: stunServers,
+		VNCPort:     *vncPort,
 	})
 	if err != nil {
 		log.Fatalf("create agent: %v", err)
@@ -97,6 +99,15 @@ func splitComma(s string) []string {
 		parts[i] = strings.TrimSpace(parts[i])
 	}
 	return parts
+}
+
+func envInt(key string, def int) int {
+	if raw := os.Getenv(key); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func envOr(key, def string) string {

@@ -264,7 +264,30 @@ The implementation is built on pion/webrtc, the mature Go WebRTC stack also
 used by many production remote-control products. Symmetric NATs that cannot be
 traversed without TURN automatically fall back to the server relay.
 
-## 10. Data Model
+## 10. Remote Desktop
+
+Remote desktop does not reimplement screen capture or encoding. The managed
+device runs a VNC server bound to localhost (TigerVNC, TightVNC or similar),
+the Pylon agent bridges that VNC port into a dedicated WebSocket, and the web
+console embeds noVNC. The operator only needs a browser.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser (noVNC)
+    participant S as Relay Server
+    participant A as Device Agent
+    participant V as VNC Server (localhost)
+
+    B->>S: WSS /ws/screen?device=...
+    S->>A: screen:start
+    A->>S: WSS /ws/screen-link (data plane)
+    A->>V: TCP 127.0.0.1:5900
+    Note over B,S,A,V: binary RFB frames relayed end to end
+```
+
+The agent defaults to port 5900 and can be changed with `-vnc-port`.
+
+## 11. Data Model
 
 ```mermaid
 erDiagram
@@ -306,7 +329,7 @@ erDiagram
 Operator sessions are kept in server memory with a 24-hour expiry. Everything
 else is persisted in `devices.db`.
 
-## 11. Protocol
+## 12. Protocol
 
 All control traffic is JSON over WebSocket. The envelope is:
 
@@ -332,12 +355,14 @@ All control traffic is JSON over WebSocket. The envelope is:
 | `forward:connect` | source agent -> server, server -> target | begin device-to-device forwarding |
 | `forward:offer` / `forward:answer` | both | WebRTC SDP signaling through the server |
 | `forward:ice` | both | WebRTC ICE candidate exchange |
+| `screen:start` | server -> agent | open the remote desktop data link |
+| `screen:error` | agent -> server | remote desktop setup failed |
 | `forward:direct-ok` | agent -> server | direct connection established |
 | `forward:open` / `forward:data` / `forward:close` | both | relayed device-to-device stream |
 | `file:upload:done` / `file:done` / `file:error` | both | finish or fail |
 | `file:download` | server -> agent | read a device path |
 
-## 12. Security Properties
+## 13. Security Properties
 
 - Operator and device credentials are separated.
 - Device tokens are stored as SHA-256 hashes and shown once at creation.
@@ -351,7 +376,7 @@ All control traffic is JSON over WebSocket. The envelope is:
   reverse proxy.
 - Default deployment does not expose plain HTTP beyond localhost.
 
-## 13. Directory Layout
+## 14. Directory Layout
 
 ```text
 cmd/server/            server entrypoint (HTTP, HTTPS/ACME)
@@ -363,7 +388,7 @@ web/                   React + TypeScript console (embedded into server)
 docs/architecture.md   this document
 ```
 
-## 14. Extension Points
+## 15. Extension Points
 
 - UDP-based hole punching for symmetric NAT support.
 - Remote desktop via an agent-side screen streaming endpoint.

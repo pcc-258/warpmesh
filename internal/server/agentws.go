@@ -81,6 +81,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	close(done)
 	s.removeAgent(hello.DeviceID)
 	s.closeAgentForwards(hello.DeviceID)
+	s.closeAgentScreens(hello.DeviceID)
 	_ = s.reg.RecordAudit(hello.DeviceID, "agent.offline", hello.DeviceID, "")
 	s.logf("agent offline: %s", hello.DeviceID)
 }
@@ -134,6 +135,13 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 	case protocol.TypeForwardOpen, protocol.TypeForwardData, protocol.TypeForwardClose, protocol.TypeForwardError,
 		protocol.TypeForwardOffer, protocol.TypeForwardAnswer, protocol.TypeForwardICE:
 		s.relayForward(deviceID, msg)
+	case protocol.TypeScreenError:
+		s.sessionsMu.RLock()
+		sess := s.screens[msg.SessionID]
+		s.sessionsMu.RUnlock()
+		if sess != nil && sess.deviceID == deviceID {
+			_ = sess.browser.WriteJSON(msg)
+		}
 	}
 }
 

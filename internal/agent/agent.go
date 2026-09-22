@@ -35,6 +35,7 @@ type Config struct {
 	AllowPaths  []string
 	Forwards    []ForwardSpec
 	STUNServers []string
+	VNCPort     int
 }
 
 // ForwardSpec exposes a local TCP listener that reaches a port on another
@@ -123,6 +124,9 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if len(cfg.STUNServers) == 0 {
 		cfg.STUNServers = []string{"stun:stun.l.google.com:19302"}
+	}
+	if cfg.VNCPort == 0 {
+		cfg.VNCPort = 5900
 	}
 	a := &Agent{
 		cfg:            cfg,
@@ -285,6 +289,9 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		a.handleDirectICE(msg)
 		return nil
 	case protocol.TypeForwardDirectOK:
+		return nil
+	case protocol.TypeScreenStart:
+		go a.startScreenLink(msg.SessionID)
 		return nil
 	case protocol.TypeForwardOpen, protocol.TypeForwardError:
 		a.mu.Lock()

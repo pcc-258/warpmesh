@@ -486,6 +486,77 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	}
 }
 
+func TestScreenRelay(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken:  "admin-token",
+		DeviceToken: "device-token",
+		DataDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentWS.Close()
+	if err := agentWS.WriteJSON(protocol.Message{
+		Type:     protocol.TypeHello,
+		DeviceID: "dev-s",
+		Name:     "screen box",
+		Hostname: "screen-box",
+		OS:       "windows",
+		Arch:     "amd64",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	browserWS, _, err := websocket.DefaultDialer.Dial(
+		baseWS+"/ws/screen?token=admin-token&device=dev-s", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browserWS.Close()
+
+	var start protocol.Message
+	if err := agentWS.ReadJSON(&start); err != nil {
+		t.Fatal(err)
+	}
+	if start.Type != protocol.TypeScreenStart || start.SessionID == "" {
+		t.Fatalf("unexpected screen start: %+v", start)
+	}
+
+	linkWS, _, err := websocket.DefaultDialer.Dial(
+		baseWS+"/ws/screen-link?token=device-token&device=dev-s&session="+start.SessionID, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer linkWS.Close()
+
+	if err := browserWS.WriteMessage(websocket.BinaryMessage, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	mt, data, err := linkWS.ReadMessage()
+	if err != nil || mt != websocket.BinaryMessage || string(data) != "abc" {
+		t.Fatalf("expected relayed abc, got mt=%d data=%q err=%v", mt, data, err)
+	}
+
+	if err := linkWS.WriteMessage(websocket.BinaryMessage, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	mt, data, err = browserWS.ReadMessage()
+	if err != nil || mt != websocket.BinaryMessage || string(data) != "def" {
+		t.Fatalf("expected relayed def, got mt=%d data=%q err=%v", mt, data, err)
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

@@ -21,6 +21,10 @@ to establish a peer-to-peer DataChannel, then automatically fall back to the
 server relay if no direct path is found after 5 seconds. This keeps VPS
 bandwidth low while still working behind restrictive NATs.
 
+Remote desktop uses a local VNC server on the managed device plus an embedded
+noVNC client in the console, relayed through the agent. The operator controls
+the remote screen from a plain browser without installing a VNC client.
+
 The design intentionally borrows ideas from mature open-source projects:
 MeshCentral-style web remote management, RustDesk-style lightweight outbound
 agents, and Tailscale-style "device identity plus relay" thinking. The code is

@@ -55,6 +55,16 @@ type forwardSession struct {
 	timer  *time.Timer
 }
 
+type screenSession struct {
+	sessionID string
+	deviceID  string
+	browser   *websocket.Conn
+	link      *websocket.Conn
+	linkReady chan struct{}
+	done      chan struct{}
+	linkSet   bool
+}
+
 type sessionEntry struct {
 	username  string
 	expiresAt time.Time
@@ -81,6 +91,7 @@ type Server struct {
 	terms         map[string]*termSession
 	files         map[string]*fileSession
 	forwards      map[string]*forwardSession
+	screens       map[string]*screenSession
 	sessions      map[string]sessionEntry
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
@@ -107,6 +118,7 @@ func NewServer(cfg Config) (*Server, error) {
 		terms:         make(map[string]*termSession),
 		files:         make(map[string]*fileSession),
 		forwards:      make(map[string]*forwardSession),
+		screens:       make(map[string]*screenSession),
 		sessions:      make(map[string]sessionEntry),
 		loginAttempts: make(map[string]loginAttempt),
 	}, nil
@@ -127,6 +139,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/ws/agent", s.handleAgentWS)
 	mux.HandleFunc("/ws/terminal", s.handleTerminalWS)
 	mux.HandleFunc("/ws/file", s.handleFileWS)
+	mux.HandleFunc("/ws/screen", s.handleScreenWS)
+	mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
 }

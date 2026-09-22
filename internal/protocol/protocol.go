@@ -60,6 +60,8 @@ const (
 	TypeForwardAnswer   = "forward:answer"
 	TypeForwardICE      = "forward:ice"
 	TypeForwardDirectOK = "forward:direct-ok"
+	TypeScreenStart     = "screen:start"
+	TypeScreenError     = "screen:error"
 )
 
 // EncodeData base64-encodes raw bytes for JSON transport.
