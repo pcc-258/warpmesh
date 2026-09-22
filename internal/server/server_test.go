@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -115,6 +116,114 @@ func TestTerminalRelay(t *testing.T) {
 	}
 	if exit.Type != protocol.TypeTermExit {
 		t.Fatalf("expected exit, got %+v", exit)
+	}
+}
+
+func TestLoginStatsAndDeviceKeys(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken:    "admin-token",
+		DeviceToken:   "device-token",
+		DataDir:       t.TempDir(),
+		AdminUser:     "admin",
+		AdminPassword: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	loginBody, _ := json.Marshal(map[string]string{"username": "admin", "password": "secret"})
+	resp, err := http.Post(ts.URL+"/api/login", "application/json", bytes.NewReader(loginBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+		t.Fatal(err)
+	}
+	if loginResp.Token == "" {
+		t.Fatal("expected session token")
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/device-keys", bytes.NewReader([]byte(`{"name":"home pc"}`)))
+	req.Header.Set("Authorization", "Bearer "+loginResp.Token)
+	keyResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keyResp.Body.Close()
+	var key DeviceKey
+	if err := json.NewDecoder(keyResp.Body).Decode(&key); err != nil {
+		t.Fatal(err)
+	}
+	if key.DeviceID == "" || key.Token == "" {
+		t.Fatalf("expected device key with token, got %+v", key)
+	}
+
+	// The per-device key must be able to bring an agent online.
+	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
+	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentWS.Close()
+	if err := agentWS.WriteJSON(protocol.Message{
+		Type:     protocol.TypeHello,
+		DeviceID: key.DeviceID,
+		Name:     "home pc",
+		Hostname: "home-pc",
+		OS:       "linux",
+		Arch:     "amd64",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		dev, ok := srv.reg.Get(key.DeviceID)
+		return ok && dev.Online
+	})
+
+	statsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/stats", nil)
+	statsReq.Header.Set("Authorization", "Bearer "+loginResp.Token)
+	statsResp, err := http.DefaultClient.Do(statsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statsResp.Body.Close()
+	var stats struct {
+		Total  int `json:"total"`
+		Online int `json:"online"`
+	}
+	if err := json.NewDecoder(statsResp.Body).Decode(&stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Total != 1 || stats.Online != 1 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+
+	auditReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/audit?limit=20", nil)
+	auditReq.Header.Set("Authorization", "Bearer "+loginResp.Token)
+	auditResp, err := http.DefaultClient.Do(auditReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer auditResp.Body.Close()
+	var audit []AuditEntry
+	if err := json.NewDecoder(auditResp.Body).Decode(&audit); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range audit {
+		if entry.Action == "device-key.create" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected device-key.create in audit log, got %+v", audit)
 	}
 }
 

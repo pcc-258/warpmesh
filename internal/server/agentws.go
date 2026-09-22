@@ -11,20 +11,22 @@ import (
 )
 
 func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
-	if !s.validDevice(r.URL.Query().Get("token")) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-		return
-	}
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer ws.Close()
 
-	// First message must be a hello carrying device identity.
+	// The first message must carry device identity so the server can check
+	// the per-device credential instead of trusting a shared token alone.
 	var hello protocol.Message
 	if err := ws.ReadJSON(&hello); err != nil || hello.Type != protocol.TypeHello || hello.DeviceID == "" {
 		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, Error: "expected hello message"})
+		return
+	}
+	if !s.authorizeAgent(hello.DeviceID, r.URL.Query().Get("token")) {
+		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, Error: "invalid device credential"})
+		_ = s.reg.RecordAudit(hello.DeviceID, "agent.auth-failed", hello.DeviceID, "invalid device credential")
 		return
 	}
 
@@ -32,11 +34,10 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	if len(ips) == 0 {
 		ips = localIPs()
 	}
-	dev, err := s.reg.Upsert(hello.DeviceID, hello.Name, hello.Hostname, hello.OS, hello.Arch, ips)
-	if err != nil {
+	if _, err := s.reg.Upsert(hello.DeviceID, hello.Name, hello.Hostname, hello.OS, hello.Arch, ips); err != nil {
 		s.logf("registry upsert failed for %s: %v", hello.DeviceID, err)
 	}
-	_ = dev
+	_ = s.reg.RecordAudit(hello.DeviceID, "agent.online", hello.DeviceID, hello.OS+"/"+hello.Arch)
 
 	conn := &agentConn{deviceID: hello.DeviceID, ws: ws}
 	s.agentsMu.Lock()
@@ -76,6 +77,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 	close(done)
 	s.removeAgent(hello.DeviceID)
+	_ = s.reg.RecordAudit(hello.DeviceID, "agent.offline", hello.DeviceID, "")
 	s.logf("agent offline: %s", hello.DeviceID)
 }
 

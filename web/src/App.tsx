@@ -5,13 +5,18 @@ import {
   CloudUpload,
   Download,
   HardDrive,
+  KeyRound,
+  Layers,
   LogOut,
   MonitorSmartphone,
   Pencil,
   RefreshCw,
+  ScrollText,
   Server,
+  ShieldCheck,
   TerminalSquare,
   Trash2,
+  UserRound,
   Wifi,
 } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
@@ -19,13 +24,20 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
   clearToken,
+  createDeviceKey,
   deleteDevice,
+  getStats,
   getToken,
   lastSeenLabel,
+  listDeviceKeys,
   listDevices,
+  login,
   renameDevice,
+  revokeDeviceKey,
   setToken,
   type Device,
+  type DeviceKey,
+  type Stats,
   wsUrl,
 } from "./api";
 
@@ -39,7 +51,7 @@ export default function App() {
   const [view, setView] = useState<View>({ name: "dashboard" });
 
   if (!token) {
-    return <Login onLogin={(t) => setTokenState(t)} />;
+    return <Login onLogin={() => setTokenState(getToken())} />;
   }
 
   if (view.name === "terminal") {
@@ -62,9 +74,31 @@ export default function App() {
   );
 }
 
-function Login({ onLogin }: { onLogin: (token: string) => void }) {
-  const [value, setValue] = useState("");
+function Login({ onLogin }: { onLogin: () => void }) {
+  const [mode, setMode] = useState<"token" | "account">("account");
+  const [tokenValue, setTokenValue] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    try {
+      if (mode === "account") {
+        await login(username.trim(), password);
+      } else {
+        if (!tokenValue.trim()) {
+          setError("Token is required");
+          return;
+        }
+        setToken(tokenValue.trim());
+      }
+      onLogin();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "login failed");
+    }
+  };
 
   return (
     <div className="login-wrap">
@@ -74,29 +108,49 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
         </div>
         <h1>Device Relay</h1>
         <p>Centralized control plane for your devices.</p>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!value.trim()) {
-              setError("Token is required");
-              return;
-            }
-            setToken(value.trim());
-            onLogin(value.trim());
-          }}
-        >
-          <label htmlFor="token">Admin token</label>
-          <input
-            id="token"
-            type="password"
-            value={value}
-            onChange={(e) => {
-              setValue(e.target.value);
-              setError("");
-            }}
-            placeholder="Enter your admin token"
-            autoFocus
-          />
+        <div className="login-tabs">
+          <button className={mode === "account" ? "active" : ""} onClick={() => setMode("account")}>
+            <UserRound size={14} />
+            Account
+          </button>
+          <button className={mode === "token" ? "active" : ""} onClick={() => setMode("token")}>
+            <KeyRound size={14} />
+            Token
+          </button>
+        </div>
+        <form onSubmit={submit}>
+          {mode === "account" ? (
+            <>
+              <label htmlFor="username">Username</label>
+              <input
+                id="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="admin"
+                autoFocus
+              />
+              <label htmlFor="password">Password</label>
+              <input
+                id="password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+              />
+            </>
+          ) : (
+            <>
+              <label htmlFor="token">Admin token</label>
+              <input
+                id="token"
+                type="password"
+                value={tokenValue}
+                onChange={(e) => setTokenValue(e.target.value)}
+                placeholder="Enter your admin token"
+                autoFocus
+              />
+            </>
+          )}
           {error && <div className="form-error">{error}</div>}
           <button type="submit" className="primary-btn">
             Enter console
@@ -117,12 +171,17 @@ function Dashboard({
   onFiles: (d: Device) => void;
 }) {
   const [devices, setDevices] = useState<Device[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [keys, setKeys] = useState<DeviceKey[]>([]);
+  const [group, setGroup] = useState("");
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setDevices(await listDevices());
+      const [deviceList, statsData] = await Promise.all([listDevices(), getStats()]);
+      setDevices(deviceList);
+      setStats(statsData);
     } catch {
       onLogout();
     } finally {
@@ -130,13 +189,26 @@ function Dashboard({
     }
   }, [onLogout]);
 
+  const loadKeys = useCallback(async () => {
+    try {
+      setKeys(await listDeviceKeys());
+    } catch {
+      // key panel is secondary; keep the rest of the dashboard working
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
+    loadKeys();
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, loadKeys]);
 
-  const online = devices.filter((d) => d.online).length;
+  const groups = useMemo(() => stats?.groups ?? [], [stats]);
+  const filtered = useMemo(
+    () => (group ? devices.filter((d) => d.group === group) : devices),
+    [devices, group],
+  );
 
   const handleRename = async (device: Device) => {
     const name = prompt("New device name", device.name);
@@ -153,6 +225,27 @@ function Dashboard({
     }
   };
 
+  const handleCreateKey = async () => {
+    const name = prompt("Device name for the new key");
+    if (!name?.trim()) return;
+    try {
+      const key = await createDeviceKey(name.trim());
+      alert(`Device key created.\n\nDevice ID: ${key.deviceId}\nToken: ${key.token}\n\nUse both in the agent.`);
+      loadKeys();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "failed to create key");
+    }
+  };
+
+  const handleRevokeKey = async (key: DeviceKey) => {
+    if (confirm(`Revoke device key for ${key.name}?`)) {
+      await revokeDeviceKey(key.deviceId);
+      loadKeys();
+    }
+  };
+
+  const osEntries = Object.entries(stats?.byOS ?? {}).sort((a, b) => b[1] - a[1]);
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -168,7 +261,7 @@ function Dashboard({
         <div className="topbar-actions">
           <div className="stat-pill">
             <Activity size={15} />
-            {online}/{devices.length} online
+            {stats?.online ?? 0}/{stats?.total ?? 0} online
           </div>
           <button className="icon-btn" onClick={refresh} title="Refresh" disabled={loading}>
             <RefreshCw size={16} className={loading ? "spin" : ""} />
@@ -180,22 +273,65 @@ function Dashboard({
       </header>
 
       <main className="content">
+        <section className="stat-grid">
+          <div className="stat-card">
+            <MonitorSmartphone size={18} />
+            <strong>{stats?.total ?? 0}</strong>
+            <span>Devices</span>
+          </div>
+          <div className="stat-card accent">
+            <Activity size={18} />
+            <strong>{stats?.online ?? 0}</strong>
+            <span>Online</span>
+          </div>
+          <div className="stat-card">
+            <Layers size={18} />
+            <strong>{groups.length}</strong>
+            <span>Groups</span>
+          </div>
+          <div className="stat-card">
+            <HardDrive size={18} />
+            <strong>{Object.keys(stats?.byOS ?? {}).length}</strong>
+            <span>Platforms</span>
+          </div>
+        </section>
+
         <section className="page-head">
           <div>
             <h2>Devices</h2>
             <p>Agents connect outbound, so every device works behind NAT.</p>
           </div>
+          <div className="os-chips">
+            {osEntries.map(([os, count]) => (
+              <span key={os}>
+                {os} {count}
+              </span>
+            ))}
+          </div>
         </section>
 
-        {devices.length === 0 ? (
+        {groups.length > 0 && (
+          <div className="filter-chips">
+            <button className={group === "" ? "active" : ""} onClick={() => setGroup("")}>
+              All
+            </button>
+            {groups.map((g) => (
+              <button key={g} className={group === g ? "active" : ""} onClick={() => setGroup(g)}>
+                {g}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {filtered.length === 0 ? (
           <div className="empty-state">
             <MonitorSmartphone size={32} />
             <h3>No devices yet</h3>
-            <p>Run the agent on a device with the shared device token and it will appear here.</p>
+            <p>Run the agent on a device with a device key and it will appear here.</p>
           </div>
         ) : (
           <div className="device-grid">
-            {devices.map((device) => (
+            {filtered.map((device) => (
               <article className="device-card" key={device.id}>
                 <div className="device-card-head">
                   <div className={`status-dot ${device.online ? "online" : "offline"}`} />
@@ -220,6 +356,12 @@ function Dashboard({
                     <HardDrive size={14} />
                     {device.id}
                   </div>
+                  {device.group && (
+                    <div>
+                      <Layers size={14} />
+                      {device.group}
+                    </div>
+                  )}
                 </div>
                 <div className="device-actions">
                   <button className="action-btn" disabled={!device.online} onClick={() => onTerminal(device)}>
@@ -241,6 +383,63 @@ function Dashboard({
             ))}
           </div>
         )}
+
+        <section className="panel-section">
+          <div className="section-head">
+            <div>
+              <h3>
+                <KeyRound size={17} />
+                Device keys
+              </h3>
+              <p>Each agent gets its own credential. Tokens are shown once at creation.</p>
+            </div>
+            <button className="action-btn" onClick={handleCreateKey}>
+              <ShieldCheck size={15} />
+              New key
+            </button>
+          </div>
+          {keys.length === 0 ? (
+            <div className="inline-empty">No device keys yet.</div>
+          ) : (
+            <div className="key-list">
+              {keys.map((key) => (
+                <div className="key-row" key={key.deviceId}>
+                  <div>
+                    <strong>{key.name}</strong>
+                    <span>{key.deviceId}</span>
+                  </div>
+                  <button className="icon-btn danger" title="Revoke" onClick={() => handleRevokeKey(key)}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="panel-section">
+          <div className="section-head">
+            <div>
+              <h3>
+                <ScrollText size={17} />
+                Recent activity
+              </h3>
+            </div>
+          </div>
+          <div className="activity-list">
+            {(stats?.recentActivity ?? []).map((entry) => (
+              <div className="activity-row" key={entry.id}>
+                <span className="activity-time">{new Date(entry.createdAt).toLocaleString()}</span>
+                <span className="activity-action">{entry.action}</span>
+                <span className="activity-target">
+                  {entry.target}
+                  {entry.detail ? ` (${entry.detail})` : ""}
+                </span>
+              </div>
+            ))}
+            {!stats?.recentActivity?.length && <div className="inline-empty">No activity yet.</div>}
+          </div>
+        </section>
       </main>
     </div>
   );
@@ -248,7 +447,6 @@ function Dashboard({
 
 function TerminalView({ device, onBack }: { device: Device; onBack: () => void }) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     const term = new Terminal({
@@ -275,7 +473,6 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         rows: term.rows,
       }),
     );
-    wsRef.current = socket;
 
     const sendResize = () => {
       if (socket.readyState === WebSocket.OPEN) {
@@ -470,7 +667,7 @@ function FilesView({ device, onBack }: { device: Device; onBack: () => void }) {
         </section>
         <section className="file-panel">
           <h3>Download from device</h3>
-          <p>Read any file the agent process can access.</p>
+          <p>Read any file inside the agent's allowed path roots.</p>
           <div className="path-row">
             <input
               value={path}

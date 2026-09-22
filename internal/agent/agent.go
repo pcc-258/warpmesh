@@ -30,6 +30,7 @@ type Config struct {
 	Shell     string
 	DataDir   string
 	Insecure  bool
+	AllowPaths []string
 }
 
 // Agent maintains one control connection to the relay server.
@@ -61,6 +62,11 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if cfg.Shell == "" {
 		cfg.Shell = defaultShell()
+	}
+	if len(cfg.AllowPaths) == 0 {
+		if home, err := os.UserHomeDir(); err == nil {
+			cfg.AllowPaths = []string{home}
+		}
 	}
 	return &Agent{
 		cfg:      cfg,
@@ -219,6 +225,13 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 }
 
 func (a *Agent) streamFile(msg protocol.Message) error {
+	if !a.pathAllowed(msg.Path) {
+		return a.send(protocol.Message{
+			Type:      protocol.TypeFileError,
+			SessionID: msg.SessionID,
+			Error:     "path is outside the allowed directories",
+		})
+	}
 	raw, err := os.ReadFile(msg.Path)
 	if err != nil {
 		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
@@ -238,6 +251,26 @@ func (a *Agent) streamFile(msg protocol.Message) error {
 		}
 	}
 	return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
+}
+
+func (a *Agent) pathAllowed(path string) bool {
+	if len(a.cfg.AllowPaths) == 0 {
+		return true
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	for _, root := range a.cfg.AllowPaths {
+		r, err := filepath.Abs(filepath.Clean(root))
+		if err != nil {
+			continue
+		}
+		if abs == r || strings.HasPrefix(abs, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) send(v any) error {

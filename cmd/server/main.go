@@ -23,6 +23,8 @@ func main() {
 	domain := flag.String("domain", os.Getenv("DEVICE_RELAY_DOMAIN"), "public domain; enables automatic Let's Encrypt certificates")
 	acmeEmail := flag.String("acme-email", os.Getenv("DEVICE_RELAY_ACME_EMAIL"), "contact email used for Let's Encrypt")
 	adminToken := flag.String("admin-token", envOr("DEVICE_RELAY_ADMIN_TOKEN", "admin"), "admin token for the web UI")
+	adminUser := flag.String("admin-user", envOr("DEVICE_RELAY_ADMIN_USER", "admin"), "initial console username")
+	adminPassword := flag.String("admin-password", envOr("DEVICE_RELAY_ADMIN_PASSWORD", "admin"), "initial console password")
 	deviceToken := flag.String("device-token", envOr("DEVICE_RELAY_DEVICE_TOKEN", "device"), "shared token used by device agents")
 	dataDir := flag.String("data-dir", envOr("DEVICE_RELAY_DATA_DIR", "./data"), "directory for persisted state")
 	tlsCert := flag.String("tls-cert", os.Getenv("DEVICE_RELAY_TLS_CERT"), "optional TLS certificate file")
@@ -38,6 +40,8 @@ func main() {
 		DeviceToken: *deviceToken,
 		DataDir:     *dataDir,
 		WebFS:       web,
+		AdminUser:   *adminUser,
+		AdminPassword: *adminPassword,
 	})
 	if err != nil {
 		log.Fatalf("create server: %v", err)

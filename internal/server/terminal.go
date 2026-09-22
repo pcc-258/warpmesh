@@ -9,7 +9,8 @@ import (
 )
 
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
-	if !s.adminFromRequest(r) {
+	actor, ok := s.authenticate(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
@@ -34,6 +35,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	s.sessionsMu.Lock()
 	s.terms[sessionID] = sess
 	s.sessionsMu.Unlock()
+	_ = s.reg.RecordAudit(actor, "terminal.start", deviceID, "")
 	defer func() {
 		s.sessionsMu.Lock()
 		delete(s.terms, sessionID)

@@ -10,6 +10,12 @@ The server persists its device catalog in SQLite (`data/devices.db`) using the
 pure-Go `modernc.org/sqlite` driver, so the release binary has no CGO
 dependency.
 
+The console includes a dashboard with online/offline stats, OS breakdown,
+device groups, a per-device key panel and an audit log. Agents can use their
+own device key instead of the shared device token, and keys are shown once at
+creation. Agent file downloads are restricted to an allowed path root (home by
+default) instead of allowing arbitrary paths.
+
 The design intentionally borrows ideas from mature open-source projects:
 MeshCentral-style web remote management, RustDesk-style lightweight outbound
 agents, and Tailscale-style "device identity plus relay" thinking. The code is

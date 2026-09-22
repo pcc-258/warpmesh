@@ -11,7 +11,8 @@ import (
 )
 
 func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
-	if !s.adminFromRequest(r) {
+	actor, ok := s.authenticate(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
@@ -49,6 +50,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing file name"})
 			return
 		}
+		_ = s.reg.RecordAudit(actor, "file.upload", deviceID, name)
 		if err := agent.write(protocol.Message{
 			Type:      protocol.TypeFileUpload,
 			SessionID: sessionID,
@@ -89,6 +91,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing path"})
 			return
 		}
+		_ = s.reg.RecordAudit(actor, "file.download", deviceID, path)
 		if err := agent.write(protocol.Message{
 			Type:      protocol.TypeFileDownload,
 			SessionID: sessionID,

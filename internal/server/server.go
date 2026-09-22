@@ -1,25 +1,31 @@
 package server
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"io/fs"
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 // Config controls the relay server.
 type Config struct {
-	AdminToken  string
-	DeviceToken string
-	DataDir     string
-	WebFS       fs.FS
+	AdminToken    string
+	DeviceToken   string
+	DataDir       string
+	WebFS         fs.FS
+	AdminUser     string
+	AdminPassword string
 }
 
 type agentConn struct {
@@ -39,6 +45,11 @@ type fileSession struct {
 	op       string
 }
 
+type sessionEntry struct {
+	username  string
+	expiresAt time.Time
+}
+
 // Server is the relay control plane.
 type Server struct {
 	cfg       Config
@@ -49,6 +60,7 @@ type Server struct {
 	sessionsMu sync.RWMutex
 	terms     map[string]*termSession
 	files     map[string]*fileSession
+	sessions  map[string]sessionEntry
 }
 
 // NewServer creates a relay server with the embedded web UI.
@@ -57,13 +69,21 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.AdminUser != "" && cfg.AdminPassword != "" {
+		if err := reg.EnsureUser(cfg.AdminUser, cfg.AdminPassword, "admin"); err != nil {
+			return nil, err
+		}
+	}
 	return &Server{
-		cfg:      cfg,
-		reg:      reg,
-		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		cfg: cfg,
+		reg: reg,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: sameOriginCheck,
+		},
 		agents:   make(map[string]*agentConn),
 		terms:    make(map[string]*termSession),
 		files:    make(map[string]*fileSession),
+		sessions: make(map[string]sessionEntry),
 	}, nil
 }
 
@@ -71,8 +91,13 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/devices", s.handleDevices)
 	mux.HandleFunc("/api/devices/", s.handleDeviceByID)
+	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/device-keys", s.handleDeviceKeys)
+	mux.HandleFunc("/api/device-keys/", s.handleDeviceKeyByID)
+	mux.HandleFunc("/api/audit", s.handleAudit)
 	mux.HandleFunc("/ws/agent", s.handleAgentWS)
 	mux.HandleFunc("/ws/terminal", s.handleTerminalWS)
 	mux.HandleFunc("/ws/file", s.handleFileWS)
@@ -82,6 +107,41 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request"})
+		return
+	}
+	user, err := s.reg.ValidateUser(req.Username, req.Password)
+	if err != nil {
+		_ = s.reg.RecordAudit(req.Username, "login.failed", req.Username, "bad credentials")
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid credentials"})
+		return
+	}
+	token, err := newSessionToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "session creation failed"})
+		return
+	}
+	s.sessionsMu.Lock()
+	s.sessions[token] = sessionEntry{username: user.Username, expiresAt: time.Now().Add(24 * time.Hour)}
+	s.sessionsMu.Unlock()
+	_ = s.reg.RecordAudit(user.Username, "login.ok", user.Username, "")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":    token,
+		"username": user.Username,
+		"role":     user.Role,
+	})
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
@@ -120,12 +180,37 @@ func (s *Server) validDevice(token string) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.DeviceToken)) == 1
 }
 
-func (s *Server) adminFromRequest(r *http.Request) bool {
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return s.validAdmin(strings.TrimPrefix(auth, "Bearer "))
+func (s *Server) authorizeAgent(deviceID, token string) bool {
+	if s.validDevice(token) {
+		return true
 	}
-	return s.validAdmin(r.URL.Query().Get("token"))
+	return s.reg.ValidateDeviceKey(deviceID, token)
+}
+
+func (s *Server) authenticate(r *http.Request) (string, bool) {
+	token := r.URL.Query().Get("token")
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		token = strings.TrimPrefix(auth, "Bearer ")
+	}
+	if s.validAdmin(token) {
+		return "admin-token", true
+	}
+	return s.validSession(token)
+}
+
+func (s *Server) validSession(token string) (string, bool) {
+	s.sessionsMu.RLock()
+	entry, ok := s.sessions[token]
+	s.sessionsMu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) {
+		if ok {
+			s.sessionsMu.Lock()
+			delete(s.sessions, token)
+			s.sessionsMu.Unlock()
+		}
+		return "", false
+	}
+	return entry.username, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -155,4 +240,26 @@ func (a *agentConn) write(v any) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	return a.ws.WriteJSON(v)
+}
+
+func newSessionToken() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// sameOriginCheck accepts browser WebSockets from the page's own host and
+// non-browser clients (agents and tests) that send no Origin header.
+func sameOriginCheck(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == r.Host
 }
