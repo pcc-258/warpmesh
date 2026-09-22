@@ -1,4 +1,4 @@
-package devicerelay
+package pylon
 
 import "embed"
 

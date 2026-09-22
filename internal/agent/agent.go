@@ -18,7 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/pcc-258/device-relay/internal/protocol"
+	"github.com/pcc-258/pylon/internal/protocol"
 )
 
 // Config configures a device agent.

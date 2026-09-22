@@ -1,6 +1,6 @@
-# Device Relay Architecture
+# Pylon Architecture
 
-Device Relay is a self-hosted control plane for a fleet of devices behind NAT.
+Pylon is a self-hosted control plane for a fleet of devices behind NAT.
 It combines a Linux relay server, outbound device agents and a browser-based
 management console. This document describes the design so the project can be
 understood, extended and audited without reading every source file.
@@ -34,8 +34,8 @@ The three binaries are:
 
 | Binary | Platform | Responsibility |
 | --- | --- | --- |
-| `devicerelay-server` | Linux | HTTP API, WebSocket relay, static web UI, SQLite persistence, Let's Encrypt |
-| `devicerelay-agent` | Windows / macOS / Linux | Outbound registration, heartbeat, PTY/ConPTY terminal, file transfer |
+| `pylon-server` | Linux | HTTP API, WebSocket relay, static web UI, SQLite persistence, Let's Encrypt |
+| `pylon-agent` | Windows / macOS / Linux | Outbound registration, heartbeat, PTY/ConPTY terminal, file transfer |
 | Web UI | embedded into server | Dashboard, device management, terminal, file transfer, device keys |
 
 ## 3. Deployment
@@ -48,7 +48,7 @@ flowchart TB
     end
     subgraph VPS["Relay VPS (Linux)"]
         Caddy[Optional Caddy / Nginx<br/>or built-in autocert]
-        Server[devicerelay-server]
+        Server[pylon-server]
         SQLite[(devices.db)]
         Certs[(/data/certs)]
     end
@@ -75,10 +75,10 @@ flowchart TB
 Recommended deployment:
 
 ```bash
-./bin/devicerelay-server \
+./bin/pylon-server \
   -domain relay.example.com \
   -acme-email you@example.com \
-  -data-dir /var/lib/device-relay
+  -data-dir /var/lib/pylon
 ```
 
 TCP 80 and 443 must be open. The server redirects HTTP to HTTPS and

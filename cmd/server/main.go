@@ -12,8 +12,8 @@ import (
 
 	"golang.org/x/crypto/acme/autocert"
 
-	relay "github.com/pcc-258/device-relay"
-	"github.com/pcc-258/device-relay/internal/server"
+	relay "github.com/pcc-258/pylon"
+	"github.com/pcc-258/pylon/internal/server"
 )
 
 func main() {

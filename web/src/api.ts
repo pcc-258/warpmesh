@@ -34,7 +34,7 @@ export interface AuditEntry {
   createdAt: string;
 }
 
-const TOKEN_KEY = "device-relay-token";
+const TOKEN_KEY = "pylon-token";
 
 export function getToken(): string {
   return localStorage.getItem(TOKEN_KEY) || "";

@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pcc-258/device-relay/internal/agent"
+	"github.com/pcc-258/pylon/internal/agent"
 )
 
 func main() {

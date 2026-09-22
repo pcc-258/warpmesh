@@ -8,7 +8,7 @@ import (
 
 	"github.com/UserExistsError/conpty"
 
-	"github.com/pcc-258/device-relay/internal/protocol"
+	"github.com/pcc-258/pylon/internal/protocol"
 )
 
 // TermSession wraps a Windows ConPTY-backed shell.

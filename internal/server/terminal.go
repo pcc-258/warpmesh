@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 
-	"github.com/pcc-258/device-relay/internal/protocol"
+	"github.com/pcc-258/pylon/internal/protocol"
 )
 
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {

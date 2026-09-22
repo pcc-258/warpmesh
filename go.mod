@@ -1,4 +1,4 @@
-module github.com/pcc-258/device-relay
+module github.com/pcc-258/pylon
 
 go 1.26.0
 

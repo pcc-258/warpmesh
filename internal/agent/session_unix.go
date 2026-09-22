@@ -9,7 +9,7 @@ import (
 
 	"github.com/creack/pty"
 
-	"github.com/pcc-258/device-relay/internal/protocol"
+	"github.com/pcc-258/pylon/internal/protocol"
 )
 
 // TermSession wraps a PTY-backed shell.

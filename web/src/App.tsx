@@ -100,7 +100,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
         <div className="brand-mark">
           <Server size={22} />
         </div>
-        <h1>Device Relay</h1>
+        <h1>Pylon</h1>
         <p>Centralized control plane for your devices.</p>
         <form onSubmit={submit}>
           <label htmlFor="username">Username</label>
@@ -222,7 +222,7 @@ function Dashboard({
             <Server size={18} />
           </div>
           <div>
-            <strong>Device Relay</strong>
+            <strong>Pylon</strong>
             <span>management console</span>
           </div>
         </div>
