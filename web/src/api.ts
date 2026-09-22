@@ -115,6 +115,10 @@ export function revokeDeviceKey(deviceId: string): Promise<void> {
   return api<void>(`/api/device-keys/${deviceId}`, { method: "DELETE" });
 }
 
+export function listAudit(limit = 50): Promise<AuditEntry[]> {
+  return api<AuditEntry[]>(`/api/audit?limit=${limit}`);
+}
+
 export function wsUrl(path: string, params: Record<string, string | number>): string {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const query = new URLSearchParams();
