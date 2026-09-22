@@ -31,16 +31,20 @@ func main() {
 	tlsKey := flag.String("tls-key", os.Getenv("DEVICE_RELAY_TLS_KEY"), "optional TLS private key file")
 	flag.Parse()
 
+	if *adminPassword == "admin" || *adminToken == "admin" {
+		log.Printf("WARNING: default admin credentials are in use; set DEVICE_RELAY_ADMIN_PASSWORD and DEVICE_RELAY_ADMIN_TOKEN before exposing the console")
+	}
+
 	web, err := fs.Sub(relay.WebFS, "web/dist")
 	if err != nil {
 		log.Fatalf("embedded web ui unavailable: %v", err)
 	}
 	srv, err := server.NewServer(server.Config{
-		AdminToken:  *adminToken,
-		DeviceToken: *deviceToken,
-		DataDir:     *dataDir,
-		WebFS:       web,
-		AdminUser:   *adminUser,
+		AdminToken:    *adminToken,
+		DeviceToken:   *deviceToken,
+		DataDir:       *dataDir,
+		WebFS:         web,
+		AdminUser:     *adminUser,
 		AdminPassword: *adminPassword,
 	})
 	if err != nil {

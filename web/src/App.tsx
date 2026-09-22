@@ -16,7 +16,6 @@ import {
   ShieldCheck,
   TerminalSquare,
   Trash2,
-  UserRound,
   Wifi,
 } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
@@ -32,9 +31,9 @@ import {
   listDeviceKeys,
   listDevices,
   login,
+  logout,
   renameDevice,
   revokeDeviceKey,
-  setToken,
   type Device,
   type DeviceKey,
   type Stats,
@@ -64,7 +63,12 @@ export default function App() {
 
   return (
     <Dashboard
-      onLogout={() => {
+      onLogout={async () => {
+        try {
+          await logout();
+        } catch {
+          // local logout must still work when the server is unreachable
+        }
         clearToken();
         setTokenState("");
       }}
@@ -75,8 +79,6 @@ export default function App() {
 }
 
 function Login({ onLogin }: { onLogin: () => void }) {
-  const [mode, setMode] = useState<"token" | "account">("account");
-  const [tokenValue, setTokenValue] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -85,15 +87,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
     e.preventDefault();
     setError("");
     try {
-      if (mode === "account") {
-        await login(username.trim(), password);
-      } else {
-        if (!tokenValue.trim()) {
-          setError("Token is required");
-          return;
-        }
-        setToken(tokenValue.trim());
-      }
+      await login(username.trim(), password);
       onLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : "login failed");
@@ -108,49 +102,23 @@ function Login({ onLogin }: { onLogin: () => void }) {
         </div>
         <h1>Device Relay</h1>
         <p>Centralized control plane for your devices.</p>
-        <div className="login-tabs">
-          <button className={mode === "account" ? "active" : ""} onClick={() => setMode("account")}>
-            <UserRound size={14} />
-            Account
-          </button>
-          <button className={mode === "token" ? "active" : ""} onClick={() => setMode("token")}>
-            <KeyRound size={14} />
-            Token
-          </button>
-        </div>
         <form onSubmit={submit}>
-          {mode === "account" ? (
-            <>
-              <label htmlFor="username">Username</label>
-              <input
-                id="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin"
-                autoFocus
-              />
-              <label htmlFor="password">Password</label>
-              <input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-              />
-            </>
-          ) : (
-            <>
-              <label htmlFor="token">Admin token</label>
-              <input
-                id="token"
-                type="password"
-                value={tokenValue}
-                onChange={(e) => setTokenValue(e.target.value)}
-                placeholder="Enter your admin token"
-                autoFocus
-              />
-            </>
-          )}
+          <label htmlFor="username">Username</label>
+          <input
+            id="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="admin"
+            autoFocus
+          />
+          <label htmlFor="password">Password</label>
+          <input
+            id="password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="••••••••"
+          />
           {error && <div className="form-error">{error}</div>}
           <button type="submit" className="primary-btn">
             Enter console

@@ -27,13 +27,13 @@ func main() {
 		}
 	}
 	a, err := agent.New(agent.Config{
-		ServerURL: *serverURL,
-		Token:     *token,
-		DeviceID:  *deviceID,
-		Name:      *name,
-		Shell:     *shell,
-		DataDir:   *dataDir,
-		Insecure:  *insecure,
+		ServerURL:  *serverURL,
+		Token:      *token,
+		DeviceID:   *deviceID,
+		Name:       *name,
+		Shell:      *shell,
+		DataDir:    *dataDir,
+		Insecure:   *insecure,
 		AllowPaths: paths,
 	})
 	if err != nil {

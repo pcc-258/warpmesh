@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -50,17 +51,29 @@ type sessionEntry struct {
 	expiresAt time.Time
 }
 
+type loginAttempt struct {
+	count int
+	until time.Time
+}
+
+const (
+	maxLoginAttempts = 5
+	loginLockoutTime = time.Minute
+)
+
 // Server is the relay control plane.
 type Server struct {
-	cfg       Config
-	reg       *Registry
-	upgrader  websocket.Upgrader
-	agentsMu  sync.RWMutex
-	agents    map[string]*agentConn
-	sessionsMu sync.RWMutex
-	terms     map[string]*termSession
-	files     map[string]*fileSession
-	sessions  map[string]sessionEntry
+	cfg           Config
+	reg           *Registry
+	upgrader      websocket.Upgrader
+	agentsMu      sync.RWMutex
+	agents        map[string]*agentConn
+	sessionsMu    sync.RWMutex
+	terms         map[string]*termSession
+	files         map[string]*fileSession
+	sessions      map[string]sessionEntry
+	loginMu       sync.Mutex
+	loginAttempts map[string]loginAttempt
 }
 
 // NewServer creates a relay server with the embedded web UI.
@@ -80,10 +93,11 @@ func NewServer(cfg Config) (*Server, error) {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: sameOriginCheck,
 		},
-		agents:   make(map[string]*agentConn),
-		terms:    make(map[string]*termSession),
-		files:    make(map[string]*fileSession),
-		sessions: make(map[string]sessionEntry),
+		agents:        make(map[string]*agentConn),
+		terms:         make(map[string]*termSession),
+		files:         make(map[string]*fileSession),
+		sessions:      make(map[string]sessionEntry),
+		loginAttempts: make(map[string]loginAttempt),
 	}, nil
 }
 
@@ -92,6 +106,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/logout", s.handleLogout)
 	mux.HandleFunc("/api/devices", s.handleDevices)
 	mux.HandleFunc("/api/devices/", s.handleDeviceByID)
 	mux.HandleFunc("/api/stats", s.handleStats)
@@ -122,12 +137,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request"})
 		return
 	}
+	key := req.Username + "|" + clientIP(r)
+	if !s.allowLoginAttempt(key) {
+		_ = s.reg.RecordAudit(req.Username, "login.locked", req.Username, "too many failures")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many login attempts, try again later"})
+		return
+	}
 	user, err := s.reg.ValidateUser(req.Username, req.Password)
 	if err != nil {
+		s.recordLoginFailure(key)
 		_ = s.reg.RecordAudit(req.Username, "login.failed", req.Username, "bad credentials")
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid credentials"})
 		return
 	}
+	s.clearLoginAttempts(key)
 	token, err := newSessionToken()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "session creation failed"})
@@ -142,6 +165,24 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"username": user.Username,
 		"role":     user.Role,
 	})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		token = strings.TrimPrefix(auth, "Bearer ")
+	}
+	username := ""
+	s.sessionsMu.Lock()
+	if entry, ok := s.sessions[token]; ok {
+		username = entry.username
+		delete(s.sessions, token)
+	}
+	s.sessionsMu.Unlock()
+	if username != "" {
+		_ = s.reg.RecordAudit(username, "logout", username, "")
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +252,41 @@ func (s *Server) validSession(token string) (string, bool) {
 		return "", false
 	}
 	return entry.username, true
+}
+
+func (s *Server) allowLoginAttempt(key string) bool {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	attempt, ok := s.loginAttempts[key]
+	if ok && time.Now().Before(attempt.until) && attempt.count >= maxLoginAttempts {
+		return false
+	}
+	return true
+}
+
+func (s *Server) recordLoginFailure(key string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	attempt := s.loginAttempts[key]
+	attempt.count++
+	if attempt.count >= maxLoginAttempts {
+		attempt.until = time.Now().Add(loginLockoutTime)
+	}
+	s.loginAttempts[key] = attempt
+}
+
+func (s *Server) clearLoginAttempts(key string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	delete(s.loginAttempts, key)
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

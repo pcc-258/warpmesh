@@ -227,6 +227,87 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	}
 }
 
+func TestLoginRateLimit(t *testing.T) {
+	srv, err := NewServer(Config{
+		DataDir:       t.TempDir(),
+		AdminUser:     "admin",
+		AdminPassword: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	bad := []byte(`{"username":"admin","password":"wrong"}`)
+	for i := 0; i < 5; i++ {
+		resp, err := http.Post(ts.URL+"/api/login", "application/json", bytes.NewReader(bad))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", i+1, resp.StatusCode)
+		}
+	}
+	resp, err := http.Post(ts.URL+"/api/login", "application/json", bytes.NewReader(bad))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after lockout, got %d", resp.StatusCode)
+	}
+}
+
+func TestLogoutInvalidatesSession(t *testing.T) {
+	srv, err := NewServer(Config{
+		DataDir:       t.TempDir(),
+		AdminUser:     "admin",
+		AdminPassword: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	loginBody, _ := json.Marshal(map[string]string{"username": "admin", "password": "secret"})
+	resp, err := http.Post(ts.URL+"/api/login", "application/json", bytes.NewReader(loginBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/logout", nil)
+	req.Header.Set("Authorization", "Bearer "+loginResp.Token)
+	logoutResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 from logout, got %d", logoutResp.StatusCode)
+	}
+
+	statsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/stats", nil)
+	statsReq.Header.Set("Authorization", "Bearer "+loginResp.Token)
+	statsResp, err := http.DefaultClient.Do(statsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = statsResp.Body.Close()
+	if statsResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout, got %d", statsResp.StatusCode)
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

@@ -300,6 +300,8 @@ All control traffic is JSON over WebSocket. The envelope is:
 - WebSocket connections validate the `Origin` header for browsers.
 - Failed authentication and security-relevant actions are recorded in the
   audit log.
+- Login failures are rate limited per username and client IP, and sessions can
+  be invalidated explicitly with `POST /api/logout`.
 - File downloads are constrained to allowed paths.
 - HTTPS is provided by automatic Let's Encrypt, manual certificates or a
   reverse proxy.

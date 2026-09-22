@@ -92,6 +92,10 @@ export async function login(username: string, password: string): Promise<void> {
   setToken(data.token);
 }
 
+export async function logout(): Promise<void> {
+  await api<void>("/api/logout", { method: "POST" });
+}
+
 export function getStats(): Promise<Stats> {
   return api<Stats>("/api/stats");
 }

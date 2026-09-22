@@ -78,6 +78,12 @@ ADMIN_TOKEN=admin DEVICE_TOKEN=device ./bin/devicerelay-server -listen :8080
 # Open http://127.0.0.1:8080 and sign in with the admin token.
 ```
 
+The console itself requires an account login. The initial account is created
+from `DEVICE_RELAY_ADMIN_USER` / `DEVICE_RELAY_ADMIN_PASSWORD` (defaults:
+`admin` / `admin`). Change both before exposing the server publicly. Failed
+logins are rate limited per account and IP, and sessions can be ended with the
+Log out button.
+
 For a public server, put a TLS terminator in front (Caddy, Nginx) or pass
 `-tls-cert` and `-tls-key` to the server, then agents use `wss://`.
 

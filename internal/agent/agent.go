@@ -23,13 +23,13 @@ import (
 
 // Config configures a device agent.
 type Config struct {
-	ServerURL string
-	Token     string
-	DeviceID  string
-	Name      string
-	Shell     string
-	DataDir   string
-	Insecure  bool
+	ServerURL  string
+	Token      string
+	DeviceID   string
+	Name       string
+	Shell      string
+	DataDir    string
+	Insecure   bool
 	AllowPaths []string
 }
 
