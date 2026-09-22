@@ -6,6 +6,10 @@ web console provides remote terminals, file transfer and device management.
 The server and agent are single Go binaries; the web UI is a React single-page
 app embedded into the server binary.
 
+The server persists its device catalog in SQLite (`data/devices.db`) using the
+pure-Go `modernc.org/sqlite` driver, so the release binary has no CGO
+dependency.
+
 The design intentionally borrows ideas from mature open-source projects:
 MeshCentral-style web remote management, RustDesk-style lightweight outbound
 agents, and Tailscale-style "device identity plus relay" thinking. The code is
