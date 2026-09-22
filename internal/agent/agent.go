@@ -311,6 +311,9 @@ func defaultShell() string {
 		return shell
 	}
 	if runtime.GOOS == "windows" {
+		if comspec := os.Getenv("COMSPEC"); comspec != "" {
+			return comspec
+		}
 		return "cmd.exe"
 	}
 	return "/bin/sh"

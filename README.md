@@ -29,6 +29,30 @@ Browser ──HTTPS/WSS──> Relay Server <──WSS── Agent (home PC, NAS
 - Files can be uploaded to the agent's `uploads/` directory or downloaded from
   an arbitrary path readable by the agent process.
 
+## Platform support
+
+- Server: Linux (amd64/arm64). The SQLite driver is pure Go, so the server
+  builds with `CGO_ENABLED=0` and has no native dependencies.
+- Agent: Windows (ConPTY), macOS and Linux (PTY).
+
+Build all release binaries with:
+
+```bash
+make cross
+```
+
+Outputs:
+
+```text
+bin/devicerelay-server-linux-amd64
+bin/devicerelay-agent-linux-amd64
+bin/devicerelay-agent-windows-amd64.exe
+bin/devicerelay-agent-darwin-arm64
+```
+
+Windows terminals are backed by Windows ConPTY, so interactive `cmd.exe` and
+PowerShell sessions work the same as Unix PTY sessions.
+
 ## Quickstart
 
 ```bash

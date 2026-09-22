@@ -3,6 +3,7 @@ module github.com/pcc-258/device-relay
 go 1.26.0
 
 require (
+	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/gorilla/websocket v1.5.3
 	golang.org/x/crypto v0.57.0
