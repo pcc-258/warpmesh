@@ -27,6 +27,10 @@ original and Apache-2.0 licensed.
 Browser ──HTTPS/WSS──> Relay Server <──WSS── Agent (home PC, NAS, Linux box...)
 ```
 
+See [docs/architecture.md](docs/architecture.md) for the full design,
+including Mermaid diagrams for deployment, registration, terminal sessions,
+file transfer and the SQLite data model.
+
 - Agents never need a public IP or inbound firewall rules.
 - The server authenticates browsers with an admin token and agents with a
   shared device token.
