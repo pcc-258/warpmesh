@@ -47,6 +47,7 @@ func main() {
 		WebFS:         web,
 		AdminUser:     *adminUser,
 		AdminPassword: *adminPassword,
+		AgentListen:   *altHTTPSListen,
 	})
 	if err != nil {
 		log.Fatalf("create server: %v", err)

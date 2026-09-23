@@ -1,12 +1,16 @@
 package main
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pcc-258/warpmesh/internal/agent"
 )
@@ -25,6 +29,15 @@ func main() {
 	vncPort := flag.Int("vnc-port", envInt("DEVICE_RELAY_VNC_PORT", 5900), "local VNC server port used for remote desktop")
 	flag.Parse()
 
+	agentServerURL := *serverURL
+	if strings.HasPrefix(agentServerURL, "http://") || strings.HasPrefix(agentServerURL, "https://") {
+		resolved, err := resolveAgentEndpoint(agentServerURL, *insecure)
+		if err != nil {
+			log.Fatalf("resolve agent endpoint: %v", err)
+		}
+		agentServerURL = resolved
+	}
+
 	var paths []string
 	for _, p := range splitComma(*allowPaths) {
 		if p != "" {
@@ -42,7 +55,7 @@ func main() {
 		}
 	}
 	a, err := agent.New(agent.Config{
-		ServerURL:   *serverURL,
+		ServerURL:   agentServerURL,
 		Token:       *token,
 		DeviceID:    *deviceID,
 		Name:        *name,
@@ -58,6 +71,28 @@ func main() {
 		log.Fatalf("create agent: %v", err)
 	}
 	a.Run()
+}
+
+func resolveAgentEndpoint(base string, insecure bool) (string, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	if insecure {
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
+	resp, err := client.Get(strings.TrimRight(base, "/") + "/api/agent-config")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var cfg struct {
+		AgentWSS string `json:"agentWSS"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return "", err
+	}
+	if cfg.AgentWSS == "" {
+		return "", fmt.Errorf("server did not publish an agent endpoint")
+	}
+	return cfg.AgentWSS, nil
 }
 
 func parseForwards(spec string) ([]agent.ForwardSpec, error) {

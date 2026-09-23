@@ -85,8 +85,9 @@ TCP 80 and 443 must be open. The server redirects HTTP to HTTPS and
 automatically renews certificates.
 
 Port split: the web console and browser WebSockets live on 443; the agent
-control plane and screen-link data plane live on 18443. Agents never talk to
-the web port.
+control plane and screen-link data plane live on a server-configured port
+(`DEVICE_RELAY_ALT_HTTPS_LISTEN`). Agents discover it via `/api/agent-config`
+and never hardcode the port.
 
 ## 4. Authentication and Access Model
 

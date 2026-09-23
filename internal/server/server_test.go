@@ -548,6 +548,34 @@ func TestScreenRelay(t *testing.T) {
 	}
 }
 
+func TestAgentConfigEndpoint(t *testing.T) {
+	srv, err := NewServer(Config{
+		DataDir:     t.TempDir(),
+		AgentListen: ":18443",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/agent-config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var cfg struct {
+		AgentWSS string `json:"agentWSS"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(cfg.AgentWSS, ":18443/ws/agent") {
+		t.Fatalf("unexpected agent endpoint: %s", cfg.AgentWSS)
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

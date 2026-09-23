@@ -111,8 +111,9 @@ Three options, from easiest to most manual:
    ```
 
    The server obtains and renews certificates automatically, the web UI is
-   `https://relay.example.com`, and agents connect with
-   `wss://relay.example.com:18443/ws/agent`.
+   `https://relay.example.com`, and agents only need the web address. The agent
+   plane port is configured on the server with `DEVICE_RELAY_ALT_HTTPS_LISTEN`
+   and published by `/api/agent-config`.
 
 2. Bring your own certificate:
 

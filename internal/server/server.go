@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"mime"
@@ -27,6 +28,7 @@ type Config struct {
 	WebFS         fs.FS
 	AdminUser     string
 	AdminPassword string
+	AgentListen   string
 }
 
 type agentConn struct {
@@ -146,6 +148,7 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/device-keys", s.handleDeviceKeys)
 	mux.HandleFunc("/api/device-keys/", s.handleDeviceKeyByID)
 	mux.HandleFunc("/api/audit", s.handleAudit)
+	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
 	if includeAgent {
 		mux.HandleFunc("/ws/agent", s.handleAgentWS)
 	}
@@ -163,6 +166,7 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 func (s *Server) AgentHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
 	mux.HandleFunc("/ws/agent", s.handleAgentWS)
 	mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
 	return mux
@@ -175,6 +179,26 @@ func (s *Server) Close() error {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// handleAgentConfig publishes the agent-plane endpoint so clients do not need
+// to hardcode the relay port.
+func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		host = h
+	}
+	scheme := "ws"
+	if r.TLS != nil {
+		scheme = "wss"
+	}
+	port := strings.TrimPrefix(s.cfg.AgentListen, ":")
+	if port == "" {
+		port = "443"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agentWSS": fmt.Sprintf("%s://%s:%s/ws/agent", scheme, host, port),
+	})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
