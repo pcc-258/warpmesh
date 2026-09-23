@@ -6,7 +6,7 @@ sleep 1
 
 export DISPLAY=:1
 fluxbox &
-xsetroot -solid "#171d24" &
+xsetroot -solid "#2dd4bf" &
 
 x11vnc -display :1 -forever -shared -rfbport 5900 -nopw -bg
 
