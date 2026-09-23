@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"io/fs"
@@ -10,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/crypto/acme/autocert"
+	"github.com/caddyserver/certmagic"
 
 	relay "github.com/pcc-258/warpmesh"
 	"github.com/pcc-258/warpmesh/internal/server"
@@ -57,7 +58,7 @@ func main() {
 
 	switch {
 	case *domain != "":
-		runAutomaticHTTPS(handler, agentHandler, *domain, *acmeEmail, *dataDir, *httpsListen, *altHTTPSListen, *httpListen, *adminToken)
+		runCertMagic(handler, agentHandler, *domain, *acmeEmail, *dataDir, *httpsListen, *altHTTPSListen, *httpListen, *adminToken)
 	case *tlsCert != "" && *tlsKey != "":
 		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 		if err != nil {
@@ -85,25 +86,33 @@ func main() {
 	}
 }
 
-func runAutomaticHTTPS(webHandler, agentHandler http.Handler, domain, acmeEmail, dataDir, httpsListen, altHTTPSListen, httpListen, adminToken string) {
+func runCertMagic(webHandler, agentHandler http.Handler, domain, acmeEmail, dataDir, httpsListen, altHTTPSListen, httpListen, adminToken string) {
 	certDir := filepath.Join(dataDir, "certs")
-	manager := &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(domain),
-		Cache:      autocert.DirCache(certDir),
-		Email:      acmeEmail,
+	magic := certmagic.NewDefault()
+	magic.Storage = &certmagic.FileStorage{Path: certDir}
+	issuer := certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
+		Email:  acmeEmail,
+		Agreed: true,
+		CA:     certmagic.LetsEncryptProductionCA,
+	})
+	magic.Issuers = []certmagic.Issuer{issuer}
+	ctx := context.Background()
+	if err := magic.ManageSync(ctx, []string{domain}); err != nil {
+		log.Fatalf("manage certificates: %v", err)
 	}
+	tlsConfig := magic.TLSConfig()
+	tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
 
 	httpsSrv := &http.Server{
 		Addr:      httpsListen,
 		Handler:   webHandler,
-		TLSConfig: manager.TLSConfig(),
+		TLSConfig: tlsConfig,
 	}
 	if altHTTPSListen != "" {
 		altSrv := &http.Server{
 			Addr:      altHTTPSListen,
 			Handler:   agentHandler,
-			TLSConfig: manager.TLSConfig(),
+			TLSConfig: tlsConfig,
 		}
 		go func() {
 			log.Printf("warpmesh agent plane serving HTTPS on %s for %s", altHTTPSListen, domain)
@@ -111,7 +120,7 @@ func runAutomaticHTTPS(webHandler, agentHandler http.Handler, domain, acmeEmail,
 		}()
 	}
 	go func() {
-		challengeHandler := manager.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		challengeHandler := issuer.HTTPChallengeHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusMovedPermanently)
 		}))
 		log.Printf("ACME/redirect server on %s for %s", httpListen, domain)

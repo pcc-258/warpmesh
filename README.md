@@ -115,6 +115,10 @@ Three options, from easiest to most manual:
    plane port is configured on the server with `DEVICE_RELAY_ALT_HTTPS_LISTEN`
    and published by `/api/agent-config`.
 
+   Certificates are managed by `certmagic` (the certificate engine behind
+   Caddy): automatic issuance, renewal before expiry, retry, disk storage and
+   hot reload are handled by the library.
+
 2. Bring your own certificate:
 
    ```bash

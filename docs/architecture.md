@@ -34,7 +34,7 @@ The three binaries are:
 
 | Binary | Platform | Responsibility |
 | --- | --- | --- |
-| `warpmesh-server` | Linux | HTTP API, WebSocket relay, static web UI, SQLite persistence, Let's Encrypt |
+| `warpmesh-server` | Linux | HTTP API, WebSocket relay, static web UI, SQLite persistence, certmagic-managed Let's Encrypt |
 | `warpmesh-agent` | Windows / macOS / Linux | Outbound registration, heartbeat, PTY/ConPTY terminal, file transfer |
 | Web UI | embedded into server | Dashboard, device management, terminal, file transfer, device keys |
 
