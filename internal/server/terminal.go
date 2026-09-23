@@ -19,6 +19,10 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device"})
 		return
 	}
+	if !s.canAccessDevice(actor, deviceID) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "device not granted"})
+		return
+	}
 	agent := s.getAgent(deviceID)
 	if agent == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})

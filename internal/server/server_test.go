@@ -662,6 +662,83 @@ func TestFileManagerRelay(t *testing.T) {
 	}
 }
 
+func TestUserDevicePermission(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken:    "admin-token",
+		DataDir:       t.TempDir(),
+		AdminUser:     "admin",
+		AdminPassword: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	if _, err := srv.reg.Upsert("dev-a", "a", "a", "linux", "amd64", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.reg.Upsert("dev-b", "b", "b", "linux", "amd64", nil); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	login := func(username, password string) string {
+		body, _ := json.Marshal(map[string]string{"username": username, "password": password})
+		resp, err := http.Post(ts.URL+"/api/login", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var out struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Token
+	}
+
+	adminToken := login("admin", "secret")
+	createBody := []byte(`{"username":"operator1","password":"pw","role":"operator","deviceIds":["dev-a"]}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/users", bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create user failed: %d", resp.StatusCode)
+	}
+
+	opToken := login("operator1", "pw")
+	devReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/devices", nil)
+	devReq.Header.Set("Authorization", "Bearer "+opToken)
+	devResp, err := http.DefaultClient.Do(devReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = devResp.Body.Close() }()
+	var devices []Device
+	if err := json.NewDecoder(devResp.Body).Decode(&devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].ID != "dev-a" {
+		t.Fatalf("operator should only see dev-a, got %+v", devices)
+	}
+
+	usersReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/users", nil)
+	usersReq.Header.Set("Authorization", "Bearer "+opToken)
+	usersResp, err := http.DefaultClient.Do(usersReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = usersResp.Body.Close()
+	if usersResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("operator should not manage users, got %d", usersResp.StatusCode)
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

@@ -749,6 +749,27 @@ input:focus {
   flex: none;
 }
 
+.user-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.user-form select {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 9px 10px;
+}
+
+.user-form .primary-btn {
+  margin-top: 0;
+  align-self: end;
+}
+
 .spin {
   animation: spin 1s linear infinite;
 }

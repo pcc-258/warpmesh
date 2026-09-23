@@ -157,6 +157,8 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/invites", s.handleInvites)
 	mux.HandleFunc("/api/invites/", s.handleInviteByCode)
 	mux.HandleFunc("/api/enroll", s.handleEnroll)
+	mux.HandleFunc("/api/users", s.handleUsers)
+	mux.HandleFunc("/api/users/", s.handleUserByUsername)
 	mux.HandleFunc("/api/audit", s.handleAudit)
 	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
 	if includeAgent {
@@ -340,7 +342,50 @@ func (s *Server) validSession(token string) (string, bool) {
 		}
 		return "", false
 	}
+	if user, err := s.reg.GetUser(entry.username); err == nil {
+		if !user.ExpiresAt.IsZero() && time.Now().After(user.ExpiresAt) {
+			s.sessionsMu.Lock()
+			delete(s.sessions, token)
+			s.sessionsMu.Unlock()
+			return "", false
+		}
+	}
 	return entry.username, true
+}
+
+func (s *Server) actorInfo(actor string) (User, bool) {
+	if actor == "admin-token" {
+		return User{Role: "admin"}, true
+	}
+	user, err := s.reg.GetUser(actor)
+	if err != nil {
+		return User{}, false
+	}
+	if !user.ExpiresAt.IsZero() && time.Now().After(user.ExpiresAt) {
+		return User{}, false
+	}
+	return user, true
+}
+
+func (s *Server) isAdmin(actor string) bool {
+	user, ok := s.actorInfo(actor)
+	return ok && user.Role == "admin"
+}
+
+func (s *Server) canAccessDevice(actor, deviceID string) bool {
+	user, ok := s.actorInfo(actor)
+	if !ok {
+		return false
+	}
+	if user.Role == "admin" {
+		return true
+	}
+	for _, id := range user.DeviceIDs {
+		if id == deviceID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) allowLoginAttempt(key string) bool {

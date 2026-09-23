@@ -36,6 +36,8 @@ type User struct {
 	ID        int64     `json:"id"`
 	Username  string    `json:"username"`
 	Role      string    `json:"role"`
+	DeviceIDs []string  `json:"deviceIds,omitempty"`
+	ExpiresAt time.Time `json:"expiresAt,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 }
 
@@ -85,7 +87,9 @@ CREATE TABLE IF NOT EXISTS users (
 	username      TEXT UNIQUE NOT NULL,
 	password_hash TEXT NOT NULL,
 	role          TEXT NOT NULL DEFAULT 'admin',
-	created_at    TEXT NOT NULL
+	created_at    TEXT NOT NULL,
+	expires_at    TEXT NOT NULL DEFAULT '',
+	device_ids    TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS device_keys (
@@ -150,6 +154,14 @@ func NewRegistry(dataDir string) (*Registry, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := r.ensureColumn("users", "expires_at", "expires_at TEXT NOT NULL DEFAULT ''"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := r.ensureColumn("users", "device_ids", "device_ids TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Agents reconnect after a restart; nothing is online until it says hello.
 	if _, err := db.Exec("UPDATE devices SET online = 0"); err != nil {
 		_ = db.Close()
@@ -207,7 +219,7 @@ func (r *Registry) EnsureUser(username, password, role string) error {
 	if count > 0 {
 		return nil
 	}
-	_, err = r.db.Exec("INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+	_, err = r.db.Exec("INSERT INTO users (username, password_hash, role, created_at, expires_at, device_ids) VALUES (?, ?, ?, ?, '', '[]')",
 		username, string(hash), role, time.Now().Format(time.RFC3339Nano))
 	return err
 }
@@ -217,15 +229,146 @@ func (r *Registry) ValidateUser(username, password string) (User, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var u User
-	var hash string
-	if err := r.db.QueryRow("SELECT id, username, role, password_hash FROM users WHERE username = ?", username).
-		Scan(&u.ID, &u.Username, &u.Role, &hash); err != nil {
+	var hash, expires, deviceIDs string
+	if err := r.db.QueryRow("SELECT id, username, role, password_hash, expires_at, device_ids FROM users WHERE username = ?", username).
+		Scan(&u.ID, &u.Username, &u.Role, &hash, &expires, &deviceIDs); err != nil {
 		return User{}, errors.New("invalid credentials")
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return User{}, errors.New("invalid credentials")
 	}
+	if expires != "" {
+		expiresTime, err := time.Parse(time.RFC3339Nano, expires)
+		if err == nil && time.Now().After(expiresTime) {
+			return User{}, errors.New("account expired")
+		}
+		u.ExpiresAt = expiresTime
+	}
+	_ = json.Unmarshal([]byte(deviceIDs), &u.DeviceIDs)
 	return u, nil
+}
+
+func (r *Registry) GetUser(username string) (User, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.getUserLocked(username)
+}
+
+func (r *Registry) getUserLocked(username string) (User, error) {
+	var u User
+	var created, expires, deviceIDs string
+	err := r.db.QueryRow("SELECT id, username, role, created_at, expires_at, device_ids FROM users WHERE username = ?", username).
+		Scan(&u.ID, &u.Username, &u.Role, &created, &expires, &deviceIDs)
+	if err != nil {
+		return User{}, err
+	}
+	u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	if expires != "" {
+		u.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	}
+	_ = json.Unmarshal([]byte(deviceIDs), &u.DeviceIDs)
+	return u, nil
+}
+
+func (r *Registry) ListUsers() []User {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rows, err := r.db.Query("SELECT id, username, role, created_at, expires_at, device_ids FROM users ORDER BY username COLLATE NOCASE")
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]User, 0)
+	for rows.Next() {
+		var u User
+		var created, expires, deviceIDs string
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &created, &expires, &deviceIDs); err != nil {
+			continue
+		}
+		u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		if expires != "" {
+			u.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+		}
+		_ = json.Unmarshal([]byte(deviceIDs), &u.DeviceIDs)
+		out = append(out, u)
+	}
+	return out
+}
+
+func (r *Registry) CreateUser(username, password, role string, deviceIDs []string, expiresAt time.Time) error {
+	if username == "" || password == "" {
+		return errors.New("username and password are required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(deviceIDs)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err = r.db.Exec("INSERT INTO users (username, password_hash, role, created_at, expires_at, device_ids) VALUES (?, ?, ?, ?, ?, ?)",
+		username, string(hash), role, time.Now().Format(time.RFC3339Nano), formatTime(expiresAt), string(raw))
+	return err
+}
+
+func (r *Registry) UpdateUser(username string, password *string, role *string, deviceIDs *[]string, expiresAt *time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, err := r.getUserLocked(username)
+	if err != nil {
+		return errors.New("user not found")
+	}
+	newPasswordHash := ""
+	if password != nil {
+		hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		newPasswordHash = string(hash)
+	}
+	if role == nil {
+		role = &u.Role
+	}
+	if deviceIDs == nil {
+		deviceIDs = &u.DeviceIDs
+	}
+	if expiresAt == nil {
+		*expiresAt = u.ExpiresAt
+	}
+	// Keep the stored hash when the password is unchanged.
+	var storedHash string
+	_ = r.db.QueryRow("SELECT password_hash FROM users WHERE username = ?", username).Scan(&storedHash)
+	if newPasswordHash == "" {
+		newPasswordHash = storedHash
+	}
+	raw, _ := json.Marshal(*deviceIDs)
+	_, err = r.db.Exec("UPDATE users SET password_hash = ?, role = ?, expires_at = ?, device_ids = ? WHERE username = ?",
+		newPasswordHash, *role, formatTime(*expiresAt), string(raw), username)
+	return err
+}
+
+func (r *Registry) DeleteUser(username string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res, err := r.db.Exec("DELETE FROM users WHERE username = ?", username)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("user not found")
+	}
+	return nil
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
 }
 
 // Upsert registers metadata for a device and returns the stored record.

@@ -29,8 +29,10 @@ import {
   clearToken,
   createDeviceKey,
   createInvite,
+  createUser,
   deleteInvite,
   deleteDevice,
+  deleteUser,
   getStats,
   getToken,
   lastSeenLabel,
@@ -38,16 +40,19 @@ import {
   listDeviceKeys,
   listDevices,
   listInvites,
+  listUsers,
   login,
   logout,
   renameDevice,
   revokeDeviceKey,
   rotateDeviceKey,
+  updateUser,
   type AuditEntry,
   type Device,
   type DeviceKey,
   type Invite,
   type Stats,
+  type UserAccount,
   wsUrl,
 } from "./api";
 
@@ -187,6 +192,8 @@ function Console({
   const [stats, setStats] = useState<Stats | null>(null);
   const [keys, setKeys] = useState<DeviceKey[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
+  const [users, setUsers] = useState<UserAccount[]>([]);
+  const [canManageUsers, setCanManageUsers] = useState(false);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -227,14 +234,24 @@ function Console({
     }
   }, []);
 
+  const loadUsers = useCallback(async () => {
+    try {
+      setUsers(await listUsers());
+      setCanManageUsers(true);
+    } catch {
+      setCanManageUsers(false);
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
     loadKeys();
     loadAudit();
     loadInvites();
+    loadUsers();
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, [refresh, loadKeys, loadAudit, loadInvites]);
+  }, [refresh, loadKeys, loadAudit, loadInvites, loadUsers]);
 
   const handleCreateKey = async () => {
     const name = prompt("Device name for the new key");
@@ -349,6 +366,10 @@ function Console({
             <AccessPage
               keys={keys}
               invites={invites}
+              users={users}
+              devices={devices}
+              canManageUsers={canManageUsers}
+              onUsersChanged={loadUsers}
               onCreate={handleCreateKey}
               onRevoke={handleRevokeKey}
               onRotate={handleRotateKey}
@@ -524,6 +545,10 @@ function DevicesPage({
 function AccessPage({
   keys,
   invites,
+  users,
+  devices,
+  canManageUsers,
+  onUsersChanged,
   onCreate,
   onRevoke,
   onRotate,
@@ -532,12 +557,78 @@ function AccessPage({
 }: {
   keys: DeviceKey[];
   invites: Invite[];
+  users: UserAccount[];
+  devices: Device[];
+  canManageUsers: boolean;
+  onUsersChanged: () => void;
   onCreate: () => void;
   onRevoke: (key: DeviceKey) => void;
   onRotate: (key: DeviceKey) => void;
   onCreateInvite: () => void;
   onDeleteInvite: (inv: Invite) => void;
 }) {
+  const [newUsername, setNewUsername] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newRole, setNewRole] = useState("operator");
+  const [newExpiry, setNewExpiry] = useState("");
+  const [newDevices, setNewDevices] = useState<string[]>([]);
+
+  const submitCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await createUser({
+      username: newUsername.trim(),
+      password: newPassword,
+      role: newRole,
+      deviceIds: newDevices,
+      expiresAt: newExpiry ? new Date(newExpiry).toISOString() : undefined,
+    });
+    setNewUsername("");
+    setNewPassword("");
+    setNewDevices([]);
+    setNewExpiry("");
+    onUsersChanged();
+  };
+
+  const handleResetPassword = async (user: UserAccount) => {
+    const password = prompt(`New password for ${user.username}`);
+    if (password) {
+      await updateUser(user.username, { password });
+      onUsersChanged();
+    }
+  };
+
+  const handleRole = async (user: UserAccount) => {
+    const role = prompt("Role (admin / operator)", user.role);
+    if (role === "admin" || role === "operator") {
+      await updateUser(user.username, { role });
+      onUsersChanged();
+    }
+  };
+
+  const handleExpiry = async (user: UserAccount) => {
+    const value = prompt("Expiry date (YYYY-MM-DD), empty for none", user.expiresAt ? user.expiresAt.slice(0, 10) : "");
+    if (value !== null) {
+      await updateUser(user.username, { expiresAt: value ? new Date(value).toISOString() : "" });
+      onUsersChanged();
+    }
+  };
+
+  const handleDevices = async (user: UserAccount) => {
+    const value = prompt("Allowed device ids, comma separated", user.deviceIds.join(","));
+    if (value !== null) {
+      const ids = value.split(",").map((s) => s.trim()).filter(Boolean);
+      await updateUser(user.username, { deviceIds: ids });
+      onUsersChanged();
+    }
+  };
+
+  const handleDeleteUser = async (user: UserAccount) => {
+    if (confirm(`Delete account ${user.username}?`)) {
+      await deleteUser(user.username);
+      onUsersChanged();
+    }
+  };
+
   return (
     <section className="panel">
       <div className="panel-head">
@@ -597,6 +688,64 @@ function AccessPage({
             </div>
           ))}
         </div>
+      )}
+
+      {canManageUsers && (
+        <>
+          <div className="panel-head">
+            <div>
+              <h3>Accounts</h3>
+              <p>Admin accounts have full access. Operators only access granted devices.</p>
+            </div>
+          </div>
+          <form className="user-form" onSubmit={submitCreateUser}>
+            <input value={newUsername} onChange={(e) => setNewUsername(e.target.value)} placeholder="username" required />
+            <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="password" required />
+            <select value={newRole} onChange={(e) => setNewRole(e.target.value)}>
+              <option value="operator">operator</option>
+              <option value="admin">admin</option>
+            </select>
+            <input type="date" value={newExpiry} onChange={(e) => setNewExpiry(e.target.value)} />
+            <select multiple value={newDevices} onChange={(e) => setNewDevices(Array.from(e.target.selectedOptions, (o) => o.value))}>
+              {devices.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name} ({d.id})
+                </option>
+              ))}
+            </select>
+            <button className="primary-btn inline" type="submit">
+              Create user
+            </button>
+          </form>
+          <div className="key-list">
+            {users.map((user) => (
+              <div className="key-row" key={user.username}>
+                <div>
+                  <strong>{user.username}</strong>
+                  <span>
+                    {user.role} · {user.deviceIds.length} devices
+                    {user.expiresAt ? ` · expires ${new Date(user.expiresAt).toLocaleDateString()}` : ""}
+                  </span>
+                </div>
+                <button className="icon-btn" title="Reset password" onClick={() => handleResetPassword(user)}>
+                  <Pencil size={14} />
+                </button>
+                <button className="icon-btn" title="Change role" onClick={() => handleRole(user)}>
+                  <ShieldCheck size={14} />
+                </button>
+                <button className="icon-btn" title="Set expiry" onClick={() => handleExpiry(user)}>
+                  <RefreshCw size={14} />
+                </button>
+                <button className="icon-btn" title="Edit devices" onClick={() => handleDevices(user)}>
+                  <MonitorSmartphone size={14} />
+                </button>
+                <button className="icon-btn danger" title="Delete account" onClick={() => handleDeleteUser(user)}>
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </section>
   );

@@ -17,8 +17,22 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.reg.List())
-	_ = actor
+	devices := s.reg.List()
+	if !s.isAdmin(actor) {
+		user, _ := s.actorInfo(actor)
+		allowed := make(map[string]bool)
+		for _, id := range user.DeviceIDs {
+			allowed[id] = true
+		}
+		filtered := make([]Device, 0)
+		for _, d := range devices {
+			if allowed[d.ID] {
+				filtered = append(filtered, d)
+			}
+		}
+		devices = filtered
+	}
+	writeJSON(w, http.StatusOK, devices)
 }
 
 func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
@@ -34,6 +48,10 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPatch:
+		if !s.isAdmin(actor) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
+			return
+		}
 		var req struct {
 			Name  string `json:"name"`
 			Group string `json:"group"`
@@ -59,6 +77,10 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 		d, _ := s.reg.Get(id)
 		writeJSON(w, http.StatusOK, d)
 	case http.MethodDelete:
+		if !s.isAdmin(actor) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
+			return
+		}
 		if err := s.reg.Delete(id); err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
 			return
@@ -71,12 +93,26 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	_, ok := s.authenticate(r)
+	actor, ok := s.authenticate(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
 	devices := s.reg.List()
+	if !s.isAdmin(actor) {
+		user, _ := s.actorInfo(actor)
+		allowed := make(map[string]bool)
+		for _, id := range user.DeviceIDs {
+			allowed[id] = true
+		}
+		filtered := make([]Device, 0)
+		for _, d := range devices {
+			if allowed[d.ID] {
+				filtered = append(filtered, d)
+			}
+		}
+		devices = filtered
+	}
 	byOS := make(map[string]int)
 	online := 0
 	for _, d := range devices {
@@ -98,6 +134,10 @@ func (s *Server) handleDeviceKeys(w http.ResponseWriter, r *http.Request) {
 	actor, ok := s.authenticate(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
 		return
 	}
 	switch r.Method {
@@ -131,6 +171,10 @@ func (s *Server) handleDeviceKeyByID(w http.ResponseWriter, r *http.Request) {
 	actor, ok := s.authenticate(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/device-keys/")
@@ -167,6 +211,10 @@ func (s *Server) handleInvites(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.reg.ListInvites())
@@ -194,6 +242,10 @@ func (s *Server) handleInviteByCode(w http.ResponseWriter, r *http.Request) {
 	actor, ok := s.authenticate(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
 		return
 	}
 	code := strings.TrimPrefix(r.URL.Path, "/api/invites/")
@@ -246,9 +298,13 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
-	_, ok := s.authenticate(r)
+	actor, ok := s.authenticate(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
 		return
 	}
 	limit := 50

@@ -33,6 +33,15 @@ export interface Invite {
   createdAt: string;
 }
 
+export interface UserAccount {
+  id: number;
+  username: string;
+  role: string;
+  deviceIds: string[];
+  expiresAt?: string;
+  createdAt: string;
+}
+
 export interface AuditEntry {
   id: number;
   actor: string;
@@ -137,6 +146,33 @@ export function createInvite(name: string): Promise<Invite> {
 
 export function deleteInvite(code: string): Promise<void> {
   return api<void>(`/api/invites/${code}`, { method: "DELETE" });
+}
+
+export function listUsers(): Promise<UserAccount[]> {
+  return api<UserAccount[]>("/api/users");
+}
+
+export function createUser(input: {
+  username: string;
+  password: string;
+  role: string;
+  deviceIds: string[];
+  expiresAt?: string;
+}): Promise<void> {
+  return api<void>("/api/users", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function updateUser(username: string, patch: {
+  password?: string;
+  role?: string;
+  deviceIds?: string[];
+  expiresAt?: string;
+}): Promise<void> {
+  return api<void>(`/api/users/${username}`, { method: "PATCH", body: JSON.stringify(patch) });
+}
+
+export function deleteUser(username: string): Promise<void> {
+  return api<void>(`/api/users/${username}`, { method: "DELETE" });
 }
 
 export function listAudit(limit = 50): Promise<AuditEntry[]> {
