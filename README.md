@@ -72,6 +72,37 @@ bin/warpmesh-agent-darwin-arm64
 Windows terminals are backed by Windows ConPTY, so interactive `cmd.exe` and
 PowerShell sessions work the same as Unix PTY sessions.
 
+## Agent CLI
+
+The agent binary has three modes:
+
+```bash
+# 1. Daemon mode: register this device to the relay
+./warpmesh-agent -server https://relay.example.com -token <device-key> -device-id <id> -name my-pc
+
+# 2. Remote terminal to another registered device
+./warpmesh-agent terminal -server https://relay.example.com -token <admin-token> -device <target-id>
+
+# 3. Open the graphical desktop of another device in the browser
+./warpmesh-agent desktop -server https://relay.example.com -device <target-id>
+```
+
+The daemon discovers the agent port from `/api/agent-config`; `terminal` and
+`desktop` talk to the web port directly.
+
+## Running in a container
+
+```bash
+podman build --build-arg AGENT_BINARY=bin/warpmesh-agent-linux-arm64 -t warpmesh-agent .
+
+podman run -d --name linux-box \
+  -e DEVICE_RELAY_SERVER=https://relay.example.com \
+  -e DEVICE_RELAY_TOKEN=<device-key> \
+  -e DEVICE_RELAY_DEVICE_ID=<id> \
+  -e DEVICE_RELAY_NAME=linux-box \
+  warpmesh-agent
+```
+
 ## Quickstart
 
 ```bash

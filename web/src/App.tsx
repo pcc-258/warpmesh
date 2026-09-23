@@ -56,6 +56,24 @@ export default function App() {
   const [token, setTokenState] = useState(getToken());
   const [view, setView] = useState<View>({ name: "page", page: "dashboard" });
 
+  useEffect(() => {
+    if (!token) {
+      return;
+    }
+    const match = location.hash.match(/^#\/(desktop|terminal)\/(.+)$/);
+    if (!match) {
+      return;
+    }
+    listDevices()
+      .then((devices) => {
+        const device = devices.find((d) => d.id === decodeURIComponent(match[2]));
+        if (device) {
+          setView({ name: match[1] === "desktop" ? "desktop" : "terminal", device });
+        }
+      })
+      .catch(() => {});
+  }, [token]);
+
   if (!token) {
     return <Login onLogin={() => setTokenState(getToken())} />;
   }
