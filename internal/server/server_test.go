@@ -14,11 +14,19 @@ import (
 	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
+func newTestKey(t *testing.T, srv *Server) DeviceKey {
+	t.Helper()
+	key, err := srv.reg.CreateDeviceKey("test-device", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
 func TestTerminalRelay(t *testing.T) {
 	srv, err := NewServer(Config{
-		AdminToken:  "admin-token",
-		DeviceToken: "device-token",
-		DataDir:     t.TempDir(),
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -28,14 +36,15 @@ func TestTerminalRelay(t *testing.T) {
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+	key := newTestKey(t, srv)
+	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer agentWS.Close()
 	if err := agentWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
-		DeviceID: "dev-1",
+		DeviceID: key.DeviceID,
 		Name:     "test box",
 		Hostname: "test-box",
 		OS:       "linux",
@@ -44,7 +53,7 @@ func TestTerminalRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get("dev-1")
+		dev, ok := srv.reg.Get(key.DeviceID)
 		return ok && dev.Online
 	})
 
@@ -69,7 +78,7 @@ func TestTerminalRelay(t *testing.T) {
 	}
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
-		baseWS+"/ws/terminal?token=admin-token&device=dev-1&cols=80&rows=24", nil,
+		baseWS+"/ws/terminal?token=admin-token&device="+key.DeviceID+"&cols=80&rows=24", nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +130,6 @@ func TestTerminalRelay(t *testing.T) {
 func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	srv, err := NewServer(Config{
 		AdminToken:    "admin-token",
-		DeviceToken:   "device-token",
 		DataDir:       t.TempDir(),
 		AdminUser:     "admin",
 		AdminPassword: "secret",
@@ -312,9 +320,8 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 
 func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	srv, err := NewServer(Config{
-		AdminToken:  "admin-token",
-		DeviceToken: "device-token",
-		DataDir:     t.TempDir(),
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -324,16 +331,18 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
-	dialAgent := func(deviceID string) *websocket.Conn {
-		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+	keyA := newTestKey(t, srv)
+	keyB := newTestKey(t, srv)
+	dialAgent := func(key DeviceKey) *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := ws.WriteJSON(protocol.Message{
 			Type:     protocol.TypeHello,
-			DeviceID: deviceID,
-			Name:     deviceID,
-			Hostname: deviceID,
+			DeviceID: key.DeviceID,
+			Name:     key.DeviceID,
+			Hostname: key.DeviceID,
 			OS:       "linux",
 			Arch:     "amd64",
 		}); err != nil {
@@ -342,15 +351,20 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 		return ws
 	}
 
-	agentA := dialAgent("dev-a")
+	agentA := dialAgent(keyA)
 	defer agentA.Close()
-	agentB := dialAgent("dev-b")
+	agentB := dialAgent(keyB)
 	defer agentB.Close()
+	waitFor(t, func() bool {
+		_, okA := srv.reg.Get(keyA.DeviceID)
+		_, okB := srv.reg.Get(keyB.DeviceID)
+		return okA && okB
+	})
 
 	if err := agentA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
 		SessionID: "s1",
-		Target:    "dev-b",
+		Target:    keyB.DeviceID,
 		Port:      22,
 	}); err != nil {
 		t.Fatal(err)
@@ -406,9 +420,8 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 
 func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	srv, err := NewServer(Config{
-		AdminToken:  "admin-token",
-		DeviceToken: "device-token",
-		DataDir:     t.TempDir(),
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -418,16 +431,18 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
-	dialAgent := func(deviceID string) *websocket.Conn {
-		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+	keyA := newTestKey(t, srv)
+	keyB := newTestKey(t, srv)
+	dialAgent := func(key DeviceKey) *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := ws.WriteJSON(protocol.Message{
 			Type:     protocol.TypeHello,
-			DeviceID: deviceID,
-			Name:     deviceID,
-			Hostname: deviceID,
+			DeviceID: key.DeviceID,
+			Name:     key.DeviceID,
+			Hostname: key.DeviceID,
 			OS:       "linux",
 			Arch:     "amd64",
 		}); err != nil {
@@ -436,15 +451,20 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 		return ws
 	}
 
-	agentA := dialAgent("dev-a")
+	agentA := dialAgent(keyA)
 	defer agentA.Close()
-	agentB := dialAgent("dev-b")
+	agentB := dialAgent(keyB)
 	defer agentB.Close()
+	waitFor(t, func() bool {
+		_, okA := srv.reg.Get(keyA.DeviceID)
+		_, okB := srv.reg.Get(keyB.DeviceID)
+		return okA && okB
+	})
 
 	if err := agentA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
 		SessionID: "s-direct",
-		Target:    "dev-b",
+		Target:    keyB.DeviceID,
 		Port:      22,
 	}); err != nil {
 		t.Fatal(err)
@@ -478,9 +498,8 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 
 func TestScreenRelay(t *testing.T) {
 	srv, err := NewServer(Config{
-		AdminToken:  "admin-token",
-		DeviceToken: "device-token",
-		DataDir:     t.TempDir(),
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -490,14 +509,15 @@ func TestScreenRelay(t *testing.T) {
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token=device-token", nil)
+	key := newTestKey(t, srv)
+	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer agentWS.Close()
 	if err := agentWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
-		DeviceID: "dev-s",
+		DeviceID: key.DeviceID,
 		Name:     "screen box",
 		Hostname: "screen-box",
 		OS:       "windows",
@@ -506,12 +526,12 @@ func TestScreenRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get("dev-s")
+		dev, ok := srv.reg.Get(key.DeviceID)
 		return ok && dev.Online
 	})
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
-		baseWS+"/ws/screen?token=admin-token&device=dev-s", nil,
+		baseWS+"/ws/screen?token=admin-token&device="+key.DeviceID, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -524,7 +544,7 @@ func TestScreenRelay(t *testing.T) {
 	}
 
 	linkWS, _, err := websocket.DefaultDialer.Dial(
-		baseWS+"/ws/screen-link?token=device-token&device=dev-s&session="+start.SessionID, nil,
+		baseWS+"/ws/screen-link?token="+key.Token+"&device="+key.DeviceID+"&session="+start.SessionID, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

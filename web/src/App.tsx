@@ -26,6 +26,8 @@ import "@xterm/xterm/css/xterm.css";
 import {
   clearToken,
   createDeviceKey,
+  createInvite,
+  deleteInvite,
   deleteDevice,
   getStats,
   getToken,
@@ -33,13 +35,16 @@ import {
   listAudit,
   listDeviceKeys,
   listDevices,
+  listInvites,
   login,
   logout,
   renameDevice,
   revokeDeviceKey,
+  rotateDeviceKey,
   type AuditEntry,
   type Device,
   type DeviceKey,
+  type Invite,
   type Stats,
   wsUrl,
 } from "./api";
@@ -179,6 +184,7 @@ function Console({
   const [devices, setDevices] = useState<Device[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [keys, setKeys] = useState<DeviceKey[]>([]);
+  const [invites, setInvites] = useState<Invite[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -211,13 +217,22 @@ function Console({
     }
   }, []);
 
+  const loadInvites = useCallback(async () => {
+    try {
+      setInvites(await listInvites());
+    } catch {
+      // secondary panel; dashboard keeps working
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
     loadKeys();
     loadAudit();
+    loadInvites();
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, [refresh, loadKeys, loadAudit]);
+  }, [refresh, loadKeys, loadAudit, loadInvites]);
 
   const handleCreateKey = async () => {
     const name = prompt("Device name for the new key");
@@ -235,6 +250,37 @@ function Console({
     if (confirm(`Revoke device key for ${key.name}?`)) {
       await revokeDeviceKey(key.deviceId);
       loadKeys();
+    }
+  };
+
+  const handleRotateKey = async (key: DeviceKey) => {
+    if (confirm(`Rotate the device key for ${key.name}? The old token stops working.`)) {
+      try {
+        const rotated = await rotateDeviceKey(key.deviceId);
+        alert(`New device token:\n\n${rotated.token}\n\nIt is shown once.`);
+        loadKeys();
+      } catch (err) {
+        alert(err instanceof Error ? err.message : "rotation failed");
+      }
+    }
+  };
+
+  const handleCreateInvite = async () => {
+    const name = prompt("Device name for the invite");
+    if (!name?.trim()) return;
+    try {
+      const inv = await createInvite(name.trim());
+      alert(`Invite code:\n\n${inv.code}\n\nRun on the device:\nwarpmesh-agent enroll -server https://warpmesh.ddns.net -code ${inv.code} -name ${name.trim()}`);
+      loadInvites();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "invite creation failed");
+    }
+  };
+
+  const handleDeleteInvite = async (inv: Invite) => {
+    if (confirm(`Delete invite ${inv.code}?`)) {
+      await deleteInvite(inv.code);
+      loadInvites();
     }
   };
 
@@ -297,7 +343,17 @@ function Console({
           {page === "devices" && (
             <DevicesPage devices={devices} onTerminal={onTerminal} onDesktop={onDesktop} onFiles={onFiles} />
           )}
-          {page === "access" && <AccessPage keys={keys} onCreate={handleCreateKey} onRevoke={handleRevokeKey} />}
+          {page === "access" && (
+            <AccessPage
+              keys={keys}
+              invites={invites}
+              onCreate={handleCreateKey}
+              onRevoke={handleRevokeKey}
+              onRotate={handleRotateKey}
+              onCreateInvite={handleCreateInvite}
+              onDeleteInvite={handleDeleteInvite}
+            />
+          )}
           {page === "activity" && <ActivityPage audit={audit} />}
         </div>
       </section>
@@ -465,12 +521,20 @@ function DevicesPage({
 
 function AccessPage({
   keys,
+  invites,
   onCreate,
   onRevoke,
+  onRotate,
+  onCreateInvite,
+  onDeleteInvite,
 }: {
   keys: DeviceKey[];
+  invites: Invite[];
   onCreate: () => void;
   onRevoke: (key: DeviceKey) => void;
+  onRotate: (key: DeviceKey) => void;
+  onCreateInvite: () => void;
+  onDeleteInvite: (inv: Invite) => void;
 }) {
   return (
     <section className="panel">
@@ -493,8 +557,39 @@ function AccessPage({
               <div>
                 <strong>{key.name}</strong>
                 <span>{key.deviceId}</span>
+                {key.expiresAt && <small>expires {new Date(key.expiresAt).toLocaleDateString()}</small>}
               </div>
+              <button className="icon-btn" title="Rotate key" onClick={() => onRotate(key)}>
+                <RefreshCw size={14} />
+              </button>
               <button className="icon-btn danger" title="Revoke" onClick={() => onRevoke(key)}>
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="panel-head">
+        <div>
+          <h3>Invite codes</h3>
+          <p>One-time enrollment codes. Devices redeem them for a long-lived key.</p>
+        </div>
+        <button className="primary-btn inline" onClick={onCreateInvite}>
+          New invite
+        </button>
+      </div>
+      {invites.length === 0 ? (
+        <div className="inline-empty">No invite codes yet.</div>
+      ) : (
+        <div className="key-list">
+          {invites.map((inv) => (
+            <div className="key-row" key={inv.code}>
+              <div>
+                <strong>{inv.code}</strong>
+                <span>{inv.name} · expires {new Date(inv.expiresAt).toLocaleDateString()}</span>
+              </div>
+              <button className="icon-btn danger" title="Delete invite" onClick={() => onDeleteInvite(inv)}>
                 <Trash2 size={14} />
               </button>
             </div>

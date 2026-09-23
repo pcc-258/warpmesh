@@ -23,12 +23,12 @@ import (
 // Config controls the relay server.
 type Config struct {
 	AdminToken    string
-	DeviceToken   string
 	DataDir       string
 	WebFS         fs.FS
 	AdminUser     string
 	AdminPassword string
 	AgentListen   string
+	KeyTTL        time.Duration
 }
 
 type agentConn struct {
@@ -147,6 +147,9 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/device-keys", s.handleDeviceKeys)
 	mux.HandleFunc("/api/device-keys/", s.handleDeviceKeyByID)
+	mux.HandleFunc("/api/invites", s.handleInvites)
+	mux.HandleFunc("/api/invites/", s.handleInviteByCode)
+	mux.HandleFunc("/api/enroll", s.handleEnroll)
 	mux.HandleFunc("/api/audit", s.handleAudit)
 	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
 	if includeAgent {
@@ -294,15 +297,16 @@ func (s *Server) validAdmin(token string) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) == 1
 }
 
-func (s *Server) validDevice(token string) bool {
-	return subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.DeviceToken)) == 1
+func (s *Server) authorizeAgent(deviceID, token string) bool {
+	return s.reg.ValidateDeviceKey(deviceID, token)
 }
 
-func (s *Server) authorizeAgent(deviceID, token string) bool {
-	if s.validDevice(token) {
-		return true
+func bearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
 	}
-	return s.reg.ValidateDeviceKey(deviceID, token)
+	return ""
 }
 
 func (s *Server) authenticate(r *http.Request) (string, bool) {

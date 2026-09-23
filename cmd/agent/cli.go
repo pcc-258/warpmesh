@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -100,6 +103,51 @@ func runDesktopCLI(args []string) {
 	if !*noOpen {
 		openURL(u)
 	}
+}
+
+func runEnrollCLI(args []string) {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	server := fs.String("server", "https://warpmesh.ddns.net", "web base URL")
+	code := fs.String("code", "", "one-time invite code")
+	name := fs.String("name", "", "device name")
+	dataDir := fs.String("data-dir", "data", "directory to persist device id and token")
+	_ = fs.Parse(args)
+
+	if *code == "" {
+		fmt.Fprintln(os.Stderr, "usage: warpmesh-agent enroll -server https://host -code <invite> -name <device-name>")
+		os.Exit(2)
+	}
+	body := strings.NewReader(fmt.Sprintf(`{"code":%q,"name":%q}`, *code, *name))
+	resp, err := http.Post(strings.TrimRight(*server, "/")+"/api/enroll", "application/json", body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "enroll: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var key struct {
+		DeviceID  string `json:"deviceId"`
+		Name      string `json:"name"`
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&key); err != nil {
+		fmt.Fprintf(os.Stderr, "enroll: %v\n", err)
+		os.Exit(1)
+	}
+	if key.Token == "" {
+		fmt.Fprintln(os.Stderr, "enroll failed: invalid invite")
+		os.Exit(1)
+	}
+	if *dataDir != "" {
+		if err := os.MkdirAll(*dataDir, 0o700); err != nil {
+			fmt.Fprintf(os.Stderr, "enroll: %v\n", err)
+			os.Exit(1)
+		}
+		_ = os.WriteFile(filepath.Join(*dataDir, "device-id"), []byte(key.DeviceID), 0o600)
+		_ = os.WriteFile(filepath.Join(*dataDir, "token"), []byte(key.Token), 0o600)
+	}
+	raw, _ := json.MarshalIndent(key, "", "  ")
+	fmt.Println(string(raw))
 }
 
 func openURL(u string) {

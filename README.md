@@ -150,6 +150,14 @@ Three options, from easiest to most manual:
    Caddy): automatic issuance, renewal before expiry, retry, disk storage and
    hot reload are handled by the library.
 
+Agents authenticate with per-device keys sent in the `Authorization` header;
+the legacy shared device token has been removed. Keys expire by default after
+one year and can be rotated from the Access page. One-time invite codes can be
+redeemed with `warpmesh-agent enroll`, which writes a long-lived key locally.
+Each agent also exposes a local web UI at `http://127.0.0.1:9876` for managing
+port forwards, with `-auto-vnc` attempting to provision a local VNC server for
+remote desktop.
+
 2. Bring your own certificate:
 
    ```bash

@@ -36,6 +36,8 @@ type Config struct {
 	Forwards    []ForwardSpec
 	STUNServers []string
 	VNCPort     int
+	UIPort      int
+	AutoVNC     bool
 }
 
 // ForwardSpec exposes a local TCP listener that reaches a port on another
@@ -82,19 +84,25 @@ func (f *forwardConn) Close() error {
 
 // Agent maintains one control connection to the relay server.
 type Agent struct {
-	cfg            Config
-	sessions       map[string]*TermSession
-	uploads        map[string]*os.File
-	forwards       map[string]*forwardConn
-	forwardPending map[string]chan protocol.Message
-	directPending  map[string]chan struct{}
-	peerConns      map[string]*webrtc.PeerConnection
-	dataChannels   map[string]*webrtc.DataChannel
-	localConns     map[string]net.Conn
-	pendingData    map[string][][]byte
-	mu             sync.Mutex
-	ws             *websocket.Conn
-	writeMu        sync.Mutex
+	cfg              Config
+	sessions         map[string]*TermSession
+	uploads          map[string]*os.File
+	forwards         map[string]*forwardConn
+	forwardPending   map[string]chan protocol.Message
+	directPending    map[string]chan struct{}
+	peerConns        map[string]*webrtc.PeerConnection
+	dataChannels     map[string]*webrtc.DataChannel
+	localConns       map[string]net.Conn
+	pendingData      map[string][][]byte
+	mu               sync.Mutex
+	ws               *websocket.Conn
+	writeMu          sync.Mutex
+	forwardListeners map[string]*forwardListener
+}
+
+type forwardListener struct {
+	spec ForwardSpec
+	ln   net.Listener
 }
 
 // New creates an agent and ensures a stable device identity.
@@ -103,6 +111,14 @@ func New(cfg Config) (*Agent, error) {
 		if err := os.MkdirAll(filepath.Join(cfg.DataDir, "uploads"), 0o755); err != nil {
 			return nil, err
 		}
+	}
+	if cfg.Token == "" && cfg.DataDir != "" {
+		if raw, err := os.ReadFile(filepath.Join(cfg.DataDir, "token")); err == nil {
+			cfg.Token = strings.TrimSpace(string(raw))
+		}
+	}
+	if cfg.Token == "" {
+		return nil, fmt.Errorf("device token is required; enroll with warpmesh-agent enroll or pass -token")
 	}
 	deviceID, err := loadOrCreateID(cfg)
 	if err != nil {
@@ -129,18 +145,25 @@ func New(cfg Config) (*Agent, error) {
 		cfg.VNCPort = 5900
 	}
 	a := &Agent{
-		cfg:            cfg,
-		sessions:       make(map[string]*TermSession),
-		uploads:        make(map[string]*os.File),
-		forwards:       make(map[string]*forwardConn),
-		forwardPending: make(map[string]chan protocol.Message),
-		directPending:  make(map[string]chan struct{}),
-		peerConns:      make(map[string]*webrtc.PeerConnection),
-		dataChannels:   make(map[string]*webrtc.DataChannel),
-		localConns:     make(map[string]net.Conn),
-		pendingData:    make(map[string][][]byte),
+		cfg:              cfg,
+		sessions:         make(map[string]*TermSession),
+		uploads:          make(map[string]*os.File),
+		forwards:         make(map[string]*forwardConn),
+		forwardPending:   make(map[string]chan protocol.Message),
+		directPending:    make(map[string]chan struct{}),
+		peerConns:        make(map[string]*webrtc.PeerConnection),
+		dataChannels:     make(map[string]*webrtc.DataChannel),
+		localConns:       make(map[string]net.Conn),
+		pendingData:      make(map[string][][]byte),
+		forwardListeners: make(map[string]*forwardListener),
 	}
 	a.startForwardListeners()
+	if cfg.UIPort > 0 {
+		a.startLocalUI()
+	}
+	if cfg.AutoVNC {
+		go a.ensureVNCServer()
+	}
 	return a, nil
 }
 
@@ -164,15 +187,14 @@ func (a *Agent) connectOnce() error {
 	if err != nil {
 		return err
 	}
-	q := u.Query()
-	q.Set("token", a.cfg.Token)
-	u.RawQuery = q.Encode()
 
 	dialer := websocket.DefaultDialer
 	if a.cfg.Insecure {
 		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-	ws, _, err := dialer.Dial(u.String(), http.Header{})
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+a.cfg.Token)
+	ws, _, err := dialer.Dial(u.String(), header)
 	if err != nil {
 		return err
 	}
@@ -338,25 +360,64 @@ func (a *Agent) writeSession(sessionID string, fn func(*TermSession) error) erro
 
 func (a *Agent) startForwardListeners() {
 	for _, spec := range a.cfg.Forwards {
-		go a.serveForwardListener(spec)
+		if err := a.StartForward(spec); err != nil {
+			log.Printf("forward %d failed: %v", spec.LocalPort, err)
+		}
 	}
 }
 
-func (a *Agent) serveForwardListener(spec ForwardSpec) {
-	addr := fmt.Sprintf("127.0.0.1:%d", spec.LocalPort)
-	ln, err := net.Listen("tcp", addr)
+// StartForward begins a dynamic local listener that relays to another device.
+func (a *Agent) StartForward(spec ForwardSpec) error {
+	key := fmt.Sprintf("%d", spec.LocalPort)
+	a.mu.Lock()
+	if _, ok := a.forwardListeners[key]; ok {
+		a.mu.Unlock()
+		return fmt.Errorf("forward %d already exists", spec.LocalPort)
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", spec.LocalPort))
 	if err != nil {
-		log.Printf("forward listener %s failed: %v", addr, err)
-		return
+		a.mu.Unlock()
+		return err
 	}
-	log.Printf("forward %s -> %s:%d", addr, spec.TargetDeviceID, spec.TargetPort)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+	a.forwardListeners[key] = &forwardListener{spec: spec, ln: ln}
+	a.mu.Unlock()
+	log.Printf("forward 127.0.0.1:%d -> %s:%d", spec.LocalPort, spec.TargetDeviceID, spec.TargetPort)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go a.handleForwardClient(conn, spec)
 		}
-		go a.handleForwardClient(conn, spec)
+	}()
+	return nil
+}
+
+// StopForward removes a dynamic local listener.
+func (a *Agent) StopForward(localPort int) error {
+	key := fmt.Sprintf("%d", localPort)
+	a.mu.Lock()
+	fwd, ok := a.forwardListeners[key]
+	if ok {
+		delete(a.forwardListeners, key)
 	}
+	a.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("forward %d not found", localPort)
+	}
+	return fwd.ln.Close()
+}
+
+// ListForwards returns the active local forwarding listeners.
+func (a *Agent) ListForwards() []ForwardSpec {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]ForwardSpec, 0, len(a.forwardListeners))
+	for _, fwd := range a.forwardListeners {
+		out = append(out, fwd.spec)
+	}
+	return out
 }
 
 func (a *Agent) handleForwardClient(conn net.Conn, spec ForwardSpec) {

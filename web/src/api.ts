@@ -22,7 +22,15 @@ export interface DeviceKey {
   deviceId: string;
   name: string;
   createdAt: string;
+  expiresAt?: string;
   token?: string;
+}
+
+export interface Invite {
+  code: string;
+  name: string;
+  expiresAt: string;
+  createdAt: string;
 }
 
 export interface AuditEntry {
@@ -113,6 +121,22 @@ export function createDeviceKey(name: string): Promise<DeviceKey> {
 
 export function revokeDeviceKey(deviceId: string): Promise<void> {
   return api<void>(`/api/device-keys/${deviceId}`, { method: "DELETE" });
+}
+
+export function rotateDeviceKey(deviceId: string): Promise<DeviceKey> {
+  return api<DeviceKey>(`/api/device-keys/${deviceId}/rotate`, { method: "POST" });
+}
+
+export function listInvites(): Promise<Invite[]> {
+  return api<Invite[]>("/api/invites");
+}
+
+export function createInvite(name: string): Promise<Invite> {
+  return api<Invite>("/api/invites", { method: "POST", body: JSON.stringify({ name }) });
+}
+
+export function deleteInvite(code: string): Promise<void> {
+  return api<void>(`/api/invites/${code}`, { method: "DELETE" });
 }
 
 export function listAudit(limit = 50): Promise<AuditEntry[]> {

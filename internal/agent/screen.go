@@ -21,7 +21,6 @@ func (a *Agent) startScreenLink(sessionID string) {
 	}
 	u.Path = "/ws/screen-link"
 	q := u.Query()
-	q.Set("token", a.cfg.Token)
 	q.Set("device", a.cfg.DeviceID)
 	q.Set("session", sessionID)
 	u.RawQuery = q.Encode()
@@ -30,7 +29,9 @@ func (a *Agent) startScreenLink(sessionID string) {
 	if a.cfg.Insecure {
 		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-	ws, _, err := dialer.Dial(u.String(), http.Header{})
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+a.cfg.Token)
+	ws, _, err := dialer.Dial(u.String(), header)
 	if err != nil {
 		log.Printf("screen link failed: %v", err)
 		return

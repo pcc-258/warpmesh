@@ -44,7 +44,16 @@ type DeviceKey struct {
 	DeviceID  string    `json:"deviceId"`
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"createdAt"`
+	ExpiresAt time.Time `json:"expiresAt,omitempty"`
 	Token     string    `json:"token,omitempty"`
+}
+
+// Invite is a one-time enrollment code.
+type Invite struct {
+	Code      string    `json:"code"`
+	Name      string    `json:"name"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // AuditEntry records a security-relevant event.
@@ -83,6 +92,14 @@ CREATE TABLE IF NOT EXISTS device_keys (
 	device_id  TEXT PRIMARY KEY,
 	token_hash TEXT NOT NULL,
 	name       TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS invite_codes (
+	code       TEXT PRIMARY KEY,
+	name       TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
 	created_at TEXT NOT NULL
 );
 
@@ -126,6 +143,10 @@ func NewRegistry(dataDir string) (*Registry, error) {
 		return nil, err
 	}
 	if err := r.ensureColumn("devices", "group_name", "group_name TEXT NOT NULL DEFAULT ''"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := r.ensureColumn("device_keys", "expires_at", "expires_at TEXT NOT NULL DEFAULT ''"); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -345,7 +366,7 @@ func (r *Registry) Delete(id string) error {
 
 // CreateDeviceKey issues a per-device credential and returns the plaintext
 // token exactly once.
-func (r *Registry) CreateDeviceKey(name string) (DeviceKey, error) {
+func (r *Registry) CreateDeviceKey(name string, ttl time.Duration) (DeviceKey, error) {
 	now := time.Now()
 	idBytes := make([]byte, 8)
 	if _, err := rand.Read(idBytes); err != nil {
@@ -358,24 +379,36 @@ func (r *Registry) CreateDeviceKey(name string) (DeviceKey, error) {
 	}
 	token := hex.EncodeToString(tokenBytes)
 	hash := hashToken(token)
+	expires := ""
+	expiresTime := time.Time{}
+	if ttl > 0 {
+		expiresTime = now.Add(ttl)
+		expires = expiresTime.Format(time.RFC3339Nano)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, err := r.db.Exec("INSERT INTO device_keys (device_id, token_hash, name, created_at) VALUES (?, ?, ?, ?)",
-		deviceID, hash, name, time.Now().Format(time.RFC3339Nano))
+	_, err := r.db.Exec("INSERT INTO device_keys (device_id, token_hash, name, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+		deviceID, hash, name, now.Format(time.RFC3339Nano), expires)
 	if err != nil {
 		return DeviceKey{}, err
 	}
-	return DeviceKey{DeviceID: deviceID, Name: name, CreatedAt: now, Token: token}, nil
+	return DeviceKey{DeviceID: deviceID, Name: name, CreatedAt: now, ExpiresAt: expiresTime, Token: token}, nil
 }
 
 // ValidateDeviceKey checks a device id and token pair.
 func (r *Registry) ValidateDeviceKey(deviceID, token string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var stored string
-	err := r.db.QueryRow("SELECT token_hash FROM device_keys WHERE device_id = ?", deviceID).Scan(&stored)
+	var stored, expires string
+	err := r.db.QueryRow("SELECT token_hash, expires_at FROM device_keys WHERE device_id = ?", deviceID).Scan(&stored, &expires)
 	if err != nil {
 		return false
+	}
+	if expires != "" {
+		expiresTime, err := time.Parse(time.RFC3339Nano, expires)
+		if err != nil || time.Now().After(expiresTime) {
+			return false
+		}
 	}
 	return subtle.ConstantTimeCompare([]byte(stored), []byte(hashToken(token))) == 1
 }
@@ -384,7 +417,7 @@ func (r *Registry) ValidateDeviceKey(deviceID, token string) bool {
 func (r *Registry) ListDeviceKeys() []DeviceKey {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	rows, err := r.db.Query("SELECT device_id, name, created_at FROM device_keys ORDER BY created_at DESC")
+	rows, err := r.db.Query("SELECT device_id, name, created_at, expires_at FROM device_keys ORDER BY created_at DESC")
 	if err != nil {
 		return nil
 	}
@@ -392,12 +425,116 @@ func (r *Registry) ListDeviceKeys() []DeviceKey {
 	out := make([]DeviceKey, 0)
 	for rows.Next() {
 		var k DeviceKey
-		var created string
-		if err := rows.Scan(&k.DeviceID, &k.Name, &created); err != nil {
+		var created, expires string
+		if err := rows.Scan(&k.DeviceID, &k.Name, &created, &expires); err != nil {
 			continue
 		}
 		k.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		k.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
 		out = append(out, k)
+	}
+	return out
+}
+
+// RotateDeviceKey issues a fresh token for an existing device.
+func (r *Registry) RotateDeviceKey(deviceID string, ttl time.Duration) (DeviceKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var name, created string
+	if err := r.db.QueryRow("SELECT name, created_at FROM device_keys WHERE device_id = ?", deviceID).Scan(&name, &created); err != nil {
+		return DeviceKey{}, err
+	}
+	tokenBytes := make([]byte, 24)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return DeviceKey{}, err
+	}
+	token := hex.EncodeToString(tokenBytes)
+	expires := ""
+	expiresTime := time.Time{}
+	if ttl > 0 {
+		expiresTime = time.Now().Add(ttl)
+		expires = expiresTime.Format(time.RFC3339Nano)
+	}
+	if _, err := r.db.Exec("UPDATE device_keys SET token_hash = ?, expires_at = ? WHERE device_id = ?", hashToken(token), expires, deviceID); err != nil {
+		return DeviceKey{}, err
+	}
+	createdAt, _ := time.Parse(time.RFC3339Nano, created)
+	return DeviceKey{DeviceID: deviceID, Name: name, CreatedAt: createdAt, ExpiresAt: expiresTime, Token: token}, nil
+}
+
+// CreateInvite issues a one-time enrollment code.
+func (r *Registry) CreateInvite(name string, ttl time.Duration) (Invite, error) {
+	now := time.Now()
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return Invite{}, err
+	}
+	code := "inv-" + hex.EncodeToString(b)
+	expires := now.Add(ttl)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec("INSERT INTO invite_codes (code, name, expires_at, created_at) VALUES (?, ?, ?, ?)",
+		code, name, expires.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		return Invite{}, err
+	}
+	return Invite{Code: code, Name: name, ExpiresAt: expires, CreatedAt: now}, nil
+}
+
+// ValidateInvite checks an enrollment code.
+func (r *Registry) ValidateInvite(code string) (Invite, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var inv Invite
+	var expires, created string
+	if err := r.db.QueryRow("SELECT code, name, expires_at, created_at FROM invite_codes WHERE code = ?", code).Scan(&inv.Code, &inv.Name, &expires, &created); err != nil {
+		return Invite{}, errors.New("invalid invite code")
+	}
+	inv.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+	inv.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	if time.Now().After(inv.ExpiresAt) {
+		return Invite{}, errors.New("invite code expired")
+	}
+	return inv, nil
+}
+
+// UseInvite consumes a one-time enrollment code.
+func (r *Registry) UseInvite(code string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res, err := r.db.Exec("DELETE FROM invite_codes WHERE code = ?", code)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("invite code not found")
+	}
+	return nil
+}
+
+// ListInvites returns all outstanding enrollment codes.
+func (r *Registry) ListInvites() []Invite {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rows, err := r.db.Query("SELECT code, name, expires_at, created_at FROM invite_codes ORDER BY created_at DESC")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]Invite, 0)
+	for rows.Next() {
+		var inv Invite
+		var expires, created string
+		if err := rows.Scan(&inv.Code, &inv.Name, &expires, &created); err != nil {
+			continue
+		}
+		inv.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
+		inv.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, inv)
 	}
 	return out
 }

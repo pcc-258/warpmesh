@@ -24,7 +24,11 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, Error: "expected hello message"})
 		return
 	}
-	if !s.authorizeAgent(hello.DeviceID, r.URL.Query().Get("token")) {
+	token := bearerToken(r)
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
+	if !s.authorizeAgent(hello.DeviceID, token) {
 		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, Error: "invalid device credential"})
 		_ = s.reg.RecordAudit(hello.DeviceID, "agent.auth-failed", hello.DeviceID, "invalid device credential")
 		return

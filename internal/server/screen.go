@@ -65,7 +65,11 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
-	if !s.validDevice(r.URL.Query().Get("token")) {
+	token := bearerToken(r)
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
+	if !s.authorizeAgent(r.URL.Query().Get("device"), token) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}

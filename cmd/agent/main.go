@@ -24,11 +24,14 @@ func main() {
 		case "desktop":
 			runDesktopCLI(os.Args[2:])
 			return
+		case "enroll":
+			runEnrollCLI(os.Args[2:])
+			return
 		}
 	}
 
 	serverURL := flag.String("server", envOr("DEVICE_RELAY_SERVER", "ws://127.0.0.1:8080/ws/agent"), "relay server websocket URL")
-	token := flag.String("token", envOr("DEVICE_RELAY_TOKEN", "device"), "device token")
+	token := flag.String("token", os.Getenv("DEVICE_RELAY_TOKEN"), "device token, or read from data dir after enroll")
 	deviceID := flag.String("device-id", os.Getenv("DEVICE_RELAY_DEVICE_ID"), "stable device id (auto-generated if empty)")
 	name := flag.String("name", os.Getenv("DEVICE_RELAY_NAME"), "display name, defaults to hostname")
 	shell := flag.String("shell", os.Getenv("DEVICE_RELAY_SHELL"), "shell used for terminal sessions")
@@ -38,6 +41,8 @@ func main() {
 	forwardList := flag.String("forward", os.Getenv("DEVICE_RELAY_FORWARD"), "comma-separated localPort:targetDeviceId:targetPort forwards")
 	stunList := flag.String("stun", os.Getenv("DEVICE_RELAY_STUN"), "comma-separated STUN server URLs for direct connections")
 	vncPort := flag.Int("vnc-port", envInt("DEVICE_RELAY_VNC_PORT", 5900), "local VNC server port used for remote desktop")
+	uiPort := flag.Int("ui-port", envInt("DEVICE_RELAY_UI_PORT", 9876), "local web UI port, 0 to disable")
+	autoVNC := flag.Bool("auto-vnc", os.Getenv("DEVICE_RELAY_AUTO_VNC") != "0", "auto start a local VNC server for remote desktop")
 	flag.Parse()
 
 	agentServerURL := *serverURL
@@ -77,6 +82,8 @@ func main() {
 		Forwards:    forwards,
 		STUNServers: stunServers,
 		VNCPort:     *vncPort,
+		UIPort:      *uiPort,
+		AutoVNC:     *autoVNC,
 	})
 	if err != nil {
 		log.Fatalf("create agent: %v", err)

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/certmagic"
 
@@ -27,11 +28,15 @@ func main() {
 	adminToken := flag.String("admin-token", envOr("DEVICE_RELAY_ADMIN_TOKEN", "admin"), "admin token for the web UI")
 	adminUser := flag.String("admin-user", envOr("DEVICE_RELAY_ADMIN_USER", "admin"), "initial console username")
 	adminPassword := flag.String("admin-password", envOr("DEVICE_RELAY_ADMIN_PASSWORD", "admin"), "initial console password")
-	deviceToken := flag.String("device-token", envOr("DEVICE_RELAY_DEVICE_TOKEN", "device"), "shared token used by device agents")
+	keyTTL := flag.String("key-ttl", envOr("DEVICE_RELAY_KEY_TTL", "8760h"), "device key lifetime")
 	dataDir := flag.String("data-dir", envOr("DEVICE_RELAY_DATA_DIR", "./data"), "directory for persisted state")
 	tlsCert := flag.String("tls-cert", os.Getenv("DEVICE_RELAY_TLS_CERT"), "optional TLS certificate file")
 	tlsKey := flag.String("tls-key", os.Getenv("DEVICE_RELAY_TLS_KEY"), "optional TLS private key file")
 	flag.Parse()
+	parsedTTL, err := time.ParseDuration(*keyTTL)
+	if err != nil {
+		log.Fatalf("parse key-ttl: %v", err)
+	}
 
 	if *adminPassword == "admin" || *adminToken == "admin" {
 		log.Printf("WARNING: default admin credentials are in use; set DEVICE_RELAY_ADMIN_PASSWORD and DEVICE_RELAY_ADMIN_TOKEN before exposing the console")
@@ -43,12 +48,12 @@ func main() {
 	}
 	srv, err := server.NewServer(server.Config{
 		AdminToken:    *adminToken,
-		DeviceToken:   *deviceToken,
 		DataDir:       *dataDir,
 		WebFS:         web,
 		AdminUser:     *adminUser,
 		AdminPassword: *adminPassword,
 		AgentListen:   *altHTTPSListen,
+		KeyTTL:        parsedTTL,
 	})
 	if err != nil {
 		log.Fatalf("create server: %v", err)
