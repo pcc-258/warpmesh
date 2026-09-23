@@ -1,0 +1,12 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates xvfb x11vnc fluxbox xauth xsetroot
+
+ARG AGENT_BINARY=bin/warpmesh-agent-linux-arm64
+
+COPY ${AGENT_BINARY} /usr/local/bin/warpmesh-agent
+COPY entrypoint-desktop.sh /entrypoint-desktop.sh
+
+RUN chmod +x /entrypoint-desktop.sh
+
+ENTRYPOINT ["/entrypoint-desktop.sh"]
