@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"io/fs"
 	"log"
@@ -17,9 +18,9 @@ import (
 
 func main() {
 	listen := flag.String("listen", envOr("DEVICE_RELAY_LISTEN", ":8080"), "HTTP listen address (plain HTTP mode)")
-	httpsListen := flag.String("https-listen", envOr("DEVICE_RELAY_HTTPS_LISTEN", ":443"), "HTTPS listen address")
+	httpsListen := flag.String("https-listen", envOr("DEVICE_RELAY_HTTPS_LISTEN", ":443"), "primary HTTPS listen address")
+	altHTTPSListen := flag.String("alt-https-listen", os.Getenv("DEVICE_RELAY_ALT_HTTPS_LISTEN"), "optional secondary HTTPS listen address")
 	httpListen := flag.String("http-listen", envOr("DEVICE_RELAY_HTTP_LISTEN", ":80"), "HTTP listen address for ACME challenges and redirects")
-	acmeTLSPort := flag.String("acme-tls-port", envOr("DEVICE_RELAY_ACME_TLS_PORT", ":443"), "HTTPS listen address for ACME TLS-ALPN validation")
 	domain := flag.String("domain", os.Getenv("DEVICE_RELAY_DOMAIN"), "public domain; enables automatic Let's Encrypt certificates")
 	acmeEmail := flag.String("acme-email", os.Getenv("DEVICE_RELAY_ACME_EMAIL"), "contact email used for Let's Encrypt")
 	adminToken := flag.String("admin-token", envOr("DEVICE_RELAY_ADMIN_TOKEN", "admin"), "admin token for the web UI")
@@ -50,15 +51,31 @@ func main() {
 	if err != nil {
 		log.Fatalf("create server: %v", err)
 	}
-	handler := srv.Handler()
+	handler := srv.WebHandler()
+	agentHandler := srv.AgentHandler()
 
 	switch {
 	case *domain != "":
-		runAutomaticHTTPS(handler, *domain, *acmeEmail, *dataDir, *httpsListen, *httpListen, *acmeTLSPort, *adminToken)
+		runAutomaticHTTPS(handler, agentHandler, *domain, *acmeEmail, *dataDir, *httpsListen, *altHTTPSListen, *httpListen, *adminToken)
 	case *tlsCert != "" && *tlsKey != "":
-		log.Printf("warpmesh serving HTTPS on %s", *httpsListen)
-		httpSrv := &http.Server{Addr: *httpsListen, Handler: handler}
-		log.Fatal(httpSrv.ListenAndServeTLS(*tlsCert, *tlsKey))
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatalf("load tls certificate: %v", err)
+		}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		httpSrv := &http.Server{Addr: *httpsListen, Handler: handler, TLSConfig: tlsConfig}
+		if *altHTTPSListen != "" {
+			altSrv := &http.Server{Addr: *altHTTPSListen, Handler: agentHandler, TLSConfig: tlsConfig}
+			go func() {
+				log.Printf("warpmesh agent plane serving HTTPS on %s", *altHTTPSListen)
+				log.Fatal(altSrv.ListenAndServeTLS("", ""))
+			}()
+		}
+		log.Printf("warpmesh web plane serving HTTPS on %s", *httpsListen)
+		log.Fatal(httpSrv.ListenAndServeTLS("", ""))
 	default:
 		log.Printf("warpmesh serving HTTP on %s (enable -domain or -tls-cert/-tls-key for HTTPS)", *listen)
 		log.Printf("web ui: http://%s/ (admin token: %s)", displayHost(*listen), *adminToken)
@@ -67,7 +84,7 @@ func main() {
 	}
 }
 
-func runAutomaticHTTPS(handler http.Handler, domain, acmeEmail, dataDir, httpsListen, httpListen, acmeTLSPort, adminToken string) {
+func runAutomaticHTTPS(webHandler, agentHandler http.Handler, domain, acmeEmail, dataDir, httpsListen, altHTTPSListen, httpListen, adminToken string) {
 	certDir := filepath.Join(dataDir, "certs")
 	manager := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
@@ -78,8 +95,19 @@ func runAutomaticHTTPS(handler http.Handler, domain, acmeEmail, dataDir, httpsLi
 
 	httpsSrv := &http.Server{
 		Addr:      httpsListen,
-		Handler:   handler,
+		Handler:   webHandler,
 		TLSConfig: manager.TLSConfig(),
+	}
+	if altHTTPSListen != "" {
+		altSrv := &http.Server{
+			Addr:      altHTTPSListen,
+			Handler:   agentHandler,
+			TLSConfig: manager.TLSConfig(),
+		}
+		go func() {
+			log.Printf("warpmesh agent plane serving HTTPS on %s for %s", altHTTPSListen, domain)
+			log.Fatal(altSrv.ListenAndServeTLS("", ""))
+		}()
 	}
 	go func() {
 		challengeHandler := manager.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -89,19 +117,8 @@ func runAutomaticHTTPS(handler http.Handler, domain, acmeEmail, dataDir, httpsLi
 		challengeSrv := &http.Server{Addr: httpListen, Handler: challengeHandler}
 		log.Fatal(challengeSrv.ListenAndServe())
 	}()
-	go func() {
-		// TLS-ALPN-01 lets Let's Encrypt validate on 443, which avoids Aliyun's
-		// HTTP port-80 interception for unfiled domains.
-		acmeTLS := &http.Server{
-			Addr:      acmeTLSPort,
-			Handler:   http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
-			TLSConfig: manager.TLSConfig(),
-		}
-		log.Printf("ACME TLS-ALPN server on %s for %s", acmeTLSPort, domain)
-		log.Fatal(acmeTLS.ListenAndServeTLS("", ""))
-	}()
 
-	log.Printf("warpmesh serving HTTPS on %s for %s", httpsListen, domain)
+	log.Printf("warpmesh web plane serving HTTPS on %s for %s", httpsListen, domain)
 	log.Printf("web ui: https://%s/ (admin token: %s)", domain, adminToken)
 	log.Fatal(httpsSrv.ListenAndServeTLS("", ""))
 }

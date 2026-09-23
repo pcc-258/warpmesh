@@ -112,7 +112,7 @@ Three options, from easiest to most manual:
 
    The server obtains and renews certificates automatically, the web UI is
    `https://relay.example.com`, and agents connect with
-   `wss://relay.example.com/ws/agent`.
+   `wss://relay.example.com:18443/ws/agent`.
 
 2. Bring your own certificate:
 

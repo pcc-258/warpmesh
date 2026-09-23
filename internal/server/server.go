@@ -124,8 +124,18 @@ func NewServer(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Handler returns the root HTTP handler.
+// Handler returns the full HTTP handler used by tests and single-listener
+// deployments.
 func (s *Server) Handler() http.Handler {
+	return s.routes(true)
+}
+
+// WebHandler serves the console API, browser WebSockets and static UI.
+func (s *Server) WebHandler() http.Handler {
+	return s.routes(false)
+}
+
+func (s *Server) routes(includeAgent bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/login", s.handleLogin)
@@ -136,12 +146,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/device-keys", s.handleDeviceKeys)
 	mux.HandleFunc("/api/device-keys/", s.handleDeviceKeyByID)
 	mux.HandleFunc("/api/audit", s.handleAudit)
-	mux.HandleFunc("/ws/agent", s.handleAgentWS)
+	if includeAgent {
+		mux.HandleFunc("/ws/agent", s.handleAgentWS)
+	}
 	mux.HandleFunc("/ws/terminal", s.handleTerminalWS)
 	mux.HandleFunc("/ws/file", s.handleFileWS)
 	mux.HandleFunc("/ws/screen", s.handleScreenWS)
-	mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
+	if includeAgent {
+		mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
+	}
 	mux.HandleFunc("/", s.handleStatic)
+	return mux
+}
+
+// AgentHandler serves only the agent-facing data plane.
+func (s *Server) AgentHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/ws/agent", s.handleAgentWS)
+	mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
 	return mux
 }
 
