@@ -29,7 +29,7 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
 	sess := &screenSession{
@@ -83,7 +83,7 @@ func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	s.sessionsMu.Lock()
 	sess := s.screens[sessionID]

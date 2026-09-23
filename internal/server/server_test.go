@@ -31,7 +31,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
@@ -41,7 +41,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer agentWS.Close()
+	defer func() { _ = agentWS.Close() }()
 	if err := agentWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
@@ -68,7 +68,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var devices []Device
 	if err := json.NewDecoder(resp.Body).Decode(&devices); err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer browserWS.Close()
+	defer func() { _ = browserWS.Close() }()
 
 	start := readAgentMessage(t, agentWS)
 	if start.Type != protocol.TypeTermStart || start.SessionID == "" || start.Cols != 80 {
@@ -137,7 +137,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -146,7 +146,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var loginResp struct {
 		Token string `json:"token"`
 	}
@@ -163,7 +163,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer keyResp.Body.Close()
+	defer func() { _ = keyResp.Body.Close() }()
 	var key DeviceKey
 	if err := json.NewDecoder(keyResp.Body).Decode(&key); err != nil {
 		t.Fatal(err)
@@ -178,7 +178,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer agentWS.Close()
+	defer func() { _ = agentWS.Close() }()
 	if err := agentWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
@@ -201,7 +201,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer statsResp.Body.Close()
+	defer func() { _ = statsResp.Body.Close() }()
 	var stats struct {
 		Total  int `json:"total"`
 		Online int `json:"online"`
@@ -219,7 +219,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer auditResp.Body.Close()
+	defer func() { _ = auditResp.Body.Close() }()
 	var audit []AuditEntry
 	if err := json.NewDecoder(auditResp.Body).Decode(&audit); err != nil {
 		t.Fatal(err)
@@ -244,7 +244,7 @@ func TestLoginRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -278,7 +278,7 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -326,7 +326,7 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
@@ -352,9 +352,9 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	}
 
 	agentA := dialAgent(keyA)
-	defer agentA.Close()
+	defer func() { _ = agentA.Close() }()
 	agentB := dialAgent(keyB)
-	defer agentB.Close()
+	defer func() { _ = agentB.Close() }()
 	waitFor(t, func() bool {
 		_, okA := srv.reg.Get(keyA.DeviceID)
 		_, okB := srv.reg.Get(keyB.DeviceID)
@@ -426,7 +426,7 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
@@ -452,9 +452,9 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	}
 
 	agentA := dialAgent(keyA)
-	defer agentA.Close()
+	defer func() { _ = agentA.Close() }()
 	agentB := dialAgent(keyB)
-	defer agentB.Close()
+	defer func() { _ = agentB.Close() }()
 	waitFor(t, func() bool {
 		_, okA := srv.reg.Get(keyA.DeviceID)
 		_, okB := srv.reg.Get(keyB.DeviceID)
@@ -504,7 +504,7 @@ func TestScreenRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
@@ -514,7 +514,7 @@ func TestScreenRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer agentWS.Close()
+	defer func() { _ = agentWS.Close() }()
 	if err := agentWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
@@ -536,7 +536,7 @@ func TestScreenRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer browserWS.Close()
+	defer func() { _ = browserWS.Close() }()
 
 	start := readAgentMessage(t, agentWS)
 	if start.Type != protocol.TypeScreenStart || start.SessionID == "" {
@@ -549,7 +549,7 @@ func TestScreenRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer linkWS.Close()
+	defer func() { _ = linkWS.Close() }()
 
 	if err := browserWS.WriteMessage(websocket.BinaryMessage, []byte("abc")); err != nil {
 		t.Fatal(err)
@@ -576,7 +576,7 @@ func TestAgentConfigEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -584,7 +584,7 @@ func TestAgentConfigEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var cfg struct {
 		AgentWSS string `json:"agentWSS"`
 	}

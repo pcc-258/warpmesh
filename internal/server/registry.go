@@ -163,7 +163,7 @@ func (r *Registry) ensureColumn(table, column, ddl string) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	found := false
 	for rows.Next() {
 		var cid int
@@ -240,7 +240,8 @@ func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string)
 
 	var existingName, existingGroup string
 	err = r.db.QueryRow("SELECT name, group_name FROM devices WHERE id = ?", id).Scan(&existingName, &existingGroup)
-	if errors.Is(err, sql.ErrNoRows) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
 		_, err = r.db.Exec(`
 			INSERT INTO devices (id, name, hostname, os, arch, lan_ips, group_name, created_at, last_seen, online)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
@@ -249,9 +250,9 @@ func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string)
 		if err != nil {
 			return nil, err
 		}
-	} else if err != nil {
+	case err != nil:
 		return nil, err
-	} else {
+	default:
 		if name == "" {
 			name = existingName
 		}
@@ -303,7 +304,7 @@ func (r *Registry) List() []Device {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]Device, 0)
 	for rows.Next() {
@@ -421,7 +422,7 @@ func (r *Registry) ListDeviceKeys() []DeviceKey {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]DeviceKey, 0)
 	for rows.Next() {
 		var k DeviceKey
@@ -524,7 +525,7 @@ func (r *Registry) ListInvites() []Invite {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]Invite, 0)
 	for rows.Next() {
 		var inv Invite
@@ -577,7 +578,7 @@ func (r *Registry) ListAudit(limit int) []AuditEntry {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]AuditEntry, 0)
 	for rows.Next() {
 		var e AuditEntry
@@ -599,7 +600,7 @@ func (r *Registry) Groups() []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make([]string, 0)
 	for rows.Next() {
 		var g string

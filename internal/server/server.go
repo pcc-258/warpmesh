@@ -290,7 +290,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if ctype := mime.TypeByExtension(filepath.Ext(path)); ctype != "" {
 		w.Header().Set("Content-Type", ctype)
 	}
-	w.Write(raw)
+	_, _ = w.Write(raw)
 }
 
 func (s *Server) validAdmin(token string) bool {

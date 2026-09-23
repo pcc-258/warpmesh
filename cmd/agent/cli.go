@@ -50,7 +50,7 @@ func runTerminalCLI(args []string) {
 		fmt.Fprintf(os.Stderr, "connect terminal: %v\n", err)
 		os.Exit(1)
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
@@ -118,25 +118,9 @@ func runEnrollCLI(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: warpmesh-agent enroll -server https://host -code <invite> -name <device-name>")
 		os.Exit(2)
 	}
-	body := strings.NewReader(fmt.Sprintf(`{"code":%q,"name":%q}`, *code, *name))
-	resp, err := http.Post(strings.TrimRight(*server, "/")+"/api/enroll", "application/json", body)
+	key, err := enrollDevice(*server, *code, *name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "enroll: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	var key struct {
-		DeviceID  string `json:"deviceId"`
-		Name      string `json:"name"`
-		Token     string `json:"token"`
-		ExpiresAt string `json:"expiresAt"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&key); err != nil {
-		fmt.Fprintf(os.Stderr, "enroll: %v\n", err)
-		os.Exit(1)
-	}
-	if key.Token == "" {
-		fmt.Fprintln(os.Stderr, "enroll failed: invalid invite")
 		os.Exit(1)
 	}
 	if *dataDir != "" {
@@ -151,6 +135,38 @@ func runEnrollCLI(args []string) {
 	fmt.Println(string(raw))
 }
 
+func enrollDevice(server, code, name string) (struct {
+	DeviceID  string `json:"deviceId"`
+	Name      string `json:"name"`
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expiresAt"`
+}, error) {
+	body := strings.NewReader(fmt.Sprintf(`{"code":%q,"name":%q}`, code, name))
+	resp, err := http.Post(strings.TrimRight(server, "/")+"/api/enroll", "application/json", body)
+	if err != nil {
+		return struct {
+			DeviceID  string `json:"deviceId"`
+			Name      string `json:"name"`
+			Token     string `json:"token"`
+			ExpiresAt string `json:"expiresAt"`
+		}{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var key struct {
+		DeviceID  string `json:"deviceId"`
+		Name      string `json:"name"`
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&key); err != nil {
+		return key, err
+	}
+	if key.Token == "" {
+		return key, fmt.Errorf("invalid invite")
+	}
+	return key, nil
+}
+
 func runVNCInstallCLI(args []string) {
 	fs := flag.NewFlagSet("vnc-install", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "data", "directory to store the installer")
@@ -161,26 +177,38 @@ func runVNCInstallCLI(args []string) {
 		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
 		os.Exit(1)
 	}
-	resp, err := http.Get(*url)
+	path, err := downloadVNCInstaller(*dataDir, *url)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
-	path := filepath.Join(*dataDir, "tightvnc-setup.msi")
-	out, err := os.Create(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
-		os.Exit(1)
-	}
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
-		os.Exit(1)
-	}
-	_ = out.Close()
 	fmt.Printf("downloaded installer to %s\n", path)
 	fmt.Println("run it: tightvnc-setup.msi /VERYSILENT /NORESTART")
 	fmt.Println("then start warpmesh-agent again; it will find TightVNC automatically")
+}
+
+func downloadVNCInstaller(dataDir, url string) (string, error) {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return "", err
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	path := filepath.Join(dataDir, "tightvnc-setup.msi")
+	out, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		_ = out.Close()
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func openURL(u string) {
@@ -199,9 +227,10 @@ func webWSSURL(base, path string, query map[string]string) string {
 	if err != nil {
 		return ""
 	}
-	if u.Scheme == "http" {
+	switch u.Scheme {
+	case "http":
 		u.Scheme = "ws"
-	} else if u.Scheme == "https" {
+	case "https":
 		u.Scheme = "wss"
 	}
 	u.Path = path

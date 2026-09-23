@@ -36,14 +36,14 @@ func (a *Agent) startScreenLink(sessionID string) {
 		log.Printf("screen link failed: %v", err)
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", a.cfg.VNCPort), 5*time.Second)
 	if err != nil {
 		log.Printf("screen vnc dial failed: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	done := make(chan struct{}, 2)
 	go func() {

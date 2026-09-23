@@ -15,7 +15,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	// The first message must carry device identity so the server can check
 	// the per-device credential instead of trusting a shared token alone.

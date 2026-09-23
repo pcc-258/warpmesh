@@ -18,7 +18,6 @@ import {
   ShieldCheck,
   TerminalSquare,
   Trash2,
-  Wifi,
 } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";

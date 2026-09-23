@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 )
@@ -68,18 +67,6 @@ func (a *Agent) uiForwardByPort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (a *Agent) consoleBase() string {
-	u, err := url.Parse(a.cfg.ServerURL)
-	if err != nil {
-		return ""
-	}
-	scheme := "https"
-	if u.Scheme == "ws" {
-		scheme = "http"
-	}
-	return scheme + "://" + u.Hostname()
 }
 
 func writeLocalJSON(w http.ResponseWriter, status int, v any) {

@@ -1,4 +1,4 @@
-.PHONY: web server agent build test build-linux build-agent-windows build-agent-darwin cross
+.PHONY: web server agent build test lint-go lint-web checksmell build-linux build-agent-windows build-agent-darwin cross
 
 web:
 	cd web && npm install && npm run build
@@ -13,6 +13,14 @@ build: web server agent
 
 test:
 	go test ./...
+
+lint-go:
+	golangci-lint run ./...
+
+lint-web:
+	cd web && npx eslint .
+
+checksmell: lint-go lint-web
 
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/warpmesh-server-linux-amd64 ./cmd/server

@@ -28,7 +28,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
 	sess := &termSession{deviceID: deviceID, browser: ws}

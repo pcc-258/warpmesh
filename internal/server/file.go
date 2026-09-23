@@ -31,7 +31,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
 	s.sessionsMu.Lock()

@@ -175,7 +175,7 @@ func (a *Agent) bridgeTargetChannel(sessionID string, port int) {
 	pending := a.pendingData[sessionID]
 	delete(a.pendingData, sessionID)
 	a.mu.Unlock()
-	defer service.Close()
+	defer func() { _ = service.Close() }()
 	for _, chunk := range pending {
 		_, _ = service.Write(chunk)
 	}
