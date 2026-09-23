@@ -155,8 +155,10 @@ the legacy shared device token has been removed. Keys expire by default after
 one year and can be rotated from the Access page. One-time invite codes can be
 redeemed with `warpmesh-agent enroll`, which writes a long-lived key locally.
 Each agent also exposes a local web UI at `http://127.0.0.1:9876` for managing
-port forwards, with `-auto-vnc` attempting to provision a local VNC server for
-remote desktop.
+port forwards. For remote desktop, the agent guides missing components at
+startup: macOS opens Screen Sharing settings, Linux prints the package
+commands for x11vnc/Xvfb, and Windows provides `warpmesh-agent vnc-install` to
+download the TightVNC installer.
 
 2. Bring your own certificate:
 

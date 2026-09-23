@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -148,6 +149,38 @@ func runEnrollCLI(args []string) {
 	}
 	raw, _ := json.MarshalIndent(key, "", "  ")
 	fmt.Println(string(raw))
+}
+
+func runVNCInstallCLI(args []string) {
+	fs := flag.NewFlagSet("vnc-install", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "data", "directory to store the installer")
+	url := fs.String("url", "https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi", "TightVNC installer URL")
+	_ = fs.Parse(args)
+
+	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
+		os.Exit(1)
+	}
+	resp, err := http.Get(*url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	path := filepath.Join(*dataDir, "tightvnc-setup.msi")
+	out, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		fmt.Fprintf(os.Stderr, "vnc-install: %v\n", err)
+		os.Exit(1)
+	}
+	_ = out.Close()
+	fmt.Printf("downloaded installer to %s\n", path)
+	fmt.Println("run it: tightvnc-setup.msi /VERYSILENT /NORESTART")
+	fmt.Println("then start warpmesh-agent again; it will find TightVNC automatically")
 }
 
 func openURL(u string) {

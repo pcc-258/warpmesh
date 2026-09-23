@@ -27,6 +27,9 @@ func main() {
 		case "enroll":
 			runEnrollCLI(os.Args[2:])
 			return
+		case "vnc-install":
+			runVNCInstallCLI(os.Args[2:])
+			return
 		}
 	}
 
