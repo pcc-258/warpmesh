@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowLeft,
-  CloudUpload,
   Download,
+  FileText,
+  Folder,
+  FolderPlus,
   HardDrive,
   KeyRound,
   LayoutDashboard,
@@ -18,6 +20,7 @@ import {
   ShieldCheck,
   TerminalSquare,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -91,7 +94,7 @@ export default function App() {
   }
 
   if (view.name === "files") {
-    return <FilesView device={view.device} onBack={() => setView({ name: "page", page: "devices" })} />;
+    return <FileManagerView device={view.device} onBack={() => setView({ name: "page", page: "devices" })} />;
   }
 
   return (
@@ -778,47 +781,173 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
   );
 }
 
-function FilesView({ device, onBack }: { device: Device; onBack: () => void }) {
+interface RemoteEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  modTime: string;
+}
+
+function FileManagerView({ device, onBack }: { device: Device; onBack: () => void }) {
   const [path, setPath] = useState("");
+  const [entries, setEntries] = useState<RemoteEntry[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [dragOver, setDragOver] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const upload = async (file: File) => {
+  const fileOp = (type: string, payload: Record<string, unknown> = {}) =>
+    new Promise<{ type: string; entries?: RemoteEntry[]; error?: string }>((resolve, reject) => {
+      const ws = new WebSocket(wsUrl("/ws/files", { token: getToken(), device: device.id }));
+      ws.onopen = () => ws.send(JSON.stringify({ type, ...payload }));
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "file:list:result" || msg.type === "file:roots:result" || msg.type === "file:done") {
+          ws.close();
+          resolve(msg);
+        }
+        if (msg.type === "file:error") {
+          ws.close();
+          reject(new Error(msg.error || "operation failed"));
+        }
+      };
+      ws.onerror = () => reject(new Error("websocket error"));
+    });
+
+  const loadDir = async (p: string) => {
     setBusy(true);
     setMessage("");
     try {
-      const socket = new WebSocket(
+      const msg = await fileOp("file:list", { path: p });
+      setEntries(msg.entries || []);
+      setPath(p);
+      setSelected(new Set());
+    } catch (err) {
+      setMessage(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const msg = await fileOp("file:roots");
+        const roots = msg.entries || [];
+        if (roots.length > 0) {
+          await loadDir(roots[0].path);
+        } else {
+          setMessage("No allowed file roots configured on the agent.");
+        }
+      } catch (err) {
+        setMessage(String(err));
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [device.id]);
+
+  const separator = path.includes("\\") ? "\\" : "/";
+  const joinPath = (dir: string, name: string) => (dir.endsWith(separator) ? dir + name : dir + separator + name);
+
+  const uploadOne = (file: File) =>
+    new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(
         wsUrl("/ws/file", {
           token: getToken(),
           device: device.id,
           op: "upload",
           name: file.name,
+          path,
           size: file.size,
         }),
       );
-      await new Promise<void>((resolve, reject) => {
-        socket.onopen = () => resolve();
-        socket.onerror = () => reject(new Error("socket error"));
-      });
-      const raw = new Uint8Array(await file.arrayBuffer());
-      const CHUNK = 64 * 1024;
-      for (let i = 0; i < raw.length; i += CHUNK) {
-        socket.send(raw.slice(i, i + CHUNK));
+      ws.onopen = async () => {
+        const raw = new Uint8Array(await file.arrayBuffer());
+        const CHUNK = 64 * 1024;
+        for (let i = 0; i < raw.length; i += CHUNK) {
+          ws.send(raw.slice(i, i + CHUNK));
+        }
+        ws.send(JSON.stringify({ type: "file:upload:done" }));
+      };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "file:done") {
+          resolve();
+        }
+        if (msg.type === "file:error") {
+          reject(new Error(msg.error || "upload failed"));
+        }
+      };
+      ws.onerror = () => reject(new Error("upload websocket error"));
+    });
+
+  const handleUpload = async (files: FileList | File[]) => {
+    setBusy(true);
+    setMessage("");
+    try {
+      for (const file of Array.from(files)) {
+        await uploadOne(file);
       }
-      const done = new Promise<void>((resolve) => {
-        socket.onmessage = (event) => {
+      await loadDir(path);
+    } catch (err) {
+      setMessage(String(err));
+    } finally {
+      setBusy(false);
+      if (fileRef.current) {
+        fileRef.current.value = "";
+      }
+    }
+  };
+
+  const downloadPath = (p: string, name: string) =>
+    new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(
+        wsUrl("/ws/file", {
+          token: getToken(),
+          device: device.id,
+          op: "download",
+          path: p,
+        }),
+      );
+      ws.binaryType = "arraybuffer";
+      const chunks: BlobPart[] = [];
+      ws.onmessage = (event) => {
+        if (typeof event.data === "string") {
           const msg = JSON.parse(event.data);
-          if (msg.type === "file:done" || msg.type === "file:error") {
-            socket.close();
+          if (msg.type === "file:done") {
+            const blob = new Blob(chunks);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = name;
+            a.click();
+            URL.revokeObjectURL(url);
+            ws.close();
             resolve();
           }
-        };
-        socket.onclose = () => resolve();
-      });
-      socket.send(JSON.stringify({ type: "file:upload:done" }));
-      await done;
-      setMessage(`Uploaded ${file.name} to ${device.name}.`);
+          if (msg.type === "file:error") {
+            ws.close();
+            reject(new Error(msg.error || "download failed"));
+          }
+        } else {
+          chunks.push(event.data);
+        }
+      };
+      ws.onerror = () => reject(new Error("download websocket error"));
+    });
+
+  const handleDownloadSelected = async () => {
+    setBusy(true);
+    setMessage("");
+    try {
+      for (const p of selected) {
+        const entry = entries.find((e) => e.path === p);
+        if (entry && !entry.isDir) {
+          await downloadPath(p, entry.name);
+        }
+      }
     } catch (err) {
       setMessage(String(err));
     } finally {
@@ -826,61 +955,60 @@ function FilesView({ device, onBack }: { device: Device; onBack: () => void }) {
     }
   };
 
-  const download = async () => {
-    if (!path.trim()) {
-      setMessage("Enter a path on the device, e.g. /home/user/notes.txt");
-      return;
+  const handleNewFolder = async () => {
+    const name = prompt("New folder name");
+    if (!name?.trim()) return;
+    try {
+      await fileOp("file:mkdir", { path: joinPath(path, name.trim()) });
+      await loadDir(path);
+    } catch (err) {
+      setMessage(String(err));
     }
+  };
+
+  const handleRename = async (entry: RemoteEntry) => {
+    const name = prompt("New name", entry.name);
+    if (!name?.trim() || name.trim() === entry.name) return;
+    try {
+      await fileOp("file:rename", {
+        path: entry.path,
+        target: joinPath(path, name.trim()),
+      });
+      await loadDir(path);
+    } catch (err) {
+      setMessage(String(err));
+    }
+  };
+
+  const handleDeleteSelected = async () => {
+    if (selected.size === 0 || !confirm(`Delete ${selected.size} item(s)?`)) return;
     setBusy(true);
     setMessage("");
     try {
-      const socket = new WebSocket(
-        wsUrl("/ws/file", {
-          token: getToken(),
-          device: device.id,
-          op: "download",
-          path: path.trim(),
-        }),
-      );
-      socket.binaryType = "arraybuffer";
-      const chunks: BlobPart[] = [];
-      await new Promise<void>((resolve, reject) => {
-        socket.onopen = () => resolve();
-        socket.onerror = () => reject(new Error("socket error"));
-      });
-      await new Promise<void>((resolve) => {
-        socket.onmessage = (event) => {
-          if (typeof event.data === "string") {
-            const msg = JSON.parse(event.data);
-            if (msg.type === "file:done") {
-              const blob = new Blob(chunks);
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url;
-              a.download = path.trim().split("/").pop() || "download";
-              a.click();
-              URL.revokeObjectURL(url);
-              socket.close();
-              resolve();
-            }
-            if (msg.type === "file:error") {
-              setMessage(msg.error || "download failed");
-              socket.close();
-              resolve();
-            }
-          } else {
-            chunks.push(event.data);
-          }
-        };
-        socket.onclose = () => resolve();
-      });
-      setMessage("Download complete.");
+      for (const p of selected) {
+        await fileOp("file:delete", { path: p });
+      }
+      await loadDir(path);
     } catch (err) {
       setMessage(String(err));
     } finally {
       setBusy(false);
     }
   };
+
+  const toggleSelect = (p: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) {
+        next.delete(p);
+      } else {
+        next.add(p);
+      }
+      return next;
+    });
+  };
+
+  const segments = path.split(separator).filter(Boolean);
 
   return (
     <div className="app-shell">
@@ -890,40 +1018,104 @@ function FilesView({ device, onBack }: { device: Device; onBack: () => void }) {
           Back
         </button>
         <div className="terminal-title">
-          <CloudUpload size={16} />
-          {device.name} - file transfer
+          <Folder size={16} />
+          {device.name} - file manager
         </div>
+        <span className="screen-status ok">{busy ? "working..." : ""}</span>
       </header>
-      <main className="content files-content">
-        <section className="file-panel">
-          <h3>Upload to device</h3>
-          <p>Files land in the agent data directory under uploads/.</p>
-          <input
-            ref={fileRef}
-            type="file"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) upload(file);
-            }}
-          />
-        </section>
-        <section className="file-panel">
-          <h3>Download from device</h3>
-          <p>Read any file inside the agent's allowed path roots.</p>
-          <div className="path-row">
-            <input
-              value={path}
-              onChange={(e) => setPath(e.target.value)}
-              placeholder="/home/user/notes.txt"
-            />
-            <button className="primary-btn inline" disabled={busy} onClick={download}>
-              <Download size={15} />
-              Download
-            </button>
+
+      <main className="content">
+        <div className="file-toolbar">
+          <div className="breadcrumbs">
+            {segments.map((seg, i) => {
+              const p = segments.slice(0, i + 1).join(separator);
+              return (
+                <button key={p} onClick={() => loadDir(separator + p)}>
+                  {seg}
+                </button>
+              );
+            })}
           </div>
-        </section>
-        {message && <div className="file-message">{message}</div>}
+          <div className="toolbar-actions">
+            <button className="icon-btn" title="Refresh" onClick={() => loadDir(path)}>
+              <RefreshCw size={15} />
+            </button>
+            <button className="icon-btn" title="New folder" onClick={handleNewFolder}>
+              <FolderPlus size={15} />
+            </button>
+            <button className="icon-btn" title="Upload files" onClick={() => fileRef.current?.click()}>
+              <Upload size={15} />
+            </button>
+            <button className="icon-btn" title="Download selected" disabled={selected.size === 0} onClick={handleDownloadSelected}>
+              <Download size={15} />
+            </button>
+            <button className="icon-btn danger" title="Delete selected" disabled={selected.size === 0} onClick={handleDeleteSelected}>
+              <Trash2 size={15} />
+            </button>
+            <input ref={fileRef} type="file" multiple hidden onChange={(e) => e.target.files && handleUpload(e.target.files)} />
+          </div>
+        </div>
+
+        <div
+          className={`dropzone ${dragOver ? "over" : ""}`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            if (e.dataTransfer.files.length > 0) {
+              handleUpload(e.dataTransfer.files);
+            }
+          }}
+        >
+          {message && <div className="file-message">{message}</div>}
+          <div className="file-table">
+            <div className="file-row file-row-head">
+              <span></span>
+              <span>Name</span>
+              <span>Size</span>
+              <span>Modified</span>
+              <span>Actions</span>
+            </div>
+            {entries.map((entry) => (
+              <div className="file-row" key={entry.path}>
+                <span>
+                  <input
+                    type="checkbox"
+                    checked={selected.has(entry.path)}
+                    onChange={() => toggleSelect(entry.path)}
+                  />
+                </span>
+                <button
+                  className="file-name"
+                  onClick={() => (entry.isDir ? loadDir(entry.path) : downloadPath(entry.path, entry.name))}
+                >
+                  {entry.isDir ? <Folder size={16} /> : <FileText size={16} />}
+                  {entry.name}
+                </button>
+                <span>{entry.isDir ? "-" : formatBytes(entry.size)}</span>
+                <span>{entry.modTime ? new Date(entry.modTime).toLocaleString() : "-"}</span>
+                <span className="row-actions">
+                  <button className="icon-btn" title="Rename" onClick={() => handleRename(entry)}>
+                    <Pencil size={14} />
+                  </button>
+                </span>
+              </div>
+            ))}
+            {entries.length === 0 && <div className="inline-empty">This folder is empty. Drag files here to upload.</div>}
+          </div>
+        </div>
       </main>
     </div>
   );
+}
+
+function formatBytes(n: number) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }

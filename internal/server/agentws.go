@@ -114,6 +114,21 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 		s.sessionsMu.RLock()
 		sess := s.files[msg.SessionID]
 		s.sessionsMu.RUnlock()
+		if sess == nil {
+			s.sessionsMu.RLock()
+			manager := s.managers[msg.SessionID]
+			s.sessionsMu.RUnlock()
+			if manager != nil && manager.deviceID == deviceID {
+				_ = manager.browser.WriteJSON(msg)
+				if msg.Type == protocol.TypeFileDone || msg.Type == protocol.TypeFileError {
+					s.sessionsMu.Lock()
+					delete(s.managers, msg.SessionID)
+					s.sessionsMu.Unlock()
+					_ = manager.browser.Close()
+				}
+			}
+			return
+		}
 		if sess == nil || sess.deviceID != deviceID {
 			return
 		}
@@ -131,6 +146,13 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 			delete(s.files, msg.SessionID)
 			s.sessionsMu.Unlock()
 			_ = sess.browser.Close()
+		}
+	case protocol.TypeFileListResult, protocol.TypeFileRootsResult:
+		s.sessionsMu.RLock()
+		manager := s.managers[msg.SessionID]
+		s.sessionsMu.RUnlock()
+		if manager != nil && manager.deviceID == deviceID {
+			_ = manager.browser.WriteJSON(msg)
 		}
 	case protocol.TypeForwardConnect:
 		s.handleForwardConnect(deviceID, msg)

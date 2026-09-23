@@ -50,6 +50,11 @@ type fileSession struct {
 	op       string
 }
 
+type managerSession struct {
+	deviceID string
+	browser  *websocket.Conn
+}
+
 type forwardSession struct {
 	source string
 	target string
@@ -92,6 +97,7 @@ type Server struct {
 	sessionsMu    sync.RWMutex
 	terms         map[string]*termSession
 	files         map[string]*fileSession
+	managers      map[string]*managerSession
 	forwards      map[string]*forwardSession
 	screens       map[string]*screenSession
 	sessions      map[string]sessionEntry
@@ -119,6 +125,7 @@ func NewServer(cfg Config) (*Server, error) {
 		agents:        make(map[string]*agentConn),
 		terms:         make(map[string]*termSession),
 		files:         make(map[string]*fileSession),
+		managers:      make(map[string]*managerSession),
 		forwards:      make(map[string]*forwardSession),
 		screens:       make(map[string]*screenSession),
 		sessions:      make(map[string]sessionEntry),
@@ -157,6 +164,7 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	}
 	mux.HandleFunc("/ws/terminal", s.handleTerminalWS)
 	mux.HandleFunc("/ws/file", s.handleFileWS)
+	mux.HandleFunc("/ws/files", s.handleFilesWS)
 	mux.HandleFunc("/ws/screen", s.handleScreenWS)
 	if includeAgent {
 		mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)

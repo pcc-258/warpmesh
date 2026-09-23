@@ -31,6 +31,17 @@ type Message struct {
 	Target string `json:"target,omitempty"`
 	Port   int    `json:"port,omitempty"`
 	IP     string `json:"ip,omitempty"`
+
+	Entries []FileEntry `json:"entries,omitempty"`
+}
+
+// FileEntry describes one file system object on a managed device.
+type FileEntry struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	IsDir   bool   `json:"isDir"`
+	Size    int64  `json:"size"`
+	ModTime string `json:"modTime"`
 }
 
 // Message types used by agents, the server and the web UI.
@@ -51,6 +62,13 @@ const (
 	TypeFileDownload    = "file:download"
 	TypeFileDone        = "file:done"
 	TypeFileError       = "file:error"
+	TypeFileList        = "file:list"
+	TypeFileListResult  = "file:list:result"
+	TypeFileMkdir       = "file:mkdir"
+	TypeFileDelete      = "file:delete"
+	TypeFileRename      = "file:rename"
+	TypeFileRoots       = "file:roots"
+	TypeFileRootsResult = "file:roots:result"
 	TypeForwardConnect  = "forward:connect"
 	TypeForwardOpen     = "forward:open"
 	TypeForwardData     = "forward:data"

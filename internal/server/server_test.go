@@ -596,6 +596,72 @@ func TestAgentConfigEndpoint(t *testing.T) {
 	}
 }
 
+func TestFileManagerRelay(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	key := newTestKey(t, srv)
+	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = agentWS.Close() }()
+	if err := agentWS.WriteJSON(protocol.Message{
+		Type:     protocol.TypeHello,
+		DeviceID: key.DeviceID,
+		Name:     "files box",
+		Hostname: "files-box",
+		OS:       "linux",
+		Arch:     "amd64",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		dev, ok := srv.reg.Get(key.DeviceID)
+		return ok && dev.Online
+	})
+
+	browserWS, _, err := websocket.DefaultDialer.Dial(
+		baseWS+"/ws/files?token=admin-token&device="+key.DeviceID, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = browserWS.Close() }()
+
+	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeFileList, Path: "/tmp"}); err != nil {
+		t.Fatal(err)
+	}
+	list := readAgentMessage(t, agentWS)
+	if list.Type != protocol.TypeFileList || list.Path != "/tmp" {
+		t.Fatalf("unexpected file:list forwarded to agent: %+v", list)
+	}
+	if err := agentWS.WriteJSON(protocol.Message{
+		Type:      protocol.TypeFileListResult,
+		SessionID: list.SessionID,
+		Path:      "/tmp",
+		Entries:   []protocol.FileEntry{{Name: "notes.txt", Path: "/tmp/notes.txt", Size: 12}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var result protocol.Message
+	if err := browserWS.ReadJSON(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Type != protocol.TypeFileListResult || len(result.Entries) != 1 {
+		t.Fatalf("unexpected file list result: %+v", result)
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

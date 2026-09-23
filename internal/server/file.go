@@ -56,6 +56,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 			SessionID: sessionID,
 			Name:      name,
 			Size:      queryInt64(r, "size", 0),
+			Path:      r.URL.Query().Get("path"),
 		}); err != nil {
 			return
 		}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -267,7 +268,17 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		return nil
 	case protocol.TypeFileUpload:
 		name := filepath.Base(msg.Name)
-		f, err := os.Create(filepath.Join(a.cfg.DataDir, "uploads", name))
+		dir := filepath.Join(a.cfg.DataDir, "uploads")
+		if msg.Path != "" {
+			dir = msg.Path
+		}
+		if !a.pathAllowed(dir) {
+			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is outside the allowed directories"})
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+		}
+		f, err := os.Create(filepath.Join(dir, name))
 		if err != nil {
 			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
 		}
@@ -299,6 +310,16 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		return f.Close()
 	case protocol.TypeFileDownload:
 		return a.streamFile(msg)
+	case protocol.TypeFileList:
+		return a.handleFileList(msg)
+	case protocol.TypeFileMkdir:
+		return a.handleFileMkdir(msg)
+	case protocol.TypeFileDelete:
+		return a.handleFileDelete(msg)
+	case protocol.TypeFileRename:
+		return a.handleFileRename(msg)
+	case protocol.TypeFileRoots:
+		return a.handleFileRoots(msg)
 	case protocol.TypeForwardConnect:
 		return a.handleForwardTarget(msg)
 	case protocol.TypeForwardOffer:
@@ -590,6 +611,83 @@ func (a *Agent) pathAllowed(path string) bool {
 		}
 	}
 	return false
+}
+
+func (a *Agent) handleFileList(msg protocol.Message) error {
+	if !a.pathAllowed(msg.Path) {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is outside the allowed directories"})
+	}
+	entries, err := a.listDir(msg.Path)
+	if err != nil {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+	}
+	return a.send(protocol.Message{Type: protocol.TypeFileListResult, SessionID: msg.SessionID, Path: msg.Path, Entries: entries})
+}
+
+func (a *Agent) listDir(path string) ([]protocol.FileEntry, error) {
+	raw, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.FileEntry, 0, len(raw))
+	for _, entry := range raw {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, protocol.FileEntry{
+			Name:    entry.Name(),
+			Path:    filepath.Join(path, entry.Name()),
+			IsDir:   entry.IsDir(),
+			Size:    info.Size(),
+			ModTime: info.ModTime().Format(time.RFC3339),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].IsDir != out[j].IsDir {
+			return out[i].IsDir
+		}
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
+	return out, nil
+}
+
+func (a *Agent) handleFileMkdir(msg protocol.Message) error {
+	if !a.pathAllowed(msg.Path) {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is outside the allowed directories"})
+	}
+	if err := os.MkdirAll(msg.Path, 0o755); err != nil {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+	}
+	return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
+}
+
+func (a *Agent) handleFileDelete(msg protocol.Message) error {
+	if !a.pathAllowed(msg.Path) {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is outside the allowed directories"})
+	}
+	if err := os.RemoveAll(msg.Path); err != nil {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+	}
+	return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
+}
+
+func (a *Agent) handleFileRename(msg protocol.Message) error {
+	if !a.pathAllowed(msg.Path) || !a.pathAllowed(msg.Target) {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is outside the allowed directories"})
+	}
+	if err := os.Rename(msg.Path, msg.Target); err != nil {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+	}
+	return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
+}
+
+func (a *Agent) handleFileRoots(msg protocol.Message) error {
+	roots := make([]protocol.FileEntry, 0, len(a.cfg.AllowPaths))
+	for _, root := range a.cfg.AllowPaths {
+		roots = append(roots, protocol.FileEntry{Name: root, Path: root, IsDir: true})
+	}
+	return a.send(protocol.Message{Type: protocol.TypeFileRootsResult, SessionID: msg.SessionID, Entries: roots})
 }
 
 func (a *Agent) send(v any) error {
