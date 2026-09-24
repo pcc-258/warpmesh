@@ -36,7 +36,7 @@ type User struct {
 	ID        int64     `json:"id"`
 	Username  string    `json:"username"`
 	Role      string    `json:"role"`
-	DeviceIDs []string  `json:"deviceIds,omitempty"`
+	DeviceIDs []string  `json:"deviceIds"`
 	ExpiresAt time.Time `json:"expiresAt,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 }
@@ -66,6 +66,24 @@ type AuditEntry struct {
 	Target    string    `json:"target"`
 	Detail    string    `json:"detail"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ConnectionRecord is one console or device-to-device session observed by the relay.
+type ConnectionRecord struct {
+	ID              string     `json:"id"`
+	Actor           string     `json:"actor"`
+	DeviceID        string     `json:"deviceId"`
+	DeviceName      string     `json:"deviceName"`
+	PeerDeviceID    string     `json:"peerDeviceId,omitempty"`
+	PeerDeviceName  string     `json:"peerDeviceName,omitempty"`
+	Service         string     `json:"service"`
+	Transport       string     `json:"transport"`
+	State           string     `json:"state"`
+	ClientIP        string     `json:"clientIp,omitempty"`
+	BytesToDevice   int64      `json:"bytesToDevice"`
+	BytesFromDevice int64      `json:"bytesFromDevice"`
+	StartedAt       time.Time  `json:"startedAt"`
+	EndedAt         *time.Time `json:"endedAt,omitempty"`
 }
 
 const registrySchema = `
@@ -115,6 +133,31 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	detail     TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS connection_sessions (
+	id               TEXT PRIMARY KEY,
+	actor            TEXT NOT NULL,
+	device_id        TEXT NOT NULL,
+	peer_device_id   TEXT NOT NULL DEFAULT '',
+	service          TEXT NOT NULL,
+	transport        TEXT NOT NULL,
+	state            TEXT NOT NULL,
+	client_ip        TEXT NOT NULL DEFAULT '',
+	bytes_to_device  INTEGER NOT NULL DEFAULT 0,
+	bytes_from_device INTEGER NOT NULL DEFAULT 0,
+	started_at       TEXT NOT NULL,
+	ended_at         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS connection_sessions_started_at_idx ON connection_sessions(started_at);
+
+CREATE TABLE IF NOT EXISTS connection_traffic (
+	connection_id    TEXT NOT NULL,
+	bucket_start     TEXT NOT NULL,
+	bytes_to_device  INTEGER NOT NULL DEFAULT 0,
+	bytes_from_device INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (connection_id, bucket_start)
+);
+CREATE INDEX IF NOT EXISTS connection_traffic_bucket_idx ON connection_traffic(bucket_start);
 `
 
 // Registry keeps the device catalog and access metadata in SQLite.
@@ -162,12 +205,144 @@ func NewRegistry(dataDir string) (*Registry, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec("UPDATE connection_sessions SET state = 'interrupted', ended_at = ? WHERE state IN ('active', 'pending')", time.Now().Format(time.RFC3339Nano)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Agents reconnect after a restart; nothing is online until it says hello.
 	if _, err := db.Exec("UPDATE devices SET online = 0"); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return r, nil
+}
+
+// StartConnection persists the beginning of a terminal, desktop, file, or tunnel session.
+func (r *Registry) StartConnection(actor, deviceID, peerDeviceID, service, transport, clientIP string) (string, error) {
+	id := newID()
+	now := time.Now().UTC()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec(`INSERT INTO connection_sessions
+		(id, actor, device_id, peer_device_id, service, transport, state, client_ip, started_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`, id, actor, deviceID, peerDeviceID, service, transport, clientIP, now.Format(time.RFC3339Nano))
+	return id, err
+}
+
+// SetConnectionTransport records whether a tunnel became direct or used the relay.
+func (r *Registry) SetConnectionTransport(id, transport string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec("UPDATE connection_sessions SET transport = ? WHERE id = ?", transport, id)
+	return err
+}
+
+// AddConnectionTraffic adds observed bytes to a session. Direct tunnel bytes are not observable here.
+func (r *Registry) AddConnectionTraffic(id string, toDevice, fromDevice int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE connection_sessions SET bytes_to_device = bytes_to_device + ?, bytes_from_device = bytes_from_device + ? WHERE id = ?", toDevice, fromDevice, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	bucket := time.Now().UTC().Truncate(time.Hour).Format(time.RFC3339Nano)
+	if _, err := tx.Exec(`INSERT INTO connection_traffic(connection_id, bucket_start, bytes_to_device, bytes_from_device)
+		VALUES (?, ?, ?, ?) ON CONFLICT(connection_id, bucket_start) DO UPDATE SET
+		bytes_to_device = bytes_to_device + excluded.bytes_to_device,
+		bytes_from_device = bytes_from_device + excluded.bytes_from_device`, id, bucket, toDevice, fromDevice); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// EndConnection marks a session terminal and stores its end time.
+func (r *Registry) EndConnection(id, state string) error {
+	if state != "closed" && state != "failed" && state != "interrupted" {
+		state = "closed"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec("UPDATE connection_sessions SET state = ?, ended_at = ? WHERE id = ? AND ended_at = ''", state, time.Now().UTC().Format(time.RFC3339Nano), id)
+	return err
+}
+
+// ListConnections returns the most recent sessions that started in the requested time range.
+func (r *Registry) ListConnections(since time.Time, limit int) []ConnectionRecord {
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rows, err := r.db.Query(`SELECT c.id, c.actor, c.device_id, COALESCE(d.name, c.device_id),
+		c.peer_device_id, COALESCE(p.name, c.peer_device_id), c.service, c.transport, c.state,
+		c.client_ip, c.bytes_to_device, c.bytes_from_device, c.started_at, c.ended_at
+		FROM connection_sessions c
+		LEFT JOIN devices d ON d.id = c.device_id
+		LEFT JOIN devices p ON p.id = c.peer_device_id
+		WHERE julianday(c.started_at) >= julianday(?) ORDER BY c.started_at DESC LIMIT ?`, since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return []ConnectionRecord{}
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]ConnectionRecord, 0)
+	for rows.Next() {
+		var item ConnectionRecord
+		var started, ended string
+		if err := rows.Scan(&item.ID, &item.Actor, &item.DeviceID, &item.DeviceName,
+			&item.PeerDeviceID, &item.PeerDeviceName, &item.Service, &item.Transport, &item.State,
+			&item.ClientIP, &item.BytesToDevice, &item.BytesFromDevice, &started, &ended); err != nil {
+			continue
+		}
+		item.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
+		if ended != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, ended)
+			if err == nil {
+				item.EndedAt = &parsed
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// ConnectionTrafficRecord is an hourly, VPS-observed traffic sample for one device session.
+type ConnectionTrafficRecord struct {
+	DeviceID        string
+	BucketStart     time.Time
+	BytesToDevice   int64
+	BytesFromDevice int64
+}
+
+// ListConnectionTraffic returns relay traffic buckets since the requested time.
+func (r *Registry) ListConnectionTraffic(since time.Time, limit int) []ConnectionTrafficRecord {
+	if limit <= 0 || limit > 50000 {
+		limit = 10000
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rows, err := r.db.Query(`SELECT c.device_id, t.bucket_start, t.bytes_to_device, t.bytes_from_device
+		FROM connection_traffic t JOIN connection_sessions c ON c.id = t.connection_id
+		WHERE julianday(t.bucket_start) >= julianday(?) ORDER BY t.bucket_start DESC LIMIT ?`, since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return []ConnectionTrafficRecord{}
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]ConnectionTrafficRecord, 0)
+	for rows.Next() {
+		var item ConnectionTrafficRecord
+		var started string
+		if err := rows.Scan(&item.DeviceID, &started, &item.BytesToDevice, &item.BytesFromDevice); err != nil {
+			continue
+		}
+		item.BucketStart, _ = time.Parse(time.RFC3339Nano, started)
+		out = append(out, item)
+	}
+	return out
 }
 
 func (r *Registry) ensureColumn(table, column, ddl string) error {

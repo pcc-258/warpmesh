@@ -1,12 +1,43 @@
-FROM alpine:3.20
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates xvfb x11vnc fluxbox xauth xsetroot
+ENV DEBIAN_FRONTEND=noninteractive \
+    HOME=/home/warpmesh \
+    USER=warpmesh \
+    DISPLAY=:1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dbus-daemon \
+        dbus-x11 \
+        firefox-esr \
+        fonts-dejavu \
+        mousepad \
+        thunar \
+        x11-utils \
+        x11-xserver-utils \
+        x11vnc \
+        xauth \
+        xfce4-panel \
+        xfce4-session \
+        xfce4-terminal \
+        xfdesktop4 \
+        xfwm4 \
+        xvfb \
+    && useradd --create-home --shell /bin/bash warpmesh \
+    && mkdir -p /run/dbus /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
+    && chown -R warpmesh:warpmesh /home/warpmesh \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG AGENT_BINARY=bin/warpmesh-agent-linux-arm64
 
 COPY ${AGENT_BINARY} /usr/local/bin/warpmesh-agent
 COPY entrypoint-desktop.sh /entrypoint-desktop.sh
 
-RUN chmod +x /entrypoint-desktop.sh
+RUN chmod +x /entrypoint-desktop.sh /usr/local/bin/warpmesh-agent
+
+WORKDIR /home/warpmesh
+USER warpmesh
 
 ENTRYPOINT ["/entrypoint-desktop.sh"]

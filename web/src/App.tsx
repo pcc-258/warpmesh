@@ -6,10 +6,8 @@ import {
   FileText,
   Folder,
   FolderPlus,
-  HardDrive,
   KeyRound,
   LayoutDashboard,
-  Layers,
   LogOut,
   Monitor,
   MonitorSmartphone,
@@ -21,6 +19,7 @@ import {
   TerminalSquare,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -33,7 +32,7 @@ import {
   deleteInvite,
   deleteDevice,
   deleteUser,
-  getStats,
+  getAnalytics,
   getToken,
   lastSeenLabel,
   listAudit,
@@ -48,15 +47,51 @@ import {
   rotateDeviceKey,
   updateUser,
   type AuditEntry,
+  type AnalyticsData,
+  type ConnectionRecord,
   type Device,
   type DeviceKey,
   type Invite,
-  type Stats,
   type UserAccount,
   wsUrl,
 } from "./api";
 
 type Page = "dashboard" | "devices" | "access" | "activity";
+
+const PAGE_PATHS: Record<Page, string> = {
+  dashboard: "/",
+  devices: "/devices",
+  access: "/access",
+  activity: "/activity",
+};
+
+const PAGES_BY_PATH: Record<string, Page> = {
+  "/": "dashboard",
+  "/devices": "devices",
+  "/access": "access",
+  "/activity": "activity",
+};
+
+type DeviceRouteKind = "terminal" | "desktop" | "files";
+
+function deviceView(kind: DeviceRouteKind, device: Device): Exclude<View, { name: "page" }> {
+  switch (kind) {
+    case "terminal":
+      return { name: "terminal", device };
+    case "desktop":
+      return { name: "desktop", device };
+    case "files":
+      return { name: "files", device };
+  }
+}
+
+function normalizedPath(path: string): string {
+  return path.split("?")[0].replace(/\/+$/, "") || "/";
+}
+
+function pageFromPath(path: string): Page {
+  return PAGES_BY_PATH[normalizedPath(path)] ?? "dashboard";
+}
 
 type View =
   | { name: "page"; page: Page }
@@ -66,55 +101,99 @@ type View =
 
 export default function App() {
   const [token, setTokenState] = useState(getToken());
-  const [view, setView] = useState<View>({ name: "page", page: "dashboard" });
+  const [view, setView] = useState<View>(() => ({ name: "page", page: pageFromPath(location.pathname) }));
+  const routeSeq = useRef(0);
+
+  const applyLocation = useCallback(async () => {
+    const seq = ++routeSeq.current;
+    const deviceMatch =
+      location.pathname.match(/^\/devices\/([^/]+)\/(terminal|desktop|files)$/) ||
+      location.hash.match(/^#\/(desktop|terminal|files)\/(.+)$/);
+    if (!deviceMatch) {
+      if (routeSeq.current === seq) {
+        setView({ name: "page", page: pageFromPath(location.pathname) });
+      }
+      return;
+    }
+    const kind = deviceMatch[1] as DeviceRouteKind;
+    const id = decodeURIComponent(deviceMatch[2]);
+    try {
+      const devices = await listDevices();
+      const device = devices.find((d) => d.id === id);
+      if (device && routeSeq.current === seq) {
+        setView(deviceView(kind, device));
+      }
+    } catch {
+      // deep links resolve lazily; the console stays usable if the lookup fails
+    }
+  }, []);
 
   useEffect(() => {
     if (!token) {
       return;
     }
-    const match = location.hash.match(/^#\/(desktop|terminal)\/(.+)$/);
-    if (!match) {
-      return;
+    void applyLocation();
+    window.addEventListener("popstate", applyLocation);
+    return () => window.removeEventListener("popstate", applyLocation);
+  }, [token, applyLocation]);
+
+  const goToPath = useCallback((path: string) => {
+    if (normalizedPath(location.pathname) !== normalizedPath(path)) {
+      history.pushState({}, "", path);
     }
-    listDevices()
-      .then((devices) => {
-        const device = devices.find((d) => d.id === decodeURIComponent(match[2]));
-        if (device) {
-          setView({ name: match[1] === "desktop" ? "desktop" : "terminal", device });
-        }
-      })
-      .catch(() => {});
-  }, [token]);
+  }, []);
+
+  const goToPage = useCallback(
+    (page: Page) => {
+      goToPath(PAGE_PATHS[page]);
+      setView({ name: "page", page });
+    },
+    [goToPath],
+  );
+
+  const goToDevices = useCallback(() => {
+    history.replaceState({}, "", PAGE_PATHS.devices);
+    setView({ name: "page", page: "devices" });
+  }, []);
+
+  const openDeviceView = useCallback(
+    (kind: DeviceRouteKind, device: Device) => {
+      goToPath(`/devices/${encodeURIComponent(device.id)}/${kind}`);
+      setView(deviceView(kind, device));
+    },
+    [goToPath],
+  );
 
   if (!token) {
     return <Login onLogin={() => setTokenState(getToken())} />;
   }
 
   if (view.name === "terminal") {
-    return <TerminalView device={view.device} onBack={() => setView({ name: "page", page: "devices" })} />;
+    return <TerminalView device={view.device} onBack={goToDevices} />;
   }
 
   if (view.name === "desktop") {
-    return <DesktopView device={view.device} onBack={() => setView({ name: "page", page: "devices" })} />;
+    return <DesktopView device={view.device} onBack={goToDevices} />;
   }
 
   if (view.name === "files") {
-    return <FileManagerView device={view.device} onBack={() => setView({ name: "page", page: "devices" })} />;
+    return <FileManagerView device={view.device} onBack={goToDevices} />;
   }
 
   return (
     <Console
       page={view.page}
-      onNavigate={(page) => setView({ name: "page", page })}
-      onTerminal={(d) => setView({ name: "terminal", device: d })}
-      onDesktop={(d) => setView({ name: "desktop", device: d })}
-      onFiles={(d) => setView({ name: "files", device: d })}
+      onNavigate={goToPage}
+      onTerminal={(d) => openDeviceView("terminal", d)}
+      onDesktop={(d) => openDeviceView("desktop", d)}
+      onFiles={(d) => openDeviceView("files", d)}
       onLogout={async () => {
         try {
           await logout();
         } catch {
           // local logout must still work when the server is unreachable
         }
+        history.replaceState({}, "", "/");
         clearToken();
         setTokenState("");
       }}
@@ -189,7 +268,9 @@ function Console({
   onLogout: () => void;
 }) {
   const [devices, setDevices] = useState<Device[]>([]);
-  const [stats, setStats] = useState<Stats | null>(null);
+  const [analytics, setAnalytics] = useState<AnalyticsData | null>(null);
+  const [analyticsRange, setAnalyticsRange] = useState<"24h" | "7d">("24h");
+  const [analyticsLoading, setAnalyticsLoading] = useState(true);
   const [keys, setKeys] = useState<DeviceKey[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [users, setUsers] = useState<UserAccount[]>([]);
@@ -200,15 +281,25 @@ function Console({
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [deviceList, statsData] = await Promise.all([listDevices(), getStats()]);
+      const deviceList = await listDevices();
       setDevices(deviceList);
-      setStats(statsData);
     } catch {
       onLogout();
     } finally {
       setLoading(false);
     }
   }, [onLogout]);
+
+  const loadAnalytics = useCallback(async () => {
+    setAnalyticsLoading(true);
+    try {
+      setAnalytics(await getAnalytics(analyticsRange));
+    } catch {
+      setAnalytics(null);
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  }, [analyticsRange]);
 
   const loadKeys = useCallback(async () => {
     try {
@@ -252,6 +343,12 @@ function Console({
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
   }, [refresh, loadKeys, loadAudit, loadInvites, loadUsers]);
+
+  useEffect(() => {
+    void loadAnalytics();
+    const timer = setInterval(loadAnalytics, 15000);
+    return () => clearInterval(timer);
+  }, [loadAnalytics]);
 
   const handleCreateKey = async () => {
     const name = prompt("Device name for the new key");
@@ -318,27 +415,55 @@ function Console({
           </div>
         </div>
         <nav className="sidebar-nav">
-          <button className={page === "dashboard" ? "active" : ""} onClick={() => onNavigate("dashboard")}>
+          <a
+            className={page === "dashboard" ? "active" : ""}
+            href={PAGE_PATHS.dashboard}
+            onClick={(e) => {
+              e.preventDefault();
+              onNavigate("dashboard");
+            }}
+          >
             <LayoutDashboard size={17} />
             Dashboard
-          </button>
-          <button className={page === "devices" ? "active" : ""} onClick={() => onNavigate("devices")}>
+          </a>
+          <a
+            className={page === "devices" ? "active" : ""}
+            href={PAGE_PATHS.devices}
+            onClick={(e) => {
+              e.preventDefault();
+              onNavigate("devices");
+            }}
+          >
             <MonitorSmartphone size={17} />
             Devices
-          </button>
-          <button className={page === "access" ? "active" : ""} onClick={() => onNavigate("access")}>
+          </a>
+          <a
+            className={page === "access" ? "active" : ""}
+            href={PAGE_PATHS.access}
+            onClick={(e) => {
+              e.preventDefault();
+              onNavigate("access");
+            }}
+          >
             <KeyRound size={17} />
             Access
-          </button>
-          <button className={page === "activity" ? "active" : ""} onClick={() => onNavigate("activity")}>
+          </a>
+          <a
+            className={page === "activity" ? "active" : ""}
+            href={PAGE_PATHS.activity}
+            onClick={(e) => {
+              e.preventDefault();
+              onNavigate("activity");
+            }}
+          >
             <ScrollText size={17} />
             Activity
-          </button>
+          </a>
         </nav>
         <div className="sidebar-foot">
           <div className="stat-pill">
             <Activity size={14} />
-            {stats?.online ?? 0}/{stats?.total ?? 0} online
+            {devices.filter((device) => device.online).length}/{devices.length} online
           </div>
           <button className="icon-btn" onClick={onLogout} title="Log out">
             <LogOut size={15} />
@@ -350,15 +475,22 @@ function Console({
         <header className="topbar">
           <div className="page-title">
             <h1>{title}</h1>
-            <p>{page === "dashboard" ? "Fleet overview" : page === "devices" ? "Managed devices" : page === "access" ? "Device credentials" : "Security events"}</p>
+            <p>{page === "dashboard" ? "Connections and traffic" : page === "devices" ? "Managed devices" : page === "access" ? "Device credentials" : "Security events"}</p>
           </div>
-          <button className="icon-btn" onClick={refresh} title="Refresh" disabled={loading}>
+          <button className="icon-btn" onClick={() => { void refresh(); void loadAnalytics(); }} title="Refresh" disabled={loading || analyticsLoading}>
             <RefreshCw size={16} className={loading ? "spin" : ""} />
           </button>
         </header>
 
         <div className="content">
-          {page === "dashboard" && <DashboardPage stats={stats} audit={audit} />}
+          {page === "dashboard" && (
+            <DashboardPage
+              analytics={analytics}
+              loading={analyticsLoading}
+              range={analyticsRange}
+              onRangeChange={setAnalyticsRange}
+            />
+          )}
           {page === "devices" && (
             <DevicesPage devices={devices} onTerminal={onTerminal} onDesktop={onDesktop} onFiles={onFiles} />
           )}
@@ -384,63 +516,214 @@ function Console({
   );
 }
 
-function DashboardPage({ stats, audit }: { stats: Stats | null; audit: AuditEntry[] }) {
-  const osEntries = Object.entries(stats?.byOS ?? {}).sort((a, b) => b[1] - a[1]);
-  const activity = audit.length > 0 ? audit : stats?.recentActivity ?? [];
+function DashboardPage({
+  analytics,
+  loading,
+  range,
+  onRangeChange,
+}: {
+  analytics: AnalyticsData | null;
+  loading: boolean;
+  range: "24h" | "7d";
+  onRangeChange: (range: "24h" | "7d") => void;
+}) {
+  const buckets = analytics?.buckets ?? [];
+  const maxTraffic = Math.max(1, ...buckets.map((bucket) => bucket.bytesToDevice + bucket.bytesFromDevice));
+  const knownRoutes = (analytics?.directTunnels ?? 0) + (analytics?.relayTunnels ?? 0);
+  const directPercent = knownRoutes ? Math.round(((analytics?.directTunnels ?? 0) / knownRoutes) * 100) : 0;
   return (
-    <div className="page-grid">
-      <section className="stat-grid">
+    <div className="page-grid dashboard-page">
+      <div className="dashboard-heading">
+        <div>
+          <h2>Connection overview</h2>
+          <p>Session history and traffic observed by this WarpMesh server.</p>
+        </div>
+        <div className="range-switch" aria-label="Analytics time range">
+          <button className={range === "24h" ? "active" : ""} onClick={() => onRangeChange("24h")}>24 hours</button>
+          <button className={range === "7d" ? "active" : ""} onClick={() => onRangeChange("7d")}>7 days</button>
+        </div>
+      </div>
+
+      <section className="stat-grid dashboard-stat-grid">
         <div className="stat-card">
-          <MonitorSmartphone size={18} />
-          <strong>{stats?.total ?? 0}</strong>
-          <span>Devices</span>
+          <Activity size={18} />
+          <strong>{analytics?.sessions ?? 0}</strong>
+          <span>Connections</span>
         </div>
         <div className="stat-card accent">
-          <Activity size={18} />
-          <strong>{stats?.online ?? 0}</strong>
-          <span>Online</span>
+          <MonitorSmartphone size={18} />
+          <strong>{analytics?.active ?? 0}</strong>
+          <span>Active sessions</span>
         </div>
         <div className="stat-card">
-          <Layers size={18} />
-          <strong>{stats?.groups?.length ?? 0}</strong>
-          <span>Groups</span>
+          <ShieldCheck size={18} />
+          <strong>{analytics?.directSessions ?? 0}</strong>
+          <span>Direct tunnels</span>
         </div>
         <div className="stat-card">
-          <HardDrive size={18} />
-          <strong>{Object.keys(stats?.byOS ?? {}).length}</strong>
-          <span>Platforms</span>
+          <Download size={18} />
+          <strong>{formatTrafficBytes(analytics?.relayBytes ?? 0)}</strong>
+          <span>Server relay traffic</span>
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel traffic-panel">
         <div className="panel-head">
-          <h3>Platform distribution</h3>
-        </div>
-        {osEntries.length === 0 ? (
-          <div className="inline-empty">No agents registered yet.</div>
-        ) : (
-          <div className="os-list">
-            {osEntries.map(([os, count]) => (
-              <div className="os-row" key={os}>
-                <span>{os}</span>
-                <div className="os-track">
-                  <div style={{ width: `${Math.min(100, (count / Math.max(1, osEntries[0][1])) * 100)}%` }} />
-                </div>
-                <strong>{count}</strong>
-              </div>
-            ))}
+          <div>
+            <h3>Relayed traffic</h3>
+            <p>Bytes passing through the VPS, grouped by {range === "24h" ? "hour" : "day"}</p>
           </div>
+          <span className="range-caption">{range === "24h" ? "Last 24 hours" : "Last 7 days"}</span>
+        </div>
+        {loading && !analytics ? (
+          <div className="inline-empty">Loading connection data…</div>
+        ) : buckets.length === 0 ? (
+          <div className="inline-empty">No traffic data for this period.</div>
+        ) : (
+          <>
+            <div className={`traffic-chart ${range === "7d" ? "weekly" : ""}`} role="img" aria-label="Server-relayed bytes by time bucket">
+              {buckets.map((bucket, index) => {
+                const toHeight = (bucket.bytesToDevice / maxTraffic) * 100;
+                const fromHeight = (bucket.bytesFromDevice / maxTraffic) * 100;
+                const showLabel = range === "24h" ? index % 6 === 0 || index === buckets.length - 1 : true;
+                return (
+                  <div className="traffic-column" key={bucket.startedAt}>
+                    <div
+                      className="traffic-bar"
+                      title={`${new Date(bucket.startedAt).toLocaleString()} · to device ${formatTrafficBytes(bucket.bytesToDevice)} · from device ${formatTrafficBytes(bucket.bytesFromDevice)}`}
+                    >
+                      <span className="traffic-from" style={{ height: `${fromHeight}%` }} />
+                      <span className="traffic-to" style={{ height: `${toHeight}%` }} />
+                    </div>
+                    <small>{showLabel ? chartLabel(bucket.startedAt, range) : ""}</small>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="traffic-legend">
+              <span><i className="legend-to" />To device</span>
+              <span><i className="legend-from" />From device</span>
+            </div>
+          </>
         )}
+        <p className="chart-note">Terminal, desktop, file and relayed tunnel traffic is measured here. Direct tunnels bypass the VPS, so their payload bytes are not included.</p>
       </section>
 
-      <section className="panel">
-        <div className="panel-head">
-          <h3>Recent activity</h3>
-        </div>
-        <ActivityList audit={activity.slice(0, 10)} />
-      </section>
+      <div className="dashboard-lower-grid">
+        <section className="panel route-panel">
+          <div className="panel-head">
+            <div>
+              <h3>Connection path</h3>
+              <p>How tunnel sessions reached their destination</p>
+            </div>
+          </div>
+          {knownRoutes === 0 ? (
+            <div className="inline-empty">No direct or relayed tunnel sessions in this period.</div>
+          ) : (
+            <>
+              <div className="route-split-bar" aria-label={`${directPercent}% direct, ${100 - directPercent}% relay`}>
+                <span className="route-direct" style={{ width: `${directPercent}%` }} />
+                <span className="route-relay" style={{ width: `${100 - directPercent}%` }} />
+              </div>
+              <div className="route-counts">
+                <span><i className="route-direct-dot" />Direct <strong>{analytics?.directTunnels ?? 0}</strong></span>
+                <span><i className="route-relay-dot" />Server relay <strong>{analytics?.relayTunnels ?? 0}</strong></span>
+              </div>
+            </>
+          )}
+          <p className="chart-note">Path is reported for device-to-device TCP forwarding. Browser terminal, desktop and file sessions always use the server relay.</p>
+        </section>
+
+        <section className="panel recent-connections-panel">
+          <div className="panel-head">
+            <div>
+              <h3>Recent connections</h3>
+              <p>Most recent sessions in the selected period</p>
+            </div>
+            <span className="range-caption">{analytics?.recent.length ?? 0} shown</span>
+          </div>
+          {!analytics?.recent.length ? (
+            <div className="inline-empty">{loading ? "Loading connection data…" : "No connections recorded for this period."}</div>
+          ) : (
+            <div className="connection-table-wrap">
+              <table className="connection-table">
+                <thead>
+                  <tr><th>Started</th><th>Connection</th><th>Path</th><th>Status</th><th>Traffic</th><th>Source</th></tr>
+                </thead>
+                <tbody>
+                  {analytics.recent.map((entry) => (
+                    <tr key={entry.id}>
+                      <td><span>{new Date(entry.startedAt).toLocaleString()}</span><small>{connectionDuration(entry)}</small></td>
+                      <td><strong>{serviceLabel(entry.service)}</strong><small>{connectionEndpoints(entry)}</small></td>
+                      <td><span className={`path-badge ${entry.transport}`}>{transportLabel(entry.transport)}</span></td>
+                      <td><span className={`state-badge ${entry.state}`}>{stateLabel(entry.state)}</span></td>
+                      <td><span>From device {formatTrafficBytes(entry.bytesFromDevice)}</span><small>To device {formatTrafficBytes(entry.bytesToDevice)}</small></td>
+                      <td><span>{entry.actor}</span><small>{entry.clientIp || "IP unavailable"}</small></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+      {!analytics && !loading && <div className="analytics-error" role="status">Connection analytics could not be loaded. Refresh to retry.</div>}
     </div>
   );
+}
+
+function formatTrafficBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function chartLabel(value: string, range: "24h" | "7d"): string {
+  const date = new Date(value);
+  return range === "24h"
+    ? date.toLocaleTimeString([], { hour: "2-digit", hour12: false })
+    : date.toLocaleDateString([], { month: "numeric", day: "numeric" });
+}
+
+function connectionDuration(entry: ConnectionRecord): string {
+  const end = entry.endedAt ? new Date(entry.endedAt).getTime() : Date.now();
+  const seconds = Math.max(0, Math.floor((end - new Date(entry.startedAt).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+function serviceLabel(service: string): string {
+  if (service === "terminal") return "Remote terminal";
+  if (service === "desktop") return "Remote desktop";
+  if (service === "files-upload") return "File upload";
+  if (service === "files-download") return "File download";
+  if (service.startsWith("tcp:")) return `TCP ${service.slice(4)}`;
+  return service;
+}
+
+function connectionEndpoints(entry: ConnectionRecord): string {
+  return entry.peerDeviceName ? `${entry.deviceName} ↔ ${entry.peerDeviceName}` : entry.deviceName;
+}
+
+function transportLabel(transport: string): string {
+  if (transport === "direct") return "Direct";
+  if (transport === "relay") return "Server relay";
+  return "Negotiating";
+}
+
+function stateLabel(state: string): string {
+  if (state === "active" || state === "pending") return "Active";
+  if (state === "failed") return "Failed";
+  if (state === "interrupted") return "Interrupted";
+  return "Closed";
 }
 
 function DevicesPage({
@@ -455,7 +738,7 @@ function DevicesPage({
   onFiles: (d: Device) => void;
 }) {
   const [group, setGroup] = useState("");
-  const groups = Array.from(new Set(devices.map((d) => d.group).filter(Boolean)));
+  const groups = Array.from(new Set(devices.map((d) => d.group).filter((value): value is string => Boolean(value))));
   const filtered = group ? devices.filter((d) => d.group === group) : devices;
 
   const handleRename = async (device: Device) => {
@@ -560,7 +843,7 @@ function AccessPage({
   users: UserAccount[];
   devices: Device[];
   canManageUsers: boolean;
-  onUsersChanged: () => void;
+  onUsersChanged: () => Promise<void>;
   onCreate: () => void;
   onRevoke: (key: DeviceKey) => void;
   onRotate: (key: DeviceKey) => void;
@@ -572,21 +855,54 @@ function AccessPage({
   const [newRole, setNewRole] = useState("operator");
   const [newExpiry, setNewExpiry] = useState("");
   const [newDevices, setNewDevices] = useState<string[]>([]);
+  const [showCreateUser, setShowCreateUser] = useState(false);
+  const [savingUser, setSavingUser] = useState(false);
+  const [createUserError, setCreateUserError] = useState("");
+
+  const resetNewUserForm = useCallback(() => {
+    setNewUsername("");
+    setNewPassword("");
+    setNewRole("operator");
+    setNewExpiry("");
+    setNewDevices([]);
+    setCreateUserError("");
+  }, []);
+
+  const closeCreateUser = useCallback(() => {
+    if (savingUser) return;
+    setShowCreateUser(false);
+    resetNewUserForm();
+  }, [resetNewUserForm, savingUser]);
+
+  useEffect(() => {
+    if (!showCreateUser) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !savingUser) closeCreateUser();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showCreateUser, savingUser, closeCreateUser]);
 
   const submitCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
-    await createUser({
-      username: newUsername.trim(),
-      password: newPassword,
-      role: newRole,
-      deviceIds: newDevices,
-      expiresAt: newExpiry ? new Date(newExpiry).toISOString() : undefined,
-    });
-    setNewUsername("");
-    setNewPassword("");
-    setNewDevices([]);
-    setNewExpiry("");
-    onUsersChanged();
+    setSavingUser(true);
+    setCreateUserError("");
+    try {
+      await createUser({
+        username: newUsername.trim(),
+        password: newPassword,
+        role: newRole,
+        deviceIds: newDevices,
+        expiresAt: newExpiry ? new Date(newExpiry).toISOString() : undefined,
+      });
+      await onUsersChanged();
+      setShowCreateUser(false);
+      resetNewUserForm();
+    } catch (error) {
+      setCreateUserError(error instanceof Error ? error.message : "Could not create account.");
+    } finally {
+      setSavingUser(false);
+    }
   };
 
   const handleResetPassword = async (user: UserAccount) => {
@@ -614,7 +930,7 @@ function AccessPage({
   };
 
   const handleDevices = async (user: UserAccount) => {
-    const value = prompt("Allowed device ids, comma separated", user.deviceIds.join(","));
+    const value = prompt("Allowed device ids, comma separated", (user.deviceIds ?? []).join(","));
     if (value !== null) {
       const ids = value.split(",").map((s) => s.trim()).filter(Boolean);
       await updateUser(user.username, { deviceIds: ids });
@@ -697,54 +1013,141 @@ function AccessPage({
               <h3>Accounts</h3>
               <p>Admin accounts have full access. Operators only access granted devices.</p>
             </div>
-          </div>
-          <form className="user-form" onSubmit={submitCreateUser}>
-            <input value={newUsername} onChange={(e) => setNewUsername(e.target.value)} placeholder="username" required />
-            <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="password" required />
-            <select value={newRole} onChange={(e) => setNewRole(e.target.value)}>
-              <option value="operator">operator</option>
-              <option value="admin">admin</option>
-            </select>
-            <input type="date" value={newExpiry} onChange={(e) => setNewExpiry(e.target.value)} />
-            <select multiple value={newDevices} onChange={(e) => setNewDevices(Array.from(e.target.selectedOptions, (o) => o.value))}>
-              {devices.map((d) => (
-                <option key={d.id} value={d.id}>
-                  {d.name} ({d.id})
-                </option>
-              ))}
-            </select>
-            <button className="primary-btn inline" type="submit">
-              Create user
+            <button className="primary-btn inline" type="button" onClick={() => setShowCreateUser(true)}>
+              Create account
             </button>
-          </form>
-          <div className="key-list">
-            {users.map((user) => (
-              <div className="key-row" key={user.username}>
-                <div>
-                  <strong>{user.username}</strong>
-                  <span>
-                    {user.role} · {user.deviceIds.length} devices
-                    {user.expiresAt ? ` · expires ${new Date(user.expiresAt).toLocaleDateString()}` : ""}
-                  </span>
-                </div>
-                <button className="icon-btn" title="Reset password" onClick={() => handleResetPassword(user)}>
-                  <Pencil size={14} />
-                </button>
-                <button className="icon-btn" title="Change role" onClick={() => handleRole(user)}>
-                  <ShieldCheck size={14} />
-                </button>
-                <button className="icon-btn" title="Set expiry" onClick={() => handleExpiry(user)}>
-                  <RefreshCw size={14} />
-                </button>
-                <button className="icon-btn" title="Edit devices" onClick={() => handleDevices(user)}>
-                  <MonitorSmartphone size={14} />
-                </button>
-                <button className="icon-btn danger" title="Delete account" onClick={() => handleDeleteUser(user)}>
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
           </div>
+          {users.length === 0 ? (
+            <div className="inline-empty">No accounts yet.</div>
+          ) : (
+            <div className="key-list">
+              {users.map((user) => (
+                <div className="key-row" key={user.username}>
+                  <div>
+                    <strong>{user.username}</strong>
+                    <span>
+                      {user.role} · {(user.deviceIds ?? []).length} devices
+                      {user.expiresAt ? ` · expires ${new Date(user.expiresAt).toLocaleDateString()}` : ""}
+                    </span>
+                  </div>
+                  <button className="icon-btn" title="Reset password" onClick={() => handleResetPassword(user)}>
+                    <Pencil size={14} />
+                  </button>
+                  <button className="icon-btn" title="Change role" onClick={() => handleRole(user)}>
+                    <ShieldCheck size={14} />
+                  </button>
+                  <button className="icon-btn" title="Set expiry" onClick={() => handleExpiry(user)}>
+                    <RefreshCw size={14} />
+                  </button>
+                  <button className="icon-btn" title="Edit devices" onClick={() => handleDevices(user)}>
+                    <MonitorSmartphone size={14} />
+                  </button>
+                  <button className="icon-btn danger" title="Delete account" onClick={() => handleDeleteUser(user)}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {showCreateUser && (
+            <div className="modal-backdrop" onClick={closeCreateUser}>
+              <section
+                className="account-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="create-account-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="account-modal-head">
+                  <div>
+                    <h3 id="create-account-title">Create account</h3>
+                    <p>Set credentials, role, and device access for this account.</p>
+                  </div>
+                  <button className="icon-btn" type="button" aria-label="Close dialog" onClick={closeCreateUser} disabled={savingUser}>
+                    <X size={16} />
+                  </button>
+                </div>
+                <form className="account-form" onSubmit={submitCreateUser}>
+                  <label className="account-field">
+                    <span>Username</span>
+                    <input
+                      autoFocus
+                      autoComplete="username"
+                      value={newUsername}
+                      onChange={(e) => setNewUsername(e.target.value)}
+                      required
+                    />
+                  </label>
+                  <label className="account-field">
+                    <span>Password</span>
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      required
+                    />
+                  </label>
+                  <div className="account-form-row">
+                    <label className="account-field">
+                      <span>Role</span>
+                      <select value={newRole} onChange={(e) => setNewRole(e.target.value)}>
+                        <option value="operator">operator</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    </label>
+                    <label className="account-field">
+                      <span>Expires on (optional)</span>
+                      <input type="date" value={newExpiry} onChange={(e) => setNewExpiry(e.target.value)} />
+                    </label>
+                  </div>
+                  {newRole === "operator" ? (
+                    <fieldset className="account-device-fieldset">
+                      <legend>Device access</legend>
+                      <p>Select the devices this operator can access.</p>
+                      {devices.length === 0 ? (
+                        <div className="inline-empty">No devices are registered yet.</div>
+                      ) : (
+                        <div className="account-device-list">
+                          {devices.map((device) => (
+                            <label className="account-device-option" key={device.id}>
+                              <input
+                                type="checkbox"
+                                checked={newDevices.includes(device.id)}
+                                onChange={(event) =>
+                                  setNewDevices((current) =>
+                                    event.target.checked
+                                      ? [...current, device.id]
+                                      : current.filter((id) => id !== device.id),
+                                  )
+                                }
+                              />
+                              <span>
+                                <strong>{device.name}</strong>
+                                <small>{device.id}</small>
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </fieldset>
+                  ) : (
+                    <p className="account-admin-note">Administrators can access all devices.</p>
+                  )}
+                  {createUserError && <div className="account-form-error" role="alert">{createUserError}</div>}
+                  <div className="account-form-actions">
+                    <button className="secondary-btn" type="button" onClick={closeCreateUser} disabled={savingUser}>
+                      Cancel
+                    </button>
+                    <button className="primary-btn inline" type="submit" disabled={savingUser}>
+                      {savingUser ? "Creating…" : "Create account"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+          )}
         </>
       )}
     </section>
@@ -785,6 +1188,7 @@ function ActivityList({ audit }: { audit: AuditEntry[] }) {
 
 function TerminalView({ device, onBack }: { device: Device; onBack: () => void }) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const [status, setStatus] = useState("connecting");
 
   useEffect(() => {
     const term = new Terminal({
@@ -822,15 +1226,21 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     socket.onmessage = (event) => {
       const msg = JSON.parse(event.data);
       if (msg.type === "terminal:output") {
+        setStatus("connected");
         const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
         term.write(bytes);
       }
       if (msg.type === "terminal:exit" || msg.type === "terminal:error") {
+        setStatus(msg.type === "terminal:error" ? "error" : "disconnected");
         term.writeln("\r\n\x1b[90m[session ended]\x1b[0m");
         socket.close();
       }
     };
-    socket.onclose = () => term.writeln("\r\n\x1b[90m[connection closed]\x1b[0m");
+    socket.onerror = () => setStatus("error");
+    socket.onclose = () => {
+      setStatus((current) => (current === "error" ? current : "disconnected"));
+      term.writeln("\r\n\x1b[90m[connection closed]\x1b[0m");
+    };
 
     const dataDisposable = term.onData((data) => {
       if (socket.readyState === WebSocket.OPEN) {
@@ -865,6 +1275,15 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         <div className="terminal-title">
           <TerminalSquare size={16} />
           {device.name} - remote terminal
+        </div>
+        <div className="connection-meta">
+          <span className="transport-indicator" title="Terminal traffic is forwarded through the Warpmesh VPS">
+            Server relay
+          </span>
+          <div className={`screen-status ${status === "connected" ? "ok" : ""}`} role="status" aria-live="polite">
+            <span className={`connection-dot ${status === "connected" ? "ok" : ""}`} />
+            {status}
+          </div>
         </div>
       </header>
       <main className="terminal-host">
@@ -921,7 +1340,15 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           <Monitor size={16} />
           {device.name} - remote desktop
         </div>
-        <div className={`screen-status ${status === "connected" ? "ok" : ""}`}>{status}</div>
+        <div className="connection-meta">
+          <span className="transport-indicator" title="Desktop traffic is forwarded through the Warpmesh VPS">
+            Server relay
+          </span>
+          <div className={`screen-status ${status === "connected" ? "ok" : ""}`} role="status" aria-live="polite">
+            <span className={`connection-dot ${status === "connected" ? "ok" : ""}`} />
+            {status}
+          </div>
+        </div>
       </header>
       <main className="desktop-host">
         <div ref={hostRef} className="desktop-canvas" />

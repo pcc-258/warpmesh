@@ -5,6 +5,7 @@ export interface Device {
   os: string;
   arch: string;
   lanIPs: string[];
+  group?: string;
   createdAt: string;
   lastSeen: string;
   online: boolean;
@@ -49,6 +50,42 @@ export interface AuditEntry {
   target: string;
   detail: string;
   createdAt: string;
+}
+
+export interface AnalyticsBucket {
+  startedAt: string;
+  bytesToDevice: number;
+  bytesFromDevice: number;
+}
+
+export interface ConnectionRecord {
+  id: string;
+  actor: string;
+  deviceId: string;
+  deviceName: string;
+  peerDeviceId?: string;
+  peerDeviceName?: string;
+  service: string;
+  transport: string;
+  state: string;
+  clientIp?: string;
+  bytesToDevice: number;
+  bytesFromDevice: number;
+  startedAt: string;
+  endedAt?: string;
+}
+
+export interface AnalyticsData {
+  period: "24h" | "7d";
+  sessions: number;
+  active: number;
+  directSessions: number;
+  relaySessions: number;
+  directTunnels: number;
+  relayTunnels: number;
+  relayBytes: number;
+  buckets: AnalyticsBucket[];
+  recent: ConnectionRecord[];
 }
 
 const TOKEN_KEY = "warpmesh-token";
@@ -115,6 +152,10 @@ export async function logout(): Promise<void> {
 
 export function getStats(): Promise<Stats> {
   return api<Stats>("/api/stats");
+}
+
+export function getAnalytics(range: "24h" | "7d"): Promise<AnalyticsData> {
+  return api<AnalyticsData>(`/api/analytics?range=${range}`);
 }
 
 export function listDeviceKeys(): Promise<DeviceKey[]> {

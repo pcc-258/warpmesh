@@ -42,12 +42,14 @@ type agentConn struct {
 type termSession struct {
 	deviceID string
 	browser  *websocket.Conn
+	traffic  *trafficRecorder
 }
 
 type fileSession struct {
 	deviceID string
 	browser  *websocket.Conn
 	op       string
+	traffic  *trafficRecorder
 }
 
 type managerSession struct {
@@ -56,10 +58,12 @@ type managerSession struct {
 }
 
 type forwardSession struct {
-	source string
-	target string
-	direct bool
-	timer  *time.Timer
+	source    string
+	target    string
+	direct    bool
+	transport string
+	timer     *time.Timer
+	traffic   *trafficRecorder
 }
 
 type screenSession struct {
@@ -70,6 +74,7 @@ type screenSession struct {
 	linkReady chan struct{}
 	done      chan struct{}
 	linkSet   bool
+	traffic   *trafficRecorder
 }
 
 type sessionEntry struct {
@@ -152,6 +157,7 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/devices", s.handleDevices)
 	mux.HandleFunc("/api/devices/", s.handleDeviceByID)
 	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/analytics", s.handleAnalytics)
 	mux.HandleFunc("/api/device-keys", s.handleDeviceKeys)
 	mux.HandleFunc("/api/device-keys/", s.handleDeviceKeyByID)
 	mux.HandleFunc("/api/invites", s.handleInvites)

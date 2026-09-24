@@ -36,12 +36,23 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
+	metricID, metricErr := s.reg.StartConnection(actor, deviceID, "", "desktop", "relay", clientIP(r))
+	if metricErr != nil {
+		s.logf("record desktop connection: %v", metricErr)
+	}
+	var traffic *trafficRecorder
+	if metricErr == nil {
+		traffic = newTrafficRecorder(s.reg, metricID)
+	}
+	endState := "closed"
+	defer func() { traffic.Close(endState) }()
 	sess := &screenSession{
 		sessionID: sessionID,
 		deviceID:  deviceID,
 		browser:   ws,
 		linkReady: make(chan struct{}),
 		done:      make(chan struct{}),
+		traffic:   traffic,
 	}
 	s.sessionsMu.Lock()
 	s.screens[sessionID] = sess
@@ -54,6 +65,7 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 
 	_ = s.reg.RecordAudit(actor, "screen.start", deviceID, "")
 	if err := agent.write(protocol.Message{Type: protocol.TypeScreenStart, SessionID: sessionID}); err != nil {
+		endState = "failed"
 		return
 	}
 
@@ -61,10 +73,11 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 	case <-sess.linkReady:
 	case <-time.After(10 * time.Second):
 		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeScreenError, SessionID: sessionID, Error: "screen link timeout"})
+		endState = "failed"
 		return
 	}
 
-	relayScreen(ws, sess.link)
+	relayScreen(ws, sess.link, traffic)
 	close(sess.done)
 }
 
@@ -107,9 +120,9 @@ func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
 	<-sess.done
 }
 
-func relayScreen(a, b *websocket.Conn) {
+func relayScreen(a, b *websocket.Conn, traffic *trafficRecorder) {
 	done := make(chan struct{}, 2)
-	copyOne := func(src, dst *websocket.Conn) {
+	copyOne := func(src, dst *websocket.Conn, fromBrowser bool) {
 		for {
 			mt, data, err := src.ReadMessage()
 			if err != nil {
@@ -118,11 +131,16 @@ func relayScreen(a, b *websocket.Conn) {
 			if err := dst.WriteMessage(mt, data); err != nil {
 				break
 			}
+			if fromBrowser {
+				traffic.Add(int64(len(data)), 0)
+			} else {
+				traffic.Add(0, int64(len(data)))
+			}
 		}
 		done <- struct{}{}
 	}
-	go copyOne(a, b)
-	go copyOne(b, a)
+	go copyOne(a, b, true)
+	go copyOne(b, a, false)
 	<-done
 	<-done
 	_ = a.Close()

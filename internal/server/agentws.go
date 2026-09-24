@@ -101,6 +101,18 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 		if sess == nil || sess.deviceID != deviceID {
 			return
 		}
+		if msg.Type == protocol.TypeTermOutput {
+			if raw, err := protocol.DecodeData(msg.Data); err == nil {
+				sess.traffic.Add(0, int64(len(raw)))
+			}
+		}
+		if msg.Type == protocol.TypeTermExit || msg.Type == protocol.TypeTermError {
+			state := "closed"
+			if msg.Type == protocol.TypeTermError {
+				state = "failed"
+			}
+			sess.traffic.Close(state)
+		}
 		if err := sess.browser.WriteJSON(msg); err != nil {
 			_ = sess.browser.Close()
 		}
@@ -137,11 +149,17 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 			if err != nil {
 				return
 			}
+			sess.traffic.Add(0, int64(len(raw)))
 			_ = sess.browser.WriteMessage(websocket.BinaryMessage, raw)
 			return
 		}
 		_ = sess.browser.WriteJSON(msg)
 		if msg.Type == protocol.TypeFileDone || msg.Type == protocol.TypeFileError {
+			state := "closed"
+			if msg.Type == protocol.TypeFileError {
+				state = "failed"
+			}
+			sess.traffic.Close(state)
 			s.sessionsMu.Lock()
 			delete(s.files, msg.SessionID)
 			s.sessionsMu.Unlock()

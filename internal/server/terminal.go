@@ -35,11 +35,20 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
-	sess := &termSession{deviceID: deviceID, browser: ws}
+	metricID, metricErr := s.reg.StartConnection(actor, deviceID, "", "terminal", "relay", clientIP(r))
+	if metricErr != nil {
+		s.logf("record terminal connection: %v", metricErr)
+	}
+	var traffic *trafficRecorder
+	if metricErr == nil {
+		traffic = newTrafficRecorder(s.reg, metricID)
+	}
+	sess := &termSession{deviceID: deviceID, browser: ws, traffic: traffic}
 	s.sessionsMu.Lock()
 	s.terms[sessionID] = sess
 	s.sessionsMu.Unlock()
 	_ = s.reg.RecordAudit(actor, "terminal.start", deviceID, "")
+	defer traffic.Close("closed")
 	defer func() {
 		s.sessionsMu.Lock()
 		delete(s.terms, sessionID)
@@ -53,6 +62,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		Cols:      cols,
 		Rows:      rows,
 	}); err != nil {
+		traffic.Close("failed")
 		return
 	}
 
@@ -66,7 +76,11 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		case protocol.TypeTermInput, protocol.TypeTermResize, protocol.TypeTermStop:
 			msg.SessionID = sessionID
 			if err := agent.write(msg); err != nil {
+				traffic.Close("failed")
 				return
+			}
+			if msg.Type == protocol.TypeTermInput {
+				traffic.Add(int64(len(msg.Data)), 0)
 			}
 			if msg.Type == protocol.TypeTermStop {
 				return

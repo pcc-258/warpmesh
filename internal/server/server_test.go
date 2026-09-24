@@ -125,6 +125,30 @@ func TestTerminalRelay(t *testing.T) {
 	if exit.Type != protocol.TypeTermExit {
 		t.Fatalf("expected exit, got %+v", exit)
 	}
+
+	analyticsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/analytics?range=24h", nil)
+	analyticsReq.Header.Set("Authorization", "Bearer admin-token")
+	analyticsResp, err := http.DefaultClient.Do(analyticsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = analyticsResp.Body.Close() }()
+	var analytics struct {
+		Sessions      int                `json:"sessions"`
+		Active        int                `json:"active"`
+		RelaySessions int                `json:"relaySessions"`
+		RelayBytes    int64              `json:"relayBytes"`
+		Recent        []ConnectionRecord `json:"recent"`
+	}
+	if err := json.NewDecoder(analyticsResp.Body).Decode(&analytics); err != nil {
+		t.Fatal(err)
+	}
+	if analyticsResp.StatusCode != http.StatusOK || analytics.Sessions != 1 || analytics.Active != 0 || analytics.RelaySessions != 1 || analytics.RelayBytes != 9 {
+		t.Fatalf("unexpected terminal analytics: status=%d response=%+v", analyticsResp.StatusCode, analytics)
+	}
+	if len(analytics.Recent) != 1 || analytics.Recent[0].Service != "terminal" || analytics.Recent[0].Transport != "relay" || analytics.Recent[0].State != "closed" {
+		t.Fatalf("unexpected terminal connection record: %+v", analytics.Recent)
+	}
 }
 
 func TestLoginStatsAndDeviceKeys(t *testing.T) {
@@ -736,6 +760,47 @@ func TestUserDevicePermission(t *testing.T) {
 	_ = usersResp.Body.Close()
 	if usersResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("operator should not manage users, got %d", usersResp.StatusCode)
+	}
+}
+
+func TestUserListIncludesEmptyDeviceIDs(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken:    "admin-token",
+		DataDir:       t.TempDir(),
+		AdminUser:     "admin",
+		AdminPassword: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/users", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var users []map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
+		t.Fatal(err)
+	}
+	if len(users) == 0 {
+		t.Fatal("expected at least the seeded admin user")
+	}
+	for _, u := range users {
+		raw, ok := u["deviceIds"]
+		if !ok {
+			t.Fatalf("user response is missing deviceIds: %s", u["username"])
+		}
+		if string(raw) != "[]" {
+			t.Fatalf("empty deviceIds should serialize as [], got %s", raw)
+		}
 	}
 }
 

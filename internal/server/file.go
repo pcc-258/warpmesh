@@ -38,8 +38,18 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
+	metricID, metricErr := s.reg.StartConnection(actor, deviceID, "", "files-"+op, "relay", clientIP(r))
+	if metricErr != nil {
+		s.logf("record file connection: %v", metricErr)
+	}
+	var traffic *trafficRecorder
+	if metricErr == nil {
+		traffic = newTrafficRecorder(s.reg, metricID)
+	}
+	endState := "closed"
+	defer func() { traffic.Close(endState) }()
 	s.sessionsMu.Lock()
-	s.files[sessionID] = &fileSession{deviceID: deviceID, browser: ws, op: op}
+	s.files[sessionID] = &fileSession{deviceID: deviceID, browser: ws, op: op, traffic: traffic}
 	s.sessionsMu.Unlock()
 	defer func() {
 		s.sessionsMu.Lock()
@@ -78,6 +88,9 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 				msg.SessionID = sessionID
 				if msg.Type == protocol.TypeFileUploadEnd || msg.Type == protocol.TypeFileError {
 					_ = agent.write(msg)
+					if msg.Type == protocol.TypeFileError {
+						endState = "failed"
+					}
 					return
 				}
 				continue
@@ -87,8 +100,10 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 				SessionID: sessionID,
 				Data:      protocol.EncodeData(raw),
 			}); err != nil {
+				endState = "failed"
 				return
 			}
+			traffic.Add(int64(len(raw)), 0)
 		}
 	case "download":
 		path := r.URL.Query().Get("path")
