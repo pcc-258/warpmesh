@@ -26,11 +26,12 @@ type Message struct {
 	Error     string `json:"error,omitempty"`
 
 	// File transfer.
-	Size   int64  `json:"size,omitempty"`
-	Path   string `json:"path,omitempty"`
-	Target string `json:"target,omitempty"`
-	Port   int    `json:"port,omitempty"`
-	IP     string `json:"ip,omitempty"`
+	Size    int64  `json:"size,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Target  string `json:"target,omitempty"`
+	Port    int    `json:"port,omitempty"`
+	IP      string `json:"ip,omitempty"`
+	Service string `json:"service,omitempty"`
 
 	Entries []FileEntry `json:"entries,omitempty"`
 }
@@ -78,6 +79,15 @@ const (
 	TypeForwardAnswer   = "forward:answer"
 	TypeForwardICE      = "forward:ice"
 	TypeForwardDirectOK = "forward:direct-ok"
+	TypeRTCOffer        = "rtc:offer"
+	TypeRTCAnswer       = "rtc:answer"
+	TypeRTCICE          = "rtc:ice"
+	TypeRTCDirectOK     = "rtc:direct-ok"
+	TypeRTCDirectError  = "rtc:direct-error"
+	TypeRTCFallback     = "rtc:fallback"
+	TypeRTCRelay        = "rtc:relay"
+	TypeRTCReady        = "rtc:ready"
+	TypeRTCStop         = "rtc:stop"
 	TypeScreenStart     = "screen:start"
 	TypeScreenError     = "screen:error"
 )

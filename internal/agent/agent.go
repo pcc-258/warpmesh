@@ -93,6 +93,9 @@ type Agent struct {
 	directPending    map[string]chan struct{}
 	peerConns        map[string]*webrtc.PeerConnection
 	dataChannels     map[string]*webrtc.DataChannel
+	browserChannels  map[string]*webrtc.DataChannel
+	browserDirect    map[string]bool
+	pendingCandidates map[string][]webrtc.ICECandidateInit
 	localConns       map[string]net.Conn
 	pendingData      map[string][][]byte
 	mu               sync.Mutex
@@ -140,7 +143,11 @@ func New(cfg Config) (*Agent, error) {
 		}
 	}
 	if len(cfg.STUNServers) == 0 {
-		cfg.STUNServers = []string{"stun:stun.l.google.com:19302"}
+		cfg.STUNServers = []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun.miwifi.com:3478",
+			"stun:stun.chat.bilibili.com:3478",
+		}
 	}
 	if cfg.VNCPort == 0 {
 		cfg.VNCPort = 5900
@@ -154,6 +161,9 @@ func New(cfg Config) (*Agent, error) {
 		directPending:    make(map[string]chan struct{}),
 		peerConns:        make(map[string]*webrtc.PeerConnection),
 		dataChannels:     make(map[string]*webrtc.DataChannel),
+		browserChannels:  make(map[string]*webrtc.DataChannel),
+		browserDirect:    make(map[string]bool),
+		pendingCandidates: make(map[string][]webrtc.ICECandidateInit),
 		localConns:       make(map[string]net.Conn),
 		pendingData:      make(map[string][][]byte),
 		forwardListeners: make(map[string]*forwardListener),
@@ -172,11 +182,17 @@ func New(cfg Config) (*Agent, error) {
 func (a *Agent) Run() {
 	backoff := time.Second
 	for {
+		started := time.Now()
 		err := a.connectOnce()
 		if err != nil {
 			log.Printf("agent disconnected from %s: %v", a.cfg.ServerURL, err)
 		}
-		time.Sleep(backoff)
+		// A connection that survived this long means the network recovered;
+		// restart the backoff so reconnects stay fast.
+		if time.Since(started) > 60*time.Second {
+			backoff = time.Second
+		}
+		time.Sleep(backoff + backoff/5)
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
@@ -240,6 +256,14 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		return a.send(protocol.Message{Type: protocol.TypePong})
 	case protocol.TypeTermStart:
 		session, err := startTerminalSession(func(m protocol.Message) error {
+			if m.Type == protocol.TypeTermOutput {
+				raw, decodeErr := protocol.DecodeData(m.Data)
+				if decodeErr != nil {
+					return decodeErr
+				}
+				a.sendTerminalOutput(msg.SessionID, raw)
+				return nil
+			}
 			return a.send(m)
 		}, msg.SessionID, a.cfg.Shell, msg.Cols, msg.Rows)
 		if err != nil {
@@ -330,6 +354,21 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		return nil
 	case protocol.TypeForwardICE:
 		a.handleDirectICE(msg)
+		return nil
+	case protocol.TypeRTCOffer:
+		go a.handleBrowserOffer(msg)
+		return nil
+	case protocol.TypeRTCRelay:
+		a.closeBrowserDirect(msg.SessionID)
+		return nil
+	case protocol.TypeRTCReady:
+		a.startBrowserDesktop(msg.SessionID)
+		return nil
+	case protocol.TypeRTCStop:
+		a.closeBrowserDirect(msg.SessionID)
+		return nil
+	case protocol.TypeRTCICE:
+		a.handleBrowserICE(msg)
 		return nil
 	case protocol.TypeForwardDirectOK:
 		return nil
@@ -704,39 +743,46 @@ func (a *Agent) send(v any) error {
 
 func (a *Agent) cleanupSessions() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	for id, session := range a.sessions {
+	sessions := a.sessions
+	uploads := a.uploads
+	forwards := a.forwards
+	peerConns := a.peerConns
+	dataChannels := a.dataChannels
+	browserChannels := a.browserChannels
+	localConns := a.localConns
+	a.sessions = make(map[string]*TermSession)
+	a.uploads = make(map[string]*os.File)
+	a.forwards = make(map[string]*forwardConn)
+	a.peerConns = make(map[string]*webrtc.PeerConnection)
+	a.dataChannels = make(map[string]*webrtc.DataChannel)
+	a.browserChannels = make(map[string]*webrtc.DataChannel)
+	a.browserDirect = make(map[string]bool)
+	a.pendingCandidates = make(map[string][]webrtc.ICECandidateInit)
+	a.localConns = make(map[string]net.Conn)
+	clear(a.pendingData)
+	clear(a.forwardPending)
+	clear(a.directPending)
+	a.mu.Unlock()
+	for _, session := range sessions {
 		_ = session.Close()
-		delete(a.sessions, id)
 	}
-	for id, f := range a.uploads {
+	for _, f := range uploads {
 		_ = f.Close()
-		delete(a.uploads, id)
 	}
-	for id, fc := range a.forwards {
+	for _, fc := range forwards {
 		_ = fc.Close()
-		delete(a.forwards, id)
 	}
-	for id, pc := range a.peerConns {
+	for _, pc := range peerConns {
 		_ = pc.Close()
-		delete(a.peerConns, id)
 	}
-	for id, dc := range a.dataChannels {
+	for _, dc := range dataChannels {
 		_ = dc.Close()
-		delete(a.dataChannels, id)
 	}
-	for id, conn := range a.localConns {
+	for _, dc := range browserChannels {
+		_ = dc.Close()
+	}
+	for _, conn := range localConns {
 		_ = conn.Close()
-		delete(a.localConns, id)
-	}
-	for id := range a.pendingData {
-		delete(a.pendingData, id)
-	}
-	for id := range a.forwardPending {
-		delete(a.forwardPending, id)
-	}
-	for id := range a.directPending {
-		delete(a.directPending, id)
 	}
 }
 

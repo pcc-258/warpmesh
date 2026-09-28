@@ -89,6 +89,37 @@ func TestTerminalRelay(t *testing.T) {
 	if start.Type != protocol.TypeTermStart || start.SessionID == "" || start.Cols != 80 {
 		t.Fatalf("unexpected start message: %+v", start)
 	}
+	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCOffer, Data: "offer-sdp"}); err != nil {
+		t.Fatal(err)
+	}
+	offer := readAgentMessage(t, agentWS)
+	if offer.Type != protocol.TypeRTCOffer || offer.SessionID != start.SessionID || offer.Service != "terminal" {
+		t.Fatalf("unexpected browser offer: %+v", offer)
+	}
+	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCAnswer, SessionID: start.SessionID, Service: "terminal", Data: "answer-sdp"}); err != nil {
+		t.Fatal(err)
+	}
+	var answer protocol.Message
+	if err := browserWS.ReadJSON(&answer); err != nil || answer.Type != protocol.TypeRTCAnswer || answer.Data != "answer-sdp" {
+		t.Fatalf("unexpected browser answer: %+v err=%v", answer, err)
+	}
+	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCDirectOK, SessionID: start.SessionID, Service: "terminal"}); err != nil {
+		t.Fatal(err)
+	}
+	var direct protocol.Message
+	if err := browserWS.ReadJSON(&direct); err != nil || direct.Type != protocol.TypeRTCDirectOK {
+		t.Fatalf("unexpected direct status: %+v err=%v", direct, err)
+	}
+	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCFallback}); err != nil {
+		t.Fatal(err)
+	}
+	if relay := readAgentMessage(t, agentWS); relay.Type != protocol.TypeRTCRelay || relay.SessionID != start.SessionID {
+		t.Fatalf("unexpected relay fallback request: %+v", relay)
+	}
+	var relayStatus protocol.Message
+	if err := browserWS.ReadJSON(&relayStatus); err != nil || relayStatus.Type != protocol.TypeRTCRelay {
+		t.Fatalf("unexpected relay status: %+v err=%v", relayStatus, err)
+	}
 
 	if err := agentWS.WriteJSON(protocol.Message{
 		Type:      protocol.TypeTermOutput,
@@ -148,6 +179,80 @@ func TestTerminalRelay(t *testing.T) {
 	}
 	if len(analytics.Recent) != 1 || analytics.Recent[0].Service != "terminal" || analytics.Recent[0].Transport != "relay" || analytics.Recent[0].State != "closed" {
 		t.Fatalf("unexpected terminal connection record: %+v", analytics.Recent)
+	}
+}
+
+func TestBrowserRTCTrickleICE(t *testing.T) {
+	srv, err := NewServer(Config{
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	key := newTestKey(t, srv)
+	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = agentWS.Close() }()
+	if err := agentWS.WriteJSON(protocol.Message{
+		Type:     protocol.TypeHello,
+		DeviceID: key.DeviceID,
+		Name:     "rtc box",
+		Hostname: "rtc-box",
+		OS:       "linux",
+		Arch:     "amd64",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		dev, ok := srv.reg.Get(key.DeviceID)
+		return ok && dev.Online
+	})
+
+	browserWS, _, err := websocket.DefaultDialer.Dial(
+		baseWS+"/ws/terminal?token=admin-token&device="+key.DeviceID+"&cols=80&rows=24", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = browserWS.Close() }()
+
+	start := readAgentMessage(t, agentWS)
+	if start.Type != protocol.TypeTermStart || start.SessionID == "" {
+		t.Fatalf("unexpected start message: %+v", start)
+	}
+	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCOffer, Data: "offer-sdp"}); err != nil {
+		t.Fatal(err)
+	}
+	offer := readAgentMessage(t, agentWS)
+	if offer.Type != protocol.TypeRTCOffer || offer.SessionID != start.SessionID || offer.Service != "terminal" {
+		t.Fatalf("unexpected browser offer: %+v", offer)
+	}
+
+	// The browser trickles a candidate; the server must forward it with the
+	// session and service attached.
+	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCICE, Data: "browser-candidate"}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := readAgentMessage(t, agentWS)
+	if candidate.Type != protocol.TypeRTCICE || candidate.SessionID != start.SessionID || candidate.Service != "terminal" || candidate.Data != "browser-candidate" {
+		t.Fatalf("unexpected browser candidate: %+v", candidate)
+	}
+
+	// The agent trickles a candidate; the browser must receive it unchanged.
+	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCICE, SessionID: start.SessionID, Service: "terminal", Data: "agent-candidate"}); err != nil {
+		t.Fatal(err)
+	}
+	var remote protocol.Message
+	if err := browserWS.ReadJSON(&remote); err != nil || remote.Type != protocol.TypeRTCICE || remote.Data != "agent-candidate" {
+		t.Fatalf("unexpected agent candidate: %+v err=%v", remote, err)
 	}
 }
 
@@ -561,7 +666,13 @@ func TestScreenRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = browserWS.Close() }()
+	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCFallback}); err != nil {
+		t.Fatal(err)
+	}
 
+	if relay := readAgentMessage(t, agentWS); relay.Type != protocol.TypeRTCRelay {
+		t.Fatalf("expected relay switch, got %+v", relay)
+	}
 	start := readAgentMessage(t, agentWS)
 	if start.Type != protocol.TypeScreenStart || start.SessionID == "" {
 		t.Fatalf("unexpected screen start: %+v", start)
@@ -574,6 +685,10 @@ func TestScreenRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = linkWS.Close() }()
+	var relayStatus protocol.Message
+	if err := browserWS.ReadJSON(&relayStatus); err != nil || relayStatus.Type != protocol.TypeRTCRelay {
+		t.Fatalf("expected browser relay status, got %+v err=%v", relayStatus, err)
+	}
 
 	if err := browserWS.WriteMessage(websocket.BinaryMessage, []byte("abc")); err != nil {
 		t.Fatal(err)

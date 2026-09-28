@@ -93,6 +93,57 @@ function pageFromPath(path: string): Page {
   return PAGES_BY_PATH[normalizedPath(path)] ?? "dashboard";
 }
 
+const RTC_STUN_SERVERS = [
+  "stun:stun.l.google.com:19302",
+  "stun:stun.miwifi.com:3478",
+  "stun:stun.chat.bilibili.com:3478",
+];
+
+type BrowserRTC = { peer: RTCPeerConnection; channel: RTCDataChannel };
+
+function createBrowserRTC(socket: WebSocket, service: "terminal" | "desktop", onOfferSent: () => void): BrowserRTC {
+  const peer = new RTCPeerConnection({
+    iceServers: [{ urls: RTC_STUN_SERVERS }],
+    iceCandidatePoolSize: 2,
+  });
+  const channel = peer.createDataChannel("warpmesh");
+  channel.binaryType = "arraybuffer";
+  // Trickle ICE: forward each candidate as it is gathered so connectivity
+  // checks can start immediately instead of waiting for full gathering.
+  peer.onicecandidate = (event) => {
+    if (event.candidate && socket.readyState === WebSocket.OPEN) {
+      socket.send(
+        JSON.stringify({
+          type: "rtc:ice",
+          service,
+          data: btoa(JSON.stringify(event.candidate.toJSON())),
+        }),
+      );
+    }
+  };
+  void (async () => {
+    try {
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      if (socket.readyState === WebSocket.OPEN && peer.localDescription) {
+        socket.send(JSON.stringify({ type: "rtc:offer", service, data: btoa(JSON.stringify(peer.localDescription)) }));
+        onOfferSent();
+      }
+    } catch {
+      // The direct attempt budget below will switch to the WebSocket relay.
+    }
+  })();
+  return { peer, channel };
+}
+
+function decodeRTCDescription(data: string): RTCSessionDescriptionInit {
+  return JSON.parse(atob(data)) as RTCSessionDescriptionInit;
+}
+
+function decodeRTCCandidate(data: string): RTCIceCandidateInit {
+  return JSON.parse(atob(data)) as RTCIceCandidateInit;
+}
+
 type View =
   | { name: "page"; page: Page }
   | { name: "terminal"; device: Device }
@@ -529,8 +580,8 @@ function DashboardPage({
 }) {
   const buckets = analytics?.buckets ?? [];
   const maxTraffic = Math.max(1, ...buckets.map((bucket) => bucket.bytesToDevice + bucket.bytesFromDevice));
-  const knownRoutes = (analytics?.directTunnels ?? 0) + (analytics?.relayTunnels ?? 0);
-  const directPercent = knownRoutes ? Math.round(((analytics?.directTunnels ?? 0) / knownRoutes) * 100) : 0;
+  const knownRoutes = (analytics?.directSessions ?? 0) + (analytics?.relaySessions ?? 0);
+  const directPercent = knownRoutes ? Math.round(((analytics?.directSessions ?? 0) / knownRoutes) * 100) : 0;
   return (
     <div className="page-grid dashboard-page">
       <div className="dashboard-heading">
@@ -558,7 +609,7 @@ function DashboardPage({
         <div className="stat-card">
           <ShieldCheck size={18} />
           <strong>{analytics?.directSessions ?? 0}</strong>
-          <span>Direct tunnels</span>
+          <span>Direct sessions</span>
         </div>
         <div className="stat-card">
           <Download size={18} />
@@ -606,7 +657,7 @@ function DashboardPage({
             </div>
           </>
         )}
-        <p className="chart-note">Terminal, desktop, file and relayed tunnel traffic is measured here. Direct tunnels bypass the VPS, so their payload bytes are not included.</p>
+        <p className="chart-note">This chart counts bytes that passed through the VPS. Direct terminal, desktop and device-forwarding traffic bypasses it; file operations use the relay.</p>
       </section>
 
       <div className="dashboard-lower-grid">
@@ -614,11 +665,11 @@ function DashboardPage({
           <div className="panel-head">
             <div>
               <h3>Connection path</h3>
-              <p>How tunnel sessions reached their destination</p>
+              <p>Actual paths used by terminals, desktops and device forwarding</p>
             </div>
           </div>
           {knownRoutes === 0 ? (
-            <div className="inline-empty">No direct or relayed tunnel sessions in this period.</div>
+            <div className="inline-empty">No direct or relayed sessions in this period.</div>
           ) : (
             <>
               <div className="route-split-bar" aria-label={`${directPercent}% direct, ${100 - directPercent}% relay`}>
@@ -626,12 +677,12 @@ function DashboardPage({
                 <span className="route-relay" style={{ width: `${100 - directPercent}%` }} />
               </div>
               <div className="route-counts">
-                <span><i className="route-direct-dot" />Direct <strong>{analytics?.directTunnels ?? 0}</strong></span>
-                <span><i className="route-relay-dot" />Server relay <strong>{analytics?.relayTunnels ?? 0}</strong></span>
+                <span><i className="route-direct-dot" />Direct <strong>{analytics?.directSessions ?? 0}</strong></span>
+                <span><i className="route-relay-dot" />Server relay <strong>{analytics?.relaySessions ?? 0}</strong></span>
               </div>
             </>
           )}
-          <p className="chart-note">Path is reported for device-to-device TCP forwarding. Browser terminal, desktop and file sessions always use the server relay.</p>
+          <p className="chart-note">Path shows the actual transport for device forwarding, terminal and desktop sessions. File operations use the server relay.</p>
         </section>
 
         <section className="panel recent-connections-panel">
@@ -1189,6 +1240,7 @@ function ActivityList({ audit }: { audit: AuditEntry[] }) {
 function TerminalView({ device, onBack }: { device: Device; onBack: () => void }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState("connecting");
+  const [transport, setTransport] = useState("negotiating");
 
   useEffect(() => {
     const term = new Terminal({
@@ -1215,6 +1267,33 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         rows: term.rows,
       }),
     );
+    let rtc: BrowserRTC | null = null;
+    let directActive = false;
+    let directAcknowledged = false;
+    let fallbackRequested = false;
+    let fallbackTimer = 0;
+    let disposed = false;
+    let terminalHadOutput = false;
+
+    const startFallback = () => {
+      if (fallbackRequested || disposed) return;
+      fallbackRequested = true;
+      directActive = false;
+      window.clearTimeout(fallbackTimer);
+      rtc?.peer.close();
+      setTransport("switching");
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "rtc:fallback" }));
+      }
+    };
+
+    const activateDirect = () => {
+      if (!directAcknowledged || rtc?.channel.readyState !== "open" || fallbackRequested) return;
+      directActive = true;
+      window.clearTimeout(fallbackTimer);
+      setTransport("direct");
+      setStatus("connected");
+    };
 
     const sendResize = () => {
       if (socket.readyState === WebSocket.OPEN) {
@@ -1222,10 +1301,76 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
       }
     };
 
-    socket.onopen = () => term.focus();
-    socket.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === "terminal:output") {
+    socket.onopen = () => {
+      term.focus();
+      try {
+        rtc = createBrowserRTC(socket, "terminal", () => {
+          fallbackTimer = window.setTimeout(startFallback, 20000);
+        });
+      } catch {
+        startFallback();
+        return;
+      }
+      rtc.channel.onopen = activateDirect;
+      rtc.channel.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          terminalHadOutput = true;
+          term.write(new Uint8Array(event.data));
+          setStatus("connected");
+        }
+      };
+      rtc.channel.onclose = () => {
+        if (directAcknowledged) startFallback();
+      };
+      rtc.channel.onerror = () => {
+        if (directAcknowledged) startFallback();
+      };
+      rtc.peer.onconnectionstatechange = () => {
+        if (rtc?.peer.connectionState === "failed") startFallback();
+      };
+    };
+    socket.onmessage = async (event) => {
+      let msg: { type: string; data?: string; error?: string };
+      try {
+        msg = JSON.parse(event.data as string) as typeof msg;
+      } catch {
+        return;
+      }
+      if (msg.type === "rtc:answer" && msg.data && rtc && !fallbackRequested) {
+        try {
+          await rtc.peer.setRemoteDescription(decodeRTCDescription(msg.data));
+        } catch {
+          startFallback();
+        }
+        return;
+      }
+      if (msg.type === "rtc:ice" && msg.data && rtc && !fallbackRequested) {
+        try {
+          await rtc.peer.addIceCandidate(decodeRTCCandidate(msg.data));
+        } catch {
+          // Candidate races are expected during trickle ICE.
+        }
+        return;
+      }
+      if (msg.type === "rtc:direct-ok") {
+        directAcknowledged = true;
+        activateDirect();
+        return;
+      }
+      if (msg.type === "rtc:direct-error") {
+        startFallback();
+        return;
+      }
+      if (msg.type === "rtc:relay") {
+        directActive = false;
+        fallbackRequested = true;
+        setTransport("relay");
+        setStatus((current) => current === "error" ? current : terminalHadOutput ? "connected" : "connecting");
+        sendResize();
+        return;
+      }
+      if (msg.type === "terminal:output" && typeof msg.data === "string") {
+        terminalHadOutput = true;
         setStatus("connected");
         const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
         term.write(bytes);
@@ -1243,6 +1388,10 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     };
 
     const dataDisposable = term.onData((data) => {
+      if (directActive && rtc?.channel.readyState === "open") {
+        rtc.channel.send(new TextEncoder().encode(data));
+        return;
+      }
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "terminal:input", data }));
       }
@@ -1255,8 +1404,11 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     observer.observe(hostRef.current!);
 
     return () => {
+      disposed = true;
+      window.clearTimeout(fallbackTimer);
       observer.disconnect();
       dataDisposable.dispose();
+      rtc?.peer.close();
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "terminal:stop" }));
       }
@@ -1277,8 +1429,8 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
           {device.name} - remote terminal
         </div>
         <div className="connection-meta">
-          <span className="transport-indicator" title="Terminal traffic is forwarded through the Warpmesh VPS">
-            Server relay
+          <span className="transport-indicator" title="Direct WebRTC is attempted first; the VPS relays traffic if direct connection fails">
+            {transport === "direct" ? "Direct" : transport === "relay" ? "Server relay" : transport === "switching" ? "Switching to relay…" : "Trying direct…"}
           </span>
           <div className={`screen-status ${status === "connected" ? "ok" : ""}`} role="status" aria-live="polite">
             <span className={`connection-dot ${status === "connected" ? "ok" : ""}`} />
@@ -1297,27 +1449,138 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
   const hostRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<{ disconnect: () => void } | null>(null);
   const [status, setStatus] = useState("connecting");
+  const [transport, setTransport] = useState("negotiating");
 
   useEffect(() => {
     let disposed = false;
+    let socket: WebSocket | null = null;
+    let rtc: BrowserRTC | null = null;
+    let directAcknowledged = false;
+    let fallbackRequested = false;
+    let fallbackTimer = 0;
     const connect = async () => {
       try {
         const RFB = (await import("@novnc/novnc")).default;
-        const url = wsUrl("/ws/screen", { token: getToken(), device: device.id });
-        const rfb = new RFB(hostRef.current!, url, { credentials: { password: "" } });
-        rfbRef.current = rfb;
-        rfb.scaleViewport = true;
-        rfb.resizeSession = false;
-        rfb.addEventListener("connect", () => !disposed && setStatus("connected"));
-        rfb.addEventListener("disconnect", () => !disposed && setStatus("disconnected"));
-        rfb.addEventListener("credentialsrequired", () => {
-          const password = prompt("VNC password (leave empty if not set)") || "";
-          rfb.sendCredentials({ password });
-        });
-        rfb.addEventListener("securityfailure", (event: CustomEvent) => {
-          const reason = (event.detail as { reason?: string })?.reason || "authentication failed";
-          if (!disposed) setStatus(reason);
-        });
+        if (disposed) return;
+        socket = new WebSocket(wsUrl("/ws/screen", { token: getToken(), device: device.id }));
+
+        const attachRFB = (channel: RTCDataChannel | WebSocket, mode: "direct" | "relay") => {
+          if (!hostRef.current || disposed) return;
+          const rfb = new RFB(hostRef.current, channel, { credentials: { password: "" } });
+          rfbRef.current = rfb;
+          rfb.scaleViewport = true;
+          rfb.resizeSession = false;
+          rfb.addEventListener("connect", () => {
+            if (!disposed) {
+              setTransport(mode);
+              setStatus("connected");
+            }
+          });
+          rfb.addEventListener("disconnect", () => {
+            if (!disposed && !(mode === "direct" && fallbackRequested)) setStatus("disconnected");
+          });
+          rfb.addEventListener("credentialsrequired", () => {
+            const password = prompt("VNC password (leave empty if not set)") || "";
+            rfb.sendCredentials({ password });
+          });
+          rfb.addEventListener("securityfailure", (event: CustomEvent) => {
+            const reason = (event.detail as { reason?: string })?.reason || "authentication failed";
+            if (!disposed) setStatus(reason);
+          });
+          if (mode === "direct" && socket?.readyState === WebSocket.OPEN) {
+            window.clearTimeout(fallbackTimer);
+            socket.send(JSON.stringify({ type: "rtc:ready" }));
+          }
+        };
+
+        const startFallback = () => {
+          if (fallbackRequested || disposed) return;
+          fallbackRequested = true;
+          window.clearTimeout(fallbackTimer);
+          if (rfbRef.current) {
+            rfbRef.current.disconnect();
+            rfbRef.current = null;
+          }
+          rtc?.peer.close();
+          setTransport("switching");
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "rtc:fallback" }));
+          }
+        };
+
+        const maybeAttachDirect = () => {
+          if (!directAcknowledged || rtc?.channel.readyState !== "open" || fallbackRequested || rfbRef.current) return;
+          attachRFB(rtc.channel, "direct");
+        };
+
+        socket.onopen = () => {
+          try {
+            rtc = createBrowserRTC(socket!, "desktop", () => {
+              fallbackTimer = window.setTimeout(startFallback, 20000);
+            });
+          } catch {
+            startFallback();
+            return;
+          }
+          rtc.channel.onopen = maybeAttachDirect;
+          rtc.channel.onclose = () => {
+            if (directAcknowledged) startFallback();
+          };
+          rtc.channel.onerror = () => {
+            if (directAcknowledged) startFallback();
+          };
+          rtc.peer.onconnectionstatechange = () => {
+            if (rtc?.peer.connectionState === "failed") startFallback();
+          };
+        };
+        socket.onmessage = async (event) => {
+          let msg: { type: string; data?: string; error?: string };
+          try {
+            msg = JSON.parse(event.data as string) as typeof msg;
+          } catch {
+            return;
+          }
+          if (msg.type === "rtc:answer" && msg.data && rtc && !fallbackRequested) {
+            try {
+              await rtc.peer.setRemoteDescription(decodeRTCDescription(msg.data));
+            } catch {
+              startFallback();
+            }
+            return;
+          }
+          if (msg.type === "rtc:ice" && msg.data && rtc && !fallbackRequested) {
+            try {
+              await rtc.peer.addIceCandidate(decodeRTCCandidate(msg.data));
+            } catch {
+              // Candidate races are expected during trickle ICE.
+            }
+            return;
+          }
+          if (msg.type === "rtc:direct-ok") {
+            directAcknowledged = true;
+            maybeAttachDirect();
+            return;
+          }
+          if (msg.type === "rtc:direct-error") {
+            startFallback();
+            return;
+          }
+          if (msg.type === "rtc:relay") {
+            window.clearTimeout(fallbackTimer);
+            rtc?.peer.close();
+            setTransport("relay");
+            setStatus("connecting");
+            attachRFB(socket!, "relay");
+            return;
+          }
+          if (msg.type === "screen:error") {
+            setStatus(msg.error || "screen connection failed");
+          }
+        };
+        socket.onerror = () => !disposed && setStatus("error");
+        socket.onclose = () => {
+          if (!disposed) setStatus("disconnected");
+        };
       } catch (err) {
         if (!disposed) setStatus(String(err));
       }
@@ -1325,7 +1588,10 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
     connect();
     return () => {
       disposed = true;
+      window.clearTimeout(fallbackTimer);
       rfbRef.current?.disconnect();
+      rtc?.peer.close();
+      socket?.close();
     };
   }, [device.id]);
 
@@ -1341,8 +1607,8 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           {device.name} - remote desktop
         </div>
         <div className="connection-meta">
-          <span className="transport-indicator" title="Desktop traffic is forwarded through the Warpmesh VPS">
-            Server relay
+          <span className="transport-indicator" title="Direct WebRTC is attempted first; the VPS relays traffic if direct connection fails">
+            {transport === "direct" ? "Direct" : transport === "relay" ? "Server relay" : transport === "switching" ? "Switching to relay…" : "Trying direct…"}
           </span>
           <div className={`screen-status ${status === "connected" ? "ok" : ""}`} role="status" aria-live="polite">
             <span className={`connection-dot ${status === "connected" ? "ok" : ""}`} />

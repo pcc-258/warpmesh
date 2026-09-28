@@ -40,9 +40,19 @@ type agentConn struct {
 }
 
 type termSession struct {
-	deviceID string
-	browser  *websocket.Conn
-	traffic  *trafficRecorder
+	deviceID   string
+	browser    *websocket.Conn
+	traffic    *trafficRecorder
+	connection string
+	transport  string
+	direct     bool
+	writeMu    sync.Mutex
+}
+
+func (s *termSession) write(msg any) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.browser.WriteJSON(msg)
 }
 
 type fileSession struct {
@@ -67,14 +77,24 @@ type forwardSession struct {
 }
 
 type screenSession struct {
-	sessionID string
-	deviceID  string
-	browser   *websocket.Conn
-	link      *websocket.Conn
-	linkReady chan struct{}
-	done      chan struct{}
-	linkSet   bool
-	traffic   *trafficRecorder
+	sessionID  string
+	deviceID   string
+	browser    *websocket.Conn
+	link       *websocket.Conn
+	linkReady  chan struct{}
+	done       chan struct{}
+	linkSet    bool
+	traffic    *trafficRecorder
+	connection string
+	transport  string
+	direct     bool
+	writeMu    sync.Mutex
+}
+
+func (s *screenSession) write(msg any) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.browser.WriteJSON(msg)
 }
 
 type sessionEntry struct {
@@ -305,6 +325,13 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	if ctype := mime.TypeByExtension(filepath.Ext(path)); ctype != "" {
 		w.Header().Set("Content-Type", ctype)
+	}
+	// Hashed build assets are immutable; the HTML entry must revalidate so a
+	// new deploy is picked up without a manual cache clear.
+	if path == "index.html" {
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 	_, _ = w.Write(raw)
 }

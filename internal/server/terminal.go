@@ -35,7 +35,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = ws.Close() }()
 
 	sessionID := newID()
-	metricID, metricErr := s.reg.StartConnection(actor, deviceID, "", "terminal", "relay", clientIP(r))
+	metricID, metricErr := s.reg.StartConnection(actor, deviceID, "", "terminal", "negotiating", clientIP(r))
 	if metricErr != nil {
 		s.logf("record terminal connection: %v", metricErr)
 	}
@@ -43,7 +43,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	if metricErr == nil {
 		traffic = newTrafficRecorder(s.reg, metricID)
 	}
-	sess := &termSession{deviceID: deviceID, browser: ws, traffic: traffic}
+	sess := &termSession{deviceID: deviceID, browser: ws, traffic: traffic, connection: metricID, transport: "negotiating"}
 	s.sessionsMu.Lock()
 	s.terms[sessionID] = sess
 	s.sessionsMu.Unlock()
@@ -53,6 +53,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		s.sessionsMu.Lock()
 		delete(s.terms, sessionID)
 		s.sessionsMu.Unlock()
+		_ = agent.write(protocol.Message{Type: protocol.TypeRTCStop, SessionID: sessionID})
 	}()
 
 	cols, rows := queryInt(r, "cols", 120), queryInt(r, "rows", 30)
@@ -73,13 +74,44 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch msg.Type {
+		case protocol.TypeRTCOffer, protocol.TypeRTCICE:
+			s.logf("browser rtc %s session=%s service=terminal", msg.Type, sessionID)
+			s.sessionsMu.RLock()
+			fallback := sess.transport == "relay"
+			s.sessionsMu.RUnlock()
+			if fallback {
+				continue
+			}
+			msg.SessionID = sessionID
+			msg.Service = "terminal"
+			if err := agent.write(msg); err != nil {
+				return
+			}
+		case protocol.TypeRTCFallback:
+			s.logf("browser rtc fallback session=%s service=terminal", sessionID)
+			s.sessionsMu.Lock()
+			alreadyRelay := sess.transport == "relay"
+			sess.transport = "relay"
+			sess.direct = false
+			s.sessionsMu.Unlock()
+			if alreadyRelay {
+				continue
+			}
+			if sess.traffic != nil {
+				_ = s.reg.SetConnectionTransport(sess.connection, "relay")
+			}
+			_ = agent.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID})
+			_ = sess.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID})
 		case protocol.TypeTermInput, protocol.TypeTermResize, protocol.TypeTermStop:
 			msg.SessionID = sessionID
 			if err := agent.write(msg); err != nil {
 				traffic.Close("failed")
 				return
 			}
-			if msg.Type == protocol.TypeTermInput {
+			s.sessionsMu.RLock()
+			relay := sess.transport == "relay"
+			s.sessionsMu.RUnlock()
+			if msg.Type == protocol.TypeTermInput && relay {
 				traffic.Add(int64(len(msg.Data)), 0)
 			}
 			if msg.Type == protocol.TypeTermStop {

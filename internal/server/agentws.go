@@ -10,6 +10,11 @@ import (
 	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
+const (
+	agentPongWait   = 70 * time.Second
+	agentPingPeriod = 30 * time.Second
+)
+
 func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -57,14 +62,21 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	s.logf("agent online: %s (%s@%s)", hello.DeviceID, hello.OS, hello.Arch)
 
-	pingTicker := time.NewTicker(25 * time.Second)
+	_ = ws.SetReadDeadline(time.Now().Add(agentPongWait))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(agentPongWait))
+	})
+	pingTicker := time.NewTicker(agentPingPeriod)
 	defer pingTicker.Stop()
 	done := make(chan struct{})
 	go func() {
 		for {
 			select {
 			case <-pingTicker.C:
-				if err := conn.write(protocol.Message{Type: protocol.TypePing}); err != nil {
+				conn.writeMu.Lock()
+				err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+				conn.writeMu.Unlock()
+				if err != nil {
 					_ = ws.Close()
 					return
 				}
@@ -97,13 +109,16 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 	case protocol.TypeTermOutput, protocol.TypeTermExit, protocol.TypeTermError:
 		s.sessionsMu.RLock()
 		sess := s.terms[msg.SessionID]
+		relay := sess != nil && sess.transport == "relay"
 		s.sessionsMu.RUnlock()
 		if sess == nil || sess.deviceID != deviceID {
 			return
 		}
 		if msg.Type == protocol.TypeTermOutput {
-			if raw, err := protocol.DecodeData(msg.Data); err == nil {
-				sess.traffic.Add(0, int64(len(raw)))
+			if relay {
+				if raw, err := protocol.DecodeData(msg.Data); err == nil {
+					sess.traffic.Add(0, int64(len(raw)))
+				}
 			}
 		}
 		if msg.Type == protocol.TypeTermExit || msg.Type == protocol.TypeTermError {
@@ -113,7 +128,7 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 			}
 			sess.traffic.Close(state)
 		}
-		if err := sess.browser.WriteJSON(msg); err != nil {
+		if err := sess.write(msg); err != nil {
 			_ = sess.browser.Close()
 		}
 		if msg.Type == protocol.TypeTermExit || msg.Type == protocol.TypeTermError {
@@ -179,14 +194,58 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 	case protocol.TypeForwardOpen, protocol.TypeForwardData, protocol.TypeForwardClose, protocol.TypeForwardError,
 		protocol.TypeForwardOffer, protocol.TypeForwardAnswer, protocol.TypeForwardICE:
 		s.relayForward(deviceID, msg)
+	case protocol.TypeRTCAnswer, protocol.TypeRTCICE, protocol.TypeRTCDirectOK, protocol.TypeRTCDirectError:
+		s.routeBrowserRTC(deviceID, msg)
 	case protocol.TypeScreenError:
 		s.sessionsMu.RLock()
 		sess := s.screens[msg.SessionID]
+		if sess != nil && sess.deviceID == deviceID && sess.transport != "relay" {
+			_ = sess.write(msg)
+		}
 		s.sessionsMu.RUnlock()
-		if sess != nil && sess.deviceID == deviceID {
-			_ = sess.browser.WriteJSON(msg)
+	}
+}
+
+func (s *Server) routeBrowserRTC(deviceID string, msg protocol.Message) {
+	s.sessionsMu.Lock()
+	var browser interface{ write(any) error }
+	var connection string
+	var relaying bool
+	switch msg.Service {
+	case "terminal":
+		if sess := s.terms[msg.SessionID]; sess != nil && sess.deviceID == deviceID {
+			relaying = sess.transport == "relay"
+			if msg.Type == protocol.TypeRTCDirectOK && sess.transport != "relay" {
+				sess.direct = true
+				sess.transport = "direct"
+			}
+			browser = sess
+			connection = sess.connection
+		}
+	case "desktop":
+		if sess := s.screens[msg.SessionID]; sess != nil && sess.deviceID == deviceID {
+			relaying = sess.transport == "relay"
+			if msg.Type == protocol.TypeRTCDirectOK && sess.transport != "relay" {
+				sess.direct = true
+				sess.transport = "direct"
+			}
+			browser = sess
+			connection = sess.connection
 		}
 	}
+	if browser == nil || relaying {
+		if relaying {
+			s.logf("agent rtc %s session=%s dropped: session already on relay", msg.Type, msg.SessionID)
+		}
+		s.sessionsMu.Unlock()
+		return
+	}
+	s.logf("agent rtc %s session=%s service=%s forwarded to browser", msg.Type, msg.SessionID, msg.Service)
+	if msg.Type == protocol.TypeRTCDirectOK && connection != "" {
+		_ = s.reg.SetConnectionTransport(connection, "direct")
+	}
+	_ = browser.write(msg)
+	s.sessionsMu.Unlock()
 }
 
 // localIPs returns non-loopback interface addresses for agent metadata.
