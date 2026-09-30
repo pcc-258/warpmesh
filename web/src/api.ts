@@ -6,6 +6,8 @@ export interface Device {
   arch: string;
   lanIPs: string[];
   group?: string;
+  /** 'any' (default) or 'restricted'. Always serialized by the server. */
+  forwardPolicy: string;
   createdAt: string;
   lastSeen: string;
   online: boolean;
@@ -90,6 +92,12 @@ export interface AnalyticsData {
 
 const TOKEN_KEY = "warpmesh-token";
 
+/**
+ * Legacy session token kept for CLI-style header auth.
+ *
+ * The browser session now lives in an HttpOnly cookie set by /api/login, so
+ * this value is normally empty and is never placed in a URL.
+ */
 export function getToken(): string {
   return localStorage.getItem(TOKEN_KEY) || "";
 }
@@ -102,15 +110,57 @@ export function clearToken() {
   localStorage.removeItem(TOKEN_KEY);
 }
 
+/** Whether a session is present. The cookie is HttpOnly, so the console keeps
+ *  a non-secret marker rather than the credential itself. */
+const SESSION_FLAG = "warpmesh-session";
+export function hasSession(): boolean {
+  return localStorage.getItem(SESSION_FLAG) === "1";
+}
+export function setSessionFlag(): void {
+  localStorage.setItem(SESSION_FLAG, "1");
+}
+export function clearSessionFlag(): void {
+  localStorage.removeItem(SESSION_FLAG);
+}
+
+
+/**
+ * Normalise a server timestamp that means "no value".
+ *
+ * Go's time.Time zero value is a struct and is never omitted by `omitempty`,
+ * so it arrives as "0001-01-01T00:00:00Z" and would render as "1/1/1".
+ */
+export function optionalDate(value?: string | null): string | undefined {
+  if (!value) return undefined;
+  if (value.startsWith("0001-01-01")) return undefined;
+  return value;
+}
+
+/** Error carrying the HTTP status so callers can distinguish 401 from a blip. */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`request failed: ${status}`);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set("Authorization", `Bearer ${getToken()}`);
+  // The browser session travels in an HttpOnly cookie; a token is only present
+  // for non-browser clients that still use header auth.
+  const token = getToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
-    throw new Error(`request failed: ${res.status}`);
+    throw new ApiError(res.status);
   }
   if (res.status === 204) {
     return undefined as T;
@@ -120,6 +170,17 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export function listDevices(): Promise<Device[]> {
   return api<Device[]>("/api/devices");
+}
+
+/**
+ * Change a device's forwarding policy.
+ *
+ * "any" (the default for a newly enrolled device) lets it reach any other
+ * device on any port, so a personal fleet needs no per-device configuration.
+ * "restricted" limits it to explicit grants.
+ */
+export function setForwardPolicy(id: string, policy: "any" | "restricted"): Promise<Device> {
+  return api<Device>(`/api/devices/${id}`, { method: "PATCH", body: JSON.stringify({ forwardPolicy: policy }) });
 }
 
 export function renameDevice(id: string, name: string): Promise<Device> {
@@ -138,16 +199,24 @@ export async function login(username: string, password: string): Promise<void> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
+    // The server sets an HttpOnly session cookie on this response.
+    credentials: "same-origin",
   });
   if (!res.ok) {
     throw new Error("invalid credentials");
   }
-  const data = (await res.json()) as { token: string };
-  setToken(data.token);
+  // Drop any token from an older build so it cannot leak into a URL later.
+  clearToken();
+  setSessionFlag();
 }
 
 export async function logout(): Promise<void> {
-  await api<void>("/api/logout", { method: "POST" });
+  try {
+    await api<void>("/api/logout", { method: "POST" });
+  } finally {
+    clearToken();
+    clearSessionFlag();
+  }
 }
 
 export function getStats(): Promise<Stats> {
@@ -207,7 +276,8 @@ export function updateUser(username: string, patch: {
   password?: string;
   role?: string;
   deviceIds?: string[];
-  expiresAt?: string;
+  /** null clears the expiry; the server parses this as *time.Time. */
+  expiresAt?: string | null;
 }): Promise<void> {
   return api<void>(`/api/users/${username}`, { method: "PATCH", body: JSON.stringify(patch) });
 }
@@ -220,6 +290,13 @@ export function listAudit(limit = 50): Promise<AuditEntry[]> {
   return api<AuditEntry[]>(`/api/audit?limit=${limit}`);
 }
 
+/**
+ * Build a WebSocket URL.
+ *
+ * Credentials are deliberately absent: the upgrade is authorized by a
+ * single-use ticket carried in the subprotocol header, so nothing secret ends
+ * up in proxy logs, browser history or Referer headers.
+ */
 export function wsUrl(path: string, params: Record<string, string | number>): string {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const query = new URLSearchParams();
