@@ -158,6 +158,10 @@ type Server struct {
 	tickets       *ticketStore
 	stop          chan struct{}
 	stopOnce      sync.Once
+	// agentWG tracks the agent WebSocket handlers. Their teardown writes to the
+	// registry (last_seen, agent.offline) and runs in the handler goroutine, so
+	// Close must wait for them before closing the database.
+	agentWG sync.WaitGroup
 }
 
 // NewServer creates a relay server with the embedded web UI.
@@ -300,6 +304,11 @@ func (s *Server) AgentHandler() http.Handler {
 // Close releases server-owned resources.
 func (s *Server) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
+	// Let in-flight agent handlers finish their teardown before the database
+	// goes away. Without this, a handler can still be writing last_seen or
+	// agent.offline when the store is closed, which surfaces as a SQLite error
+	// or a half-written state file.
+	s.agentWG.Wait()
 	return s.reg.Close()
 }
 

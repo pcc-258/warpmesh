@@ -20,7 +20,10 @@ jobs:
           # pulled 2.14.0, whose stricter config schema rejected the committed
           # .golangci.yml and failed the job before any Go file was linted.
           version: v2.13.2
-          args: run ./...
+          # The action already invokes `golangci-lint run`, so this is only the
+          # package pattern. Passing "run ./..." made it look for a directory
+          # named "run".
+          args: ./...
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
