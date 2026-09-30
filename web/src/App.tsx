@@ -25,6 +25,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
+  clearSessionFlag,
   clearToken,
   createDeviceKey,
   createInvite,
@@ -33,7 +34,7 @@ import {
   deleteDevice,
   deleteUser,
   getAnalytics,
-  getToken,
+  hasSession,
   lastSeenLabel,
   listAudit,
   listDeviceKeys,
@@ -43,6 +44,7 @@ import {
   login,
   logout,
   renameDevice,
+  setForwardPolicy,
   revokeDeviceKey,
   rotateDeviceKey,
   updateUser,
@@ -55,6 +57,16 @@ import {
   type UserAccount,
   wsUrl,
 } from "./api";
+import {
+  DIRECT_BUDGET_MS,
+  formatElapsed,
+  stageDetail,
+  stageIsPending,
+  stageLabel,
+  useSessionStage,
+  type SessionKind,
+  type StageAttempt,
+} from "./sessionStage";
 
 type Page = "dashboard" | "devices" | "access" | "activity";
 
@@ -74,7 +86,7 @@ const PAGES_BY_PATH: Record<string, Page> = {
 
 type DeviceRouteKind = "terminal" | "desktop" | "files";
 
-function deviceView(kind: DeviceRouteKind, device: Device): Exclude<View, { name: "page" }> {
+function deviceView(kind: DeviceRouteKind, device: Device): View {
   switch (kind) {
     case "terminal":
       return { name: "terminal", device };
@@ -82,7 +94,29 @@ function deviceView(kind: DeviceRouteKind, device: Device): Exclude<View, { name
       return { name: "desktop", device };
     case "files":
       return { name: "files", device };
+    default:
+      return { name: "page", page: "devices" };
   }
+}
+
+/**
+ * Parse a device deep link. The two URL shapes intentionally differ:
+ *   path  /devices/<id>/<kind>   (written by openDeviceView)
+ *   hash  #/<kind>/<id>          (written by the agent CLI)
+ * Reading one shape with the other's group order silently resolved the wrong
+ * device and dropped the operator back on the dashboard.
+ */
+function parseDeviceRoute(pathname: string, hash: string): { kind: DeviceRouteKind; id: string } | null {
+  const kinds = "(terminal|desktop|files)";
+  const pathMatch = pathname.match(new RegExp(`^/devices/([^/]+)/${kinds}$`));
+  if (pathMatch) {
+    return { id: decodeURIComponent(pathMatch[1]), kind: pathMatch[2] as DeviceRouteKind };
+  }
+  const hashMatch = hash.match(new RegExp(`^#/${kinds}/(.+)$`));
+  if (hashMatch) {
+    return { kind: hashMatch[1] as DeviceRouteKind, id: decodeURIComponent(hashMatch[2]) };
+  }
+  return null;
 }
 
 function normalizedPath(path: string): string {
@@ -101,16 +135,28 @@ const RTC_STUN_SERVERS = [
 
 type BrowserRTC = { peer: RTCPeerConnection; channel: RTCDataChannel };
 
-function createBrowserRTC(socket: WebSocket, service: "terminal" | "desktop", onOfferSent: () => void): BrowserRTC {
+function createBrowserRTC(
+  socket: WebSocket,
+  service: "terminal" | "desktop",
+  handlers: {
+    onOfferSent?: () => void;
+    onLocalCandidate?: () => void;
+    onStateChange?: (state: RTCPeerConnectionState) => void;
+  } = {},
+): BrowserRTC {
   const peer = new RTCPeerConnection({
     iceServers: [{ urls: RTC_STUN_SERVERS }],
     iceCandidatePoolSize: 2,
   });
   const channel = peer.createDataChannel("warpmesh");
   channel.binaryType = "arraybuffer";
+  // Surface the peer state so the UI can explain a stalled attempt instead of
+  // showing one static label for the whole direct budget.
+  peer.onconnectionstatechange = () => handlers.onStateChange?.(peer.connectionState);
   // Trickle ICE: forward each candidate as it is gathered so connectivity
   // checks can start immediately instead of waiting for full gathering.
   peer.onicecandidate = (event) => {
+    if (event.candidate) handlers.onLocalCandidate?.();
     if (event.candidate && socket.readyState === WebSocket.OPEN) {
       socket.send(
         JSON.stringify({
@@ -127,7 +173,7 @@ function createBrowserRTC(socket: WebSocket, service: "terminal" | "desktop", on
       await peer.setLocalDescription(offer);
       if (socket.readyState === WebSocket.OPEN && peer.localDescription) {
         socket.send(JSON.stringify({ type: "rtc:offer", service, data: btoa(JSON.stringify(peer.localDescription)) }));
-        onOfferSent();
+        handlers.onOfferSent?.();
       }
     } catch {
       // The direct attempt budget below will switch to the WebSocket relay.
@@ -151,28 +197,33 @@ type View =
   | { name: "files"; device: Device };
 
 export default function App() {
-  const [token, setTokenState] = useState(getToken());
+  // The credential lives in an HttpOnly cookie; this is only a marker that a
+  // session exists, so the console knows whether to render the login form.
+  const [token, setTokenState] = useState(hasSession());
   const [view, setView] = useState<View>(() => ({ name: "page", page: pageFromPath(location.pathname) }));
   const routeSeq = useRef(0);
 
   const applyLocation = useCallback(async () => {
     const seq = ++routeSeq.current;
-    const deviceMatch =
-      location.pathname.match(/^\/devices\/([^/]+)\/(terminal|desktop|files)$/) ||
-      location.hash.match(/^#\/(desktop|terminal|files)\/(.+)$/);
-    if (!deviceMatch) {
+    const route = parseDeviceRoute(location.pathname, location.hash);
+    if (!route) {
       if (routeSeq.current === seq) {
         setView({ name: "page", page: pageFromPath(location.pathname) });
       }
       return;
     }
-    const kind = deviceMatch[1] as DeviceRouteKind;
-    const id = decodeURIComponent(deviceMatch[2]);
     try {
       const devices = await listDevices();
-      const device = devices.find((d) => d.id === id);
-      if (device && routeSeq.current === seq) {
-        setView(deviceView(kind, device));
+      const device = devices.find((d) => d.id === route.id);
+      if (routeSeq.current !== seq) {
+        return;
+      }
+      if (device) {
+        setView(deviceView(route.kind, device));
+      } else {
+        // Stale link (the device is gone): show the inventory rather than
+        // leaving the URL claiming a view that cannot render.
+        setView({ name: "page", page: "devices" });
       }
     } catch {
       // deep links resolve lazily; the console stays usable if the lookup fails
@@ -216,7 +267,7 @@ export default function App() {
   );
 
   if (!token) {
-    return <Login onLogin={() => setTokenState(getToken())} />;
+    return <Login onLogin={() => setTokenState(true)} />;
   }
 
   if (view.name === "terminal") {
@@ -246,7 +297,8 @@ export default function App() {
         }
         history.replaceState({}, "", "/");
         clearToken();
-        setTokenState("");
+        clearSessionFlag();
+        setTokenState(false);
       }}
     />
   );
@@ -807,6 +859,23 @@ function DevicesPage({
     }
   };
 
+  // Forwarding is allow-any by default so a personal fleet needs no setup.
+  // This is the control point for tightening it later.
+  const handleForwardPolicy = async (device: Device) => {
+    const next = device.forwardPolicy === "restricted" ? "any" : "restricted";
+    const explain =
+      next === "restricted"
+        ? `Restrict forwarding for ${device.name}? It will only reach devices you grant explicitly.`
+        : `Allow ${device.name} to forward to any device and port?`;
+    if (!confirm(explain)) return;
+    try {
+      await setForwardPolicy(device.id, next);
+      location.reload();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Could not update the forwarding policy.");
+    }
+  };
+
   return (
     <>
       {groups.length > 0 && (
@@ -847,6 +916,18 @@ function DevicesPage({
                 </span>
                 <span>
                   {device.os} / {device.arch}
+                  <button
+                    type="button"
+                    className={`policy-badge ${device.forwardPolicy === "restricted" ? "restricted" : ""}`}
+                    title={
+                      device.forwardPolicy === "restricted"
+                        ? "Forwarding is restricted to explicit grants. Click to allow any."
+                        : "This device may forward to any device and port. Click to restrict."
+                    }
+                    onClick={() => handleForwardPolicy(device)}
+                  >
+                    {device.forwardPolicy === "restricted" ? "forward: restricted" : "forward: any"}
+                  </button>
                 </span>
                 <span>{device.lanIPs?.join(", ") || "no LAN IP"}</span>
                 <span>{lastSeenLabel(device.lastSeen)}</span>
@@ -1237,10 +1318,51 @@ function ActivityList({ audit }: { audit: AuditEntry[] }) {
   );
 }
 
+/**
+ * Connection progress for a terminal or desktop session.
+ *
+ * A direct WebRTC attempt can spend up to DIRECT_BUDGET_MS gathering
+ * candidates and running connectivity checks. Showing one static label for that
+ * whole window reads as a hung page, so this reports the stage, a live elapsed
+ * clock, the ICE candidate counts and a countdown to the relay fallback.
+ */
+function SessionProgress({ attempt, kind }: { attempt: StageAttempt; kind: SessionKind }) {
+  const pending = stageIsPending(attempt.stage);
+  const ok = attempt.stage === "connected";
+  const bad = attempt.stage === "error";
+  return (
+    <div className="connection-meta">
+      <div className="connection-progress" role="status" aria-live="polite">
+        <div className={`screen-status ${ok ? "ok" : bad ? "bad" : ""}`}>
+          <span className={`connection-dot ${ok ? "ok" : bad ? "bad" : ""} ${pending ? "pulse" : ""}`} />
+          <span className="connection-stage">{stageLabel(attempt.stage)}</span>
+          {pending && <span className="connection-elapsed">{formatElapsed(attempt.elapsedMs)}</span>}
+        </div>
+        {attempt.stage !== "connected" && (
+          <span className="connection-detail">{stageDetail(attempt, kind)}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Full-panel overlay so a blank desktop area never looks like a frozen page. */
+function SessionOverlay({ attempt, kind }: { attempt: StageAttempt; kind: SessionKind }) {
+  return (
+    <div className="session-overlay" role="status" aria-live="polite">
+      <span className="session-spinner" aria-hidden="true" />
+      <strong>{stageLabel(attempt.stage)}</strong>
+      <span>{stageDetail(attempt, kind)}</span>
+      <span className="session-overlay-elapsed">elapsed {formatElapsed(attempt.elapsedMs)}</span>
+    </div>
+  );
+}
+
 function TerminalView({ device, onBack }: { device: Device; onBack: () => void }) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const [status, setStatus] = useState("connecting");
-  const [transport, setTransport] = useState("negotiating");
+  const session = useSessionStage();
+  const { setStage, startBudget, stopBudget: termStopBudget, markRelaying, markConnected,
+          markFailed, markDisconnected, noteLocalCandidate, noteRemoteCandidate } = session;
 
   useEffect(() => {
     const term = new Terminal({
@@ -1259,9 +1381,10 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     term.open(hostRef.current!);
     fit.fit();
 
+    // No credential in the URL: the browser attaches the HttpOnly session
+    // cookie to the WebSocket handshake automatically.
     const socket = new WebSocket(
       wsUrl("/ws/terminal", {
-        token: getToken(),
         device: device.id,
         cols: term.cols,
         rows: term.rows,
@@ -1273,26 +1396,34 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     let fallbackRequested = false;
     let fallbackTimer = 0;
     let disposed = false;
-    let terminalHadOutput = false;
+    // A live session must not be torn down by a stale fallback.
+    let live = false;
 
     const startFallback = () => {
-      if (fallbackRequested || disposed) return;
+      // Never tear down a session that is already live: the direct channel may
+      // have opened after the budget was armed.
+      if (fallbackRequested || disposed || live) return;
       fallbackRequested = true;
       directActive = false;
       window.clearTimeout(fallbackTimer);
       rtc?.peer.close();
-      setTransport("switching");
+      setStage("switching");
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "rtc:fallback" }));
       }
     };
 
+    const markLive = () => {
+      live = true;
+      window.clearTimeout(fallbackTimer);
+      termStopBudget();
+      markConnected();
+    };
+
     const activateDirect = () => {
       if (!directAcknowledged || rtc?.channel.readyState !== "open" || fallbackRequested) return;
       directActive = true;
-      window.clearTimeout(fallbackTimer);
-      setTransport("direct");
-      setStatus("connected");
+      markLive();
     };
 
     const sendResize = () => {
@@ -1304,8 +1435,15 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     socket.onopen = () => {
       term.focus();
       try {
-        rtc = createBrowserRTC(socket, "terminal", () => {
-          fallbackTimer = window.setTimeout(startFallback, 20000);
+        rtc = createBrowserRTC(socket, "terminal", {
+          onOfferSent: () => {
+            fallbackTimer = window.setTimeout(startFallback, DIRECT_BUDGET_MS);
+          },
+          onLocalCandidate: noteLocalCandidate,
+          onStateChange: (state) => {
+            if (state === "failed") startFallback();
+            if (state === "new" || state === "connecting") setStage("checking");
+          },
         });
       } catch {
         startFallback();
@@ -1314,9 +1452,8 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
       rtc.channel.onopen = activateDirect;
       rtc.channel.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
-          terminalHadOutput = true;
           term.write(new Uint8Array(event.data));
-          setStatus("connected");
+          markLive();
         }
       };
       rtc.channel.onclose = () => {
@@ -1364,26 +1501,30 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
       if (msg.type === "rtc:relay") {
         directActive = false;
         fallbackRequested = true;
-        setTransport("relay");
-        setStatus((current) => current === "error" ? current : terminalHadOutput ? "connected" : "connecting");
+        markRelaying();
         sendResize();
         return;
       }
       if (msg.type === "terminal:output" && typeof msg.data === "string") {
-        terminalHadOutput = true;
-        setStatus("connected");
+        // Output means the session is live. Set the flag before clearing the
+        // timer: onOfferSent runs from an async task and could otherwise re-arm
+        // a fallback that later tears the live session down.
+        live = true;
+        window.clearTimeout(fallbackTimer);
+        termStopBudget();
+        markConnected();
         const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
         term.write(bytes);
       }
       if (msg.type === "terminal:exit" || msg.type === "terminal:error") {
-        setStatus(msg.type === "terminal:error" ? "error" : "disconnected");
+        markDisconnected(msg.type === "terminal:error" ? "The device reported a terminal error." : "Session ended.");
         term.writeln("\r\n\x1b[90m[session ended]\x1b[0m");
         socket.close();
       }
     };
-    socket.onerror = () => setStatus("error");
+    socket.onerror = () => markFailed("The control channel failed.");
     socket.onclose = () => {
-      setStatus((current) => (current === "error" ? current : "disconnected"));
+      markDisconnected("The control channel closed.");
       term.writeln("\r\n\x1b[90m[connection closed]\x1b[0m");
     };
 
@@ -1415,7 +1556,8 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
       socket.close();
       term.dispose();
     };
-  }, [device.id]);
+  }, [device.id, setStage, startBudget, termStopBudget, markRelaying, markConnected, markFailed,
+      markDisconnected, noteLocalCandidate, noteRemoteCandidate]);
 
   return (
     <div className="app-shell terminal-page">
@@ -1428,18 +1570,11 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
           <TerminalSquare size={16} />
           {device.name} - remote terminal
         </div>
-        <div className="connection-meta">
-          <span className="transport-indicator" title="Direct WebRTC is attempted first; the VPS relays traffic if direct connection fails">
-            {transport === "direct" ? "Direct" : transport === "relay" ? "Server relay" : transport === "switching" ? "Switching to relay…" : "Trying direct…"}
-          </span>
-          <div className={`screen-status ${status === "connected" ? "ok" : ""}`} role="status" aria-live="polite">
-            <span className={`connection-dot ${status === "connected" ? "ok" : ""}`} />
-            {status}
-          </div>
-        </div>
+        <SessionProgress attempt={session.attempt} kind="terminal" />
       </header>
       <main className="terminal-host">
         <div ref={hostRef} className="terminal" />
+        {stageIsPending(session.stage) && <SessionOverlay attempt={session.attempt} kind="terminal" />}
       </main>
     </div>
   );
@@ -1448,8 +1583,9 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
 function DesktopView({ device, onBack }: { device: Device; onBack: () => void }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<{ disconnect: () => void } | null>(null);
-  const [status, setStatus] = useState("connecting");
-  const [transport, setTransport] = useState("negotiating");
+  const session = useSessionStage();
+  const { setStage, startBudget, stopBudget: rfbStopBudget, markRelaying, markConnected,
+          markFailed, markDisconnected, noteLocalCandidate, noteRemoteCandidate } = session;
 
   useEffect(() => {
     let disposed = false;
@@ -1458,11 +1594,13 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
     let directAcknowledged = false;
     let fallbackRequested = false;
     let fallbackTimer = 0;
+    // A live session must not be torn down by a stale fallback.
+    let live = false;
     const connect = async () => {
       try {
         const RFB = (await import("@novnc/novnc")).default;
         if (disposed) return;
-        socket = new WebSocket(wsUrl("/ws/screen", { token: getToken(), device: device.id }));
+        socket = new WebSocket(wsUrl("/ws/screen", { device: device.id }));
 
         const attachRFB = (channel: RTCDataChannel | WebSocket, mode: "direct" | "relay") => {
           if (!hostRef.current || disposed) return;
@@ -1471,13 +1609,18 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           rfb.scaleViewport = true;
           rfb.resizeSession = false;
           rfb.addEventListener("connect", () => {
-            if (!disposed) {
-              setTransport(mode);
-              setStatus("connected");
-            }
+            if (disposed) return;
+            // The session is live: stop the direct-attempt budget and the
+            // fallback timer so they cannot tear it down mid-stream.
+            live = true;
+            window.clearTimeout(fallbackTimer);
+            rfbStopBudget();
+            markConnected();
           });
           rfb.addEventListener("disconnect", () => {
-            if (!disposed && !(mode === "direct" && fallbackRequested)) setStatus("disconnected");
+            if (!disposed && !(mode === "direct" && fallbackRequested)) {
+              markDisconnected("The device closed the desktop session.");
+            }
           });
           rfb.addEventListener("credentialsrequired", () => {
             const password = prompt("VNC password (leave empty if not set)") || "";
@@ -1485,7 +1628,7 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           });
           rfb.addEventListener("securityfailure", (event: CustomEvent) => {
             const reason = (event.detail as { reason?: string })?.reason || "authentication failed";
-            if (!disposed) setStatus(reason);
+            if (!disposed) markFailed(reason);
           });
           if (mode === "direct" && socket?.readyState === WebSocket.OPEN) {
             window.clearTimeout(fallbackTimer);
@@ -1494,7 +1637,8 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
         };
 
         const startFallback = () => {
-          if (fallbackRequested || disposed) return;
+          // Never tear down a session that is already live.
+          if (fallbackRequested || disposed || live) return;
           fallbackRequested = true;
           window.clearTimeout(fallbackTimer);
           if (rfbRef.current) {
@@ -1502,7 +1646,7 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
             rfbRef.current = null;
           }
           rtc?.peer.close();
-          setTransport("switching");
+          setStage("switching");
           if (socket?.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "rtc:fallback" }));
           }
@@ -1515,8 +1659,15 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
 
         socket.onopen = () => {
           try {
-            rtc = createBrowserRTC(socket!, "desktop", () => {
-              fallbackTimer = window.setTimeout(startFallback, 20000);
+            rtc = createBrowserRTC(socket!, "desktop", {
+              onOfferSent: () => {
+                fallbackTimer = window.setTimeout(startFallback, DIRECT_BUDGET_MS);
+              },
+              onLocalCandidate: noteLocalCandidate,
+              onStateChange: (state) => {
+                if (state === "failed") startFallback();
+                if (state === "new" || state === "connecting") setStage("checking");
+              },
             });
           } catch {
             startFallback();
@@ -1529,9 +1680,6 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           rtc.channel.onerror = () => {
             if (directAcknowledged) startFallback();
           };
-          rtc.peer.onconnectionstatechange = () => {
-            if (rtc?.peer.connectionState === "failed") startFallback();
-          };
         };
         socket.onmessage = async (event) => {
           let msg: { type: string; data?: string; error?: string };
@@ -1541,6 +1689,7 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
             return;
           }
           if (msg.type === "rtc:answer" && msg.data && rtc && !fallbackRequested) {
+            setStage("negotiating");
             try {
               await rtc.peer.setRemoteDescription(decodeRTCDescription(msg.data));
             } catch {
@@ -1549,6 +1698,7 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
             return;
           }
           if (msg.type === "rtc:ice" && msg.data && rtc && !fallbackRequested) {
+            noteRemoteCandidate();
             try {
               await rtc.peer.addIceCandidate(decodeRTCCandidate(msg.data));
             } catch {
@@ -1568,21 +1718,22 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           if (msg.type === "rtc:relay") {
             window.clearTimeout(fallbackTimer);
             rtc?.peer.close();
-            setTransport("relay");
-            setStatus("connecting");
+            markRelaying();
             attachRFB(socket!, "relay");
             return;
           }
           if (msg.type === "screen:error") {
-            setStatus(msg.error || "screen connection failed");
+            markFailed(msg.error || "screen connection failed");
           }
         };
-        socket.onerror = () => !disposed && setStatus("error");
+        socket.onerror = () => {
+          if (!disposed) markFailed("The control channel failed.");
+        };
         socket.onclose = () => {
-          if (!disposed) setStatus("disconnected");
+          if (!disposed) markDisconnected("The control channel closed.");
         };
       } catch (err) {
-        if (!disposed) setStatus(String(err));
+        if (!disposed) markFailed(err instanceof Error ? err.message : String(err));
       }
     };
     connect();
@@ -1593,7 +1744,8 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
       rtc?.peer.close();
       socket?.close();
     };
-  }, [device.id]);
+  }, [device.id, setStage, startBudget, rfbStopBudget, markRelaying, markConnected, markFailed,
+      markDisconnected, noteLocalCandidate, noteRemoteCandidate]);
 
   return (
     <div className="app-shell desktop-page">
@@ -1606,18 +1758,11 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           <Monitor size={16} />
           {device.name} - remote desktop
         </div>
-        <div className="connection-meta">
-          <span className="transport-indicator" title="Direct WebRTC is attempted first; the VPS relays traffic if direct connection fails">
-            {transport === "direct" ? "Direct" : transport === "relay" ? "Server relay" : transport === "switching" ? "Switching to relay…" : "Trying direct…"}
-          </span>
-          <div className={`screen-status ${status === "connected" ? "ok" : ""}`} role="status" aria-live="polite">
-            <span className={`connection-dot ${status === "connected" ? "ok" : ""}`} />
-            {status}
-          </div>
-        </div>
+        <SessionProgress attempt={session.attempt} kind="desktop" />
       </header>
       <main className="desktop-host">
         <div ref={hostRef} className="desktop-canvas" />
+        {stageIsPending(session.stage) && <SessionOverlay attempt={session.attempt} kind="desktop" />}
       </main>
     </div>
   );
@@ -1642,7 +1787,7 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
 
   const fileOp = (type: string, payload: Record<string, unknown> = {}) =>
     new Promise<{ type: string; entries?: RemoteEntry[]; error?: string }>((resolve, reject) => {
-      const ws = new WebSocket(wsUrl("/ws/files", { token: getToken(), device: device.id }));
+      const ws = new WebSocket(wsUrl("/ws/files", { device: device.id }));
       ws.onopen = () => ws.send(JSON.stringify({ type, ...payload }));
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
@@ -1697,7 +1842,6 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
     new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(
         wsUrl("/ws/file", {
-          token: getToken(),
           device: device.id,
           op: "upload",
           name: file.name,
@@ -1747,7 +1891,6 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
     new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(
         wsUrl("/ws/file", {
-          token: getToken(),
           device: device.id,
           op: "download",
           path: p,
