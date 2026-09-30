@@ -56,10 +56,7 @@ func TestTerminalRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 
 	waitFor(t, func() bool {
 		resp, err := http.Get(ts.URL + "/api/health")
@@ -215,10 +212,7 @@ func TestBrowserRTCTrickleICE(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/terminal?token=admin-token&device="+key.DeviceID+"&cols=80&rows=24", nil,
@@ -323,10 +317,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 
 	statsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/stats", nil)
 	statsReq.Header.Set("Authorization", "Bearer "+loginResp.Token)
@@ -670,10 +661,7 @@ func enrollTestAgent(t *testing.T, srv *Server, baseWS string) (*websocket.Conn,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 	return ws, key.DeviceID
 }
 
@@ -1180,10 +1168,7 @@ func TestScreenRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/screen?token=admin-token&device="+key.DeviceID, nil,
@@ -1291,10 +1276,7 @@ func TestFileManagerRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/files?token=admin-token&device="+key.DeviceID, nil,
@@ -1366,10 +1348,7 @@ func TestFileManagerRejectsUngrantedDevice(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 	grantedID := key.DeviceID
 
 	login := func(username, password string) string {
@@ -1634,10 +1613,7 @@ func TestFileManagerRejectsPrivilegedMessageTypes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		dev, ok := srv.reg.Get(key.DeviceID)
-		return ok && dev.Online
-	})
+	waitForAgent(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/files?token=admin-token&device="+key.DeviceID, nil,
@@ -1823,6 +1799,18 @@ func TestUserListIncludesEmptyDeviceIDs(t *testing.T) {
 			t.Fatalf("empty deviceIds should serialize as [], got %s", raw)
 		}
 	}
+}
+
+// waitForAgent waits until the relay has registered an agent connection.
+//
+// A device is marked online by the registry upsert inside handleAgentWS, but
+// the connection is only stored in s.agents a few statements later. A test that
+// waits on the registry can therefore race ahead and dial a browser endpoint
+// while getAgent still returns nil, which the handler answers with 409
+// "device offline" and the dialer reports as a bad handshake.
+func waitForAgent(t *testing.T, srv *Server, deviceID string) {
+	t.Helper()
+	waitFor(t, func() bool { return srv.getAgent(deviceID) != nil })
 }
 
 func waitFor(t *testing.T, fn func() bool) {
