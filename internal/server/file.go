@@ -32,6 +32,10 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = ws.Close() }()
+	// Track the handler so Close() can drain its teardown before the store is
+	// closed; httptest does not wait for hijacked connections.
+	s.wsWG.Add(1)
+	defer s.wsWG.Done()
 
 	sessionID := newID()
 	metricID, metricErr := s.reg.StartConnection(actor, deviceID, "", "files-"+op, "relay", clientIP(r))

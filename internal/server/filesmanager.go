@@ -35,6 +35,10 @@ func (s *Server) handleFilesWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = ws.Close() }()
+	// Track the handler so Close() can drain its teardown before the store is
+	// closed; httptest does not wait for hijacked connections.
+	s.wsWG.Add(1)
+	defer s.wsWG.Done()
 	hardenBrowserConn(ws)
 
 	sessionID := newID()

@@ -63,8 +63,8 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = ws.Close() }()
 	// Close() waits on this so registry writes in the teardown below cannot
 	// outlive the database handle.
-	s.agentWG.Add(1)
-	defer s.agentWG.Done()
+	s.wsWG.Add(1)
+	defer s.wsWG.Done()
 	ws.SetReadLimit(maxRelayMessageBytes)
 
 	// The first message must carry device identity so the server can check

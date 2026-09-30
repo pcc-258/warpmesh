@@ -158,10 +158,11 @@ type Server struct {
 	tickets       *ticketStore
 	stop          chan struct{}
 	stopOnce      sync.Once
-	// agentWG tracks the agent WebSocket handlers. Their teardown writes to the
-	// registry (last_seen, agent.offline) and runs in the handler goroutine, so
-	// Close must wait for them before closing the database.
-	agentWG sync.WaitGroup
+	// wsWG tracks every WebSocket handler. Their teardown writes to the registry
+	// (last_seen, agent.offline, connection state) and runs in the handler
+	// goroutine, and httptest.Server.Close does not wait for hijacked
+	// connections, so Close must drain them before closing the database.
+	wsWG sync.WaitGroup
 }
 
 // NewServer creates a relay server with the embedded web UI.
@@ -304,12 +305,62 @@ func (s *Server) AgentHandler() http.Handler {
 // Close releases server-owned resources.
 func (s *Server) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
-	// Let in-flight agent handlers finish their teardown before the database
-	// goes away. Without this, a handler can still be writing last_seen or
-	// agent.offline when the store is closed, which surfaces as a SQLite error
-	// or a half-written state file.
-	s.agentWG.Wait()
+	// A WebSocket handler only returns once its peer goes away, so close the
+	// live sockets to unblock them. Draining matters because their teardown
+	// writes to the registry (last_seen, agent.offline, connection state), and
+	// httptest.Server.Close does not wait for hijacked connections.
+	s.closeWebSockets()
+	s.waitForHandlers(handlerDrainTimeout)
 	return s.reg.Close()
+}
+
+// handlerDrainTimeout bounds how long Close waits for handler teardown. A
+// handler that is stuck on something other than the socket must not hang
+// shutdown forever.
+const handlerDrainTimeout = 5 * time.Second
+
+// closeWebSockets closes every live browser and agent socket.
+func (s *Server) closeWebSockets() {
+	s.sessionsMu.Lock()
+	var conns []*websocket.Conn
+	for _, sess := range s.terms {
+		conns = append(conns, sess.browser)
+	}
+	for _, sess := range s.screens {
+		conns = append(conns, sess.browser)
+	}
+	for _, sess := range s.files {
+		conns = append(conns, sess.browser)
+	}
+	for _, sess := range s.managers {
+		conns = append(conns, sess.browser)
+	}
+	s.sessionsMu.Unlock()
+
+	s.agentsMu.RLock()
+	for _, conn := range s.agents {
+		conns = append(conns, conn.ws)
+	}
+	s.agentsMu.RUnlock()
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// waitForHandlers blocks until every WebSocket handler has finished its
+// teardown, or the timeout expires.
+func (s *Server) waitForHandlers(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.wsWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		s.logf("shutdown: handlers still running after %s", timeout)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
