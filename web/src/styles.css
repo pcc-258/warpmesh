@@ -1514,3 +1514,14 @@ input:focus {
   color: var(--amber);
   border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
 }
+
+/* Active path badge. Direct is peer-to-peer; relay goes through the VPS. */
+.transport-indicator.direct {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 40%, var(--border));
+}
+
+.transport-indicator.relay {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+}

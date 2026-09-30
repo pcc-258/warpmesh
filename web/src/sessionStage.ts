@@ -26,6 +26,16 @@ export type SessionKind = "terminal" | "desktop";
 /** How long a direct path is attempted before falling back to the relay. */
 export const DIRECT_BUDGET_MS = 20000;
 
+/**
+ * Which path carries the session.
+ *
+ * "negotiating" until a path is proven, then the path actually in use. This has
+ * to stay visible after the session is live: whether traffic goes peer-to-peer
+ * or through the VPS relay is something an operator needs to know, and it is
+ * the thing the original transport indicator reported.
+ */
+export type SessionTransport = "negotiating" | "direct" | "relay";
+
 export type StageAttempt = {
   stage: SessionStage;
   /** Milliseconds since the session screen opened. */
@@ -36,6 +46,8 @@ export type StageAttempt = {
   localCandidates: number;
   /** ICE candidates received from the device so far. */
   remoteCandidates: number;
+  /** The path currently carrying the session. */
+  transport: SessionTransport;
   /** Present when stage is "error" or "disconnected". */
   reason?: string;
 };
@@ -56,6 +68,7 @@ export function useSessionStage() {
     budgetRemainingMs: null,
     localCandidates: 0,
     remoteCandidates: 0,
+    transport: "negotiating",
   });
 
   const stageRef = useRef<SessionStage>("setup");
@@ -64,6 +77,7 @@ export function useSessionStage() {
   const budgetEndsAtRef = useRef<number | null>(null);
   const localCandidatesRef = useRef(0);
   const remoteCandidatesRef = useRef(0);
+  const transportRef = useRef<SessionTransport>("negotiating");
   // Re-render on a 250ms cadence: fine enough to look live, cheap enough to
   // leave running for the whole session.
   const [, forceTick] = useState(0);
@@ -83,6 +97,7 @@ export function useSessionStage() {
     budgetEndsAtRef.current = null;
     localCandidatesRef.current = 0;
     remoteCandidatesRef.current = 0;
+    transportRef.current = "negotiating";
     applyStage("setup", undefined);
   }, [applyStage]);
 
@@ -109,11 +124,17 @@ export function useSessionStage() {
 
   const markRelaying = useCallback(() => {
     stopBudget();
+    transportRef.current = "relay";
     applyStage("relaying");
   }, [applyStage, stopBudget]);
 
   const markConnected = useCallback(() => {
     stopBudget();
+    // Reaching a live session while still negotiating means the direct path
+    // won the race; markRelaying would already have set relay otherwise.
+    if (transportRef.current === "negotiating") {
+      transportRef.current = "direct";
+    }
     applyStage("connected", undefined);
   }, [applyStage, stopBudget]);
 
@@ -143,6 +164,7 @@ export function useSessionStage() {
         budgetRemainingMs: budget === null ? null : Math.max(0, budget - now),
         localCandidates: localCandidatesRef.current,
         remoteCandidates: remoteCandidatesRef.current,
+        transport: transportRef.current,
         reason: reasonRef.current,
       });
       forceTick((n) => (n + 1) % 1000);
@@ -264,7 +286,9 @@ export function stageDetail(attempt: StageAttempt, kind: SessionKind = "desktop"
     case "relaying":
       return `Relay selected; waiting for the ${stream} stream to start.`;
     case "connected":
-      return "Streaming.";
+      return attempt.transport === "relay"
+        ? "Live over the server relay."
+        : "Live over a direct peer-to-peer path.";
     case "disconnected":
       return attempt.reason || "The session ended.";
     case "error":

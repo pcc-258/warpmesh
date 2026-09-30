@@ -1336,11 +1336,16 @@ function SessionProgress({ attempt, kind }: { attempt: StageAttempt; kind: Sessi
         <div className={`screen-status ${ok ? "ok" : bad ? "bad" : ""}`}>
           <span className={`connection-dot ${ok ? "ok" : bad ? "bad" : ""} ${pending ? "pulse" : ""}`} />
           <span className="connection-stage">{stageLabel(attempt.stage)}</span>
+          {/* The path matters once the session is live: direct is peer-to-peer,
+              relay goes through the VPS. */}
+          {attempt.stage === "connected" && (
+            <span className={`transport-indicator ${attempt.transport}`}>
+              {transportLabel(attempt.transport)}
+            </span>
+          )}
           {pending && <span className="connection-elapsed">{formatElapsed(attempt.elapsedMs)}</span>}
         </div>
-        {attempt.stage !== "connected" && (
-          <span className="connection-detail">{stageDetail(attempt, kind)}</span>
-        )}
+        <span className="connection-detail">{stageDetail(attempt, kind)}</span>
       </div>
     </div>
   );
