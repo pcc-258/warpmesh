@@ -12,5 +12,5 @@ linters:
     - whitespace
     - gocritic
 
-exclusions:
-  generated: lax
+  exclusions:
+    generated: lax
