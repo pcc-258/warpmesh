@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,18 +18,49 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Forwarding policy values for devices.forward_policy. "any" is the default so
+// a freshly enrolled device can reach every peer without extra configuration.
+const (
+	ForwardPolicyAny        = "any"
+	ForwardPolicyRestricted = "restricted"
+)
+
+// ValidForwardPolicy reports whether p is a policy the relay understands.
+func ValidForwardPolicy(p string) bool {
+	return p == ForwardPolicyAny || p == ForwardPolicyRestricted
+}
+
 // Device is the persisted metadata for one managed device.
 type Device struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Hostname  string    `json:"hostname"`
-	OS        string    `json:"os"`
-	Arch      string    `json:"arch"`
-	LANIPs    []string  `json:"lanIPs,omitempty"`
-	Group     string    `json:"group,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
-	LastSeen  time.Time `json:"lastSeen"`
-	Online    bool      `json:"online"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Hostname      string    `json:"hostname"`
+	OS            string    `json:"os"`
+	Arch          string    `json:"arch"`
+	LANIPs        []string  `json:"lanIPs,omitempty"`
+	Group         string    `json:"group,omitempty"`
+	ForwardPolicy string    `json:"forwardPolicy"`
+	CreatedAt     time.Time `json:"createdAt"`
+	LastSeen      time.Time `json:"lastSeen"`
+	Online        bool      `json:"online"`
+}
+
+// ForwardGrant authorizes a restricted source device to reach a target device
+// (or "*" for any device) on an inclusive TCP port range.
+type ForwardGrant struct {
+	SourceDevice string    `json:"sourceDevice"`
+	TargetDevice string    `json:"targetDevice"`
+	PortMin      int       `json:"portMin"`
+	PortMax      int       `json:"portMax"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+// ForwardPolicyRecord pairs one device with its policy and grant count.
+type ForwardPolicyRecord struct {
+	DeviceID      string `json:"deviceId"`
+	Name          string `json:"name"`
+	ForwardPolicy string `json:"forwardPolicy"`
+	GrantCount    int    `json:"grantCount"`
 }
 
 // User is an operator account that can log into the console.
@@ -95,6 +127,7 @@ CREATE TABLE IF NOT EXISTS devices (
 	arch       TEXT NOT NULL,
 	lan_ips    TEXT NOT NULL DEFAULT '[]',
 	group_name TEXT NOT NULL DEFAULT '',
+	forward_policy TEXT NOT NULL DEFAULT 'any',
 	created_at TEXT NOT NULL,
 	last_seen  TEXT NOT NULL,
 	online     INTEGER NOT NULL DEFAULT 0
@@ -158,6 +191,16 @@ CREATE TABLE IF NOT EXISTS connection_traffic (
 	PRIMARY KEY (connection_id, bucket_start)
 );
 CREATE INDEX IF NOT EXISTS connection_traffic_bucket_idx ON connection_traffic(bucket_start);
+
+CREATE TABLE IF NOT EXISTS forward_grants (
+	source_device TEXT NOT NULL,
+	target_device TEXT NOT NULL,
+	port_min INTEGER NOT NULL,
+	port_max INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (source_device, target_device, port_min, port_max)
+);
+CREATE INDEX IF NOT EXISTS forward_grants_source_idx ON forward_grants(source_device);
 `
 
 // Registry keeps the device catalog and access metadata in SQLite.
@@ -190,6 +233,10 @@ func NewRegistry(dataDir string) (*Registry, error) {
 		return nil, err
 	}
 	if err := r.ensureColumn("devices", "group_name", "group_name TEXT NOT NULL DEFAULT ''"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := r.ensureColumn("devices", "forward_policy", "forward_policy TEXT NOT NULL DEFAULT 'any'"); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -450,7 +497,7 @@ func (r *Registry) ListUsers() []User {
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query("SELECT id, username, role, created_at, expires_at, device_ids FROM users ORDER BY username COLLATE NOCASE")
 	if err != nil {
-		return nil
+		return []User{}
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]User, 0)
@@ -508,7 +555,9 @@ func (r *Registry) UpdateUser(username string, password *string, role *string, d
 		deviceIDs = &u.DeviceIDs
 	}
 	if expiresAt == nil {
-		*expiresAt = u.ExpiresAt
+		// Nil means "leave the expiry unchanged". Clearing it is expressed as a
+		// pointer to the zero time by the caller.
+		expiresAt = &u.ExpiresAt
 	}
 	// Keep the stored hash when the password is unchanged.
 	var storedHash string
@@ -616,11 +665,11 @@ func (r *Registry) List() []Device {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query(`
-		SELECT id, name, hostname, os, arch, lan_ips, group_name, created_at, last_seen, online
+		SELECT id, name, hostname, os, arch, lan_ips, group_name, forward_policy, created_at, last_seen, online
 		FROM devices
 		ORDER BY name COLLATE NOCASE`)
 	if err != nil {
-		return nil
+		return []Device{}
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -646,6 +695,162 @@ func (r *Registry) Rename(id, name string) error {
 // SetGroup assigns a device to a group.
 func (r *Registry) SetGroup(id, group string) error {
 	return r.updateField(id, "group_name", group)
+}
+
+// SetForwardPolicy switches a device between "any" and "restricted" forwarding.
+func (r *Registry) SetForwardPolicy(id, policy string) error {
+	if !ValidForwardPolicy(policy) {
+		return errors.New("forward policy must be 'any' or 'restricted'")
+	}
+	return r.updateField(id, "forward_policy", policy)
+}
+
+// ForwardAllowed reports whether source may reach target:port. A device with the
+// default "any" policy may reach anything; a "restricted" device needs a grant
+// whose target matches (or is "*") and whose port range covers port. An unknown
+// source fails closed.
+func (r *Registry) ForwardAllowed(source, target string, port int) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var policy string
+	if err := r.db.QueryRow("SELECT forward_policy FROM devices WHERE id = ?", source).Scan(&policy); err != nil {
+		return false
+	}
+	if policy != ForwardPolicyRestricted {
+		return true
+	}
+	var count int
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM forward_grants
+		WHERE source_device = ? AND (target_device = ? OR target_device = '*')
+		AND port_min <= ? AND port_max >= ?`, source, target, port, port).Scan(&count)
+	return err == nil && count > 0
+}
+
+// ListForwardPolicies returns every device with its policy and grant count.
+func (r *Registry) ListForwardPolicies() []ForwardPolicyRecord {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rows, err := r.db.Query(`SELECT d.id, d.name, d.forward_policy, COUNT(g.source_device)
+		FROM devices d LEFT JOIN forward_grants g ON g.source_device = d.id
+		GROUP BY d.id, d.name, d.forward_policy
+		ORDER BY d.name COLLATE NOCASE`)
+	if err != nil {
+		return []ForwardPolicyRecord{}
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]ForwardPolicyRecord, 0)
+	for rows.Next() {
+		var rec ForwardPolicyRecord
+		if err := rows.Scan(&rec.DeviceID, &rec.Name, &rec.ForwardPolicy, &rec.GrantCount); err != nil {
+			continue
+		}
+		if rec.ForwardPolicy == "" {
+			rec.ForwardPolicy = ForwardPolicyAny
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// AddForwardGrant records a grant for a restricted source device. Re-adding an
+// identical grant is a no-op. Target may be a device id or "*" for any device.
+func (r *Registry) AddForwardGrant(source, target string, portMin, portMax int) error {
+	if source == "" || target == "" {
+		return errors.New("source and target devices are required")
+	}
+	if portMin <= 0 || portMax > 65535 || portMin > portMax {
+		return fmt.Errorf("invalid port range %d-%d", portMin, portMax)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var exists int
+	if err := r.db.QueryRow("SELECT COUNT(*) FROM devices WHERE id = ?", source).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return errors.New("source device not found")
+	}
+	_, err := r.db.Exec(`INSERT INTO forward_grants (source_device, target_device, port_min, port_max, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(source_device, target_device, port_min, port_max) DO NOTHING`,
+		source, target, portMin, portMax, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// ListForwardGrants returns every grant ordered by source, target, and port.
+func (r *Registry) ListForwardGrants() []ForwardGrant {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.listForwardGrantsLocked("")
+}
+
+// ListForwardGrantsFor returns the grants that apply to one source device.
+func (r *Registry) ListForwardGrantsFor(source string) []ForwardGrant {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.listForwardGrantsLocked(source)
+}
+
+func (r *Registry) listForwardGrantsLocked(source string) []ForwardGrant {
+	query := `SELECT source_device, target_device, port_min, port_max, created_at FROM forward_grants`
+	args := []any{}
+	if source != "" {
+		query += " WHERE source_device = ?"
+		args = append(args, source)
+	}
+	query += " ORDER BY source_device, target_device, port_min, port_max"
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return []ForwardGrant{}
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]ForwardGrant, 0)
+	for rows.Next() {
+		var g ForwardGrant
+		var created string
+		if err := rows.Scan(&g.SourceDevice, &g.TargetDevice, &g.PortMin, &g.PortMax, &created); err != nil {
+			continue
+		}
+		g.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, g)
+	}
+	return out
+}
+
+// GetForwardGrant returns one exact grant.
+func (r *Registry) GetForwardGrant(source, target string, portMin, portMax int) (ForwardGrant, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var g ForwardGrant
+	var created string
+	err := r.db.QueryRow(`SELECT source_device, target_device, port_min, port_max, created_at
+		FROM forward_grants WHERE source_device = ? AND target_device = ? AND port_min = ? AND port_max = ?`,
+		source, target, portMin, portMax).
+		Scan(&g.SourceDevice, &g.TargetDevice, &g.PortMin, &g.PortMax, &created)
+	if err != nil {
+		return ForwardGrant{}, false
+	}
+	g.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	return g, true
+}
+
+// DeleteForwardGrant removes one exact grant.
+func (r *Registry) DeleteForwardGrant(source, target string, portMin, portMax int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res, err := r.db.Exec("DELETE FROM forward_grants WHERE source_device = ? AND target_device = ? AND port_min = ? AND port_max = ?",
+		source, target, portMin, portMax)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("grant not found")
+	}
+	return nil
 }
 
 func (r *Registry) updateField(id, column, value string) error {
@@ -738,7 +943,7 @@ func (r *Registry) ListDeviceKeys() []DeviceKey {
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query("SELECT device_id, name, created_at, expires_at FROM device_keys ORDER BY created_at DESC")
 	if err != nil {
-		return nil
+		return []DeviceKey{}
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]DeviceKey, 0)
@@ -841,7 +1046,7 @@ func (r *Registry) ListInvites() []Invite {
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query("SELECT code, name, expires_at, created_at FROM invite_codes ORDER BY created_at DESC")
 	if err != nil {
-		return nil
+		return []Invite{}
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]Invite, 0)
@@ -894,7 +1099,7 @@ func (r *Registry) ListAudit(limit int) []AuditEntry {
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query("SELECT id, actor, action, target, detail, created_at FROM audit_log ORDER BY id DESC LIMIT ?", limit)
 	if err != nil {
-		return nil
+		return []AuditEntry{}
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]AuditEntry, 0)
@@ -916,7 +1121,7 @@ func (r *Registry) Groups() []string {
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query("SELECT DISTINCT group_name FROM devices WHERE group_name != '' ORDER BY group_name COLLATE NOCASE")
 	if err != nil {
-		return nil
+		return []string{}
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]string, 0)
@@ -932,7 +1137,7 @@ func (r *Registry) Groups() []string {
 
 func (r *Registry) getLocked(id string) (Device, error) {
 	row := r.db.QueryRow(`
-		SELECT id, name, hostname, os, arch, lan_ips, group_name, created_at, last_seen, online
+		SELECT id, name, hostname, os, arch, lan_ips, group_name, forward_policy, created_at, last_seen, online
 		FROM devices
 		WHERE id = ?`, id)
 	return scanDevice(row)
@@ -946,13 +1151,16 @@ func scanDevice(row rowScanner) (Device, error) {
 	var d Device
 	var lanIPs, created, lastSeen string
 	var online int
-	if err := row.Scan(&d.ID, &d.Name, &d.Hostname, &d.OS, &d.Arch, &lanIPs, &d.Group, &created, &lastSeen, &online); err != nil {
+	if err := row.Scan(&d.ID, &d.Name, &d.Hostname, &d.OS, &d.Arch, &lanIPs, &d.Group, &d.ForwardPolicy, &created, &lastSeen, &online); err != nil {
 		return Device{}, err
 	}
 	_ = json.Unmarshal([]byte(lanIPs), &d.LANIPs)
 	d.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	d.LastSeen, _ = time.Parse(time.RFC3339Nano, lastSeen)
 	d.Online = online == 1
+	if d.ForwardPolicy == "" {
+		d.ForwardPolicy = ForwardPolicyAny
+	}
 	return d, nil
 }
 

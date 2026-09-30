@@ -10,6 +10,69 @@ import (
 
 const directAttemptTimeout = 5 * time.Second
 
+// forwardSession fields are guarded by Server.sessionsMu. These accessors keep
+// every read and write behind the lock so the timer callback and the message
+// routing path cannot race with each other.
+
+// isRelay reports whether the session is currently carried by the server relay.
+func (s *forwardSession) isRelay() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transport == "relay"
+}
+
+// markDirect promotes the session to a direct path and cancels the fallback
+// timer. It reports whether this call performed the transition.
+func (s *forwardSession) markDirect() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.direct {
+		return false
+	}
+	s.direct = true
+	s.transport = "direct"
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	return true
+}
+
+// markRelay switches the session to the server relay if no direct path has been
+// established yet, and returns the traffic recorder to flush.
+func (s *forwardSession) markRelay() (*trafficRecorder, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.direct || s.timer == nil {
+		return nil, false
+	}
+	s.timer = nil
+	s.transport = "relay"
+	return s.traffic, true
+}
+
+// setTimer arms the direct-attempt fallback timer.
+func (s *forwardSession) setTimer(timer *time.Timer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.timer != nil {
+		s.timer.Stop()
+	}
+	s.timer = timer
+}
+
+// stopTimer cancels the fallback timer and returns any traffic recorder so the
+// caller can close it without holding the session lock.
+func (s *forwardSession) stopTimer() *trafficRecorder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	return s.traffic
+}
+
 func (s *Server) handleForwardConnect(sourceID string, msg protocol.Message) {
 	if msg.Target == "" || msg.Port <= 0 || msg.SessionID == "" {
 		_ = s.sendForwardError(sourceID, msg.SessionID, "invalid forward request")
@@ -19,6 +82,15 @@ func (s *Server) handleForwardConnect(sourceID string, msg protocol.Message) {
 	target := s.getAgent(msg.Target)
 	if source == nil || target == nil {
 		_ = s.sendForwardError(sourceID, msg.SessionID, "target device offline")
+		return
+	}
+	// Authorize before anything is offered to the target: a denied request must
+	// not start a session, reach the peer, or consume a connection metric. The
+	// audit is written first so it is durable even if the source has gone away.
+	if !s.reg.ForwardAllowed(sourceID, msg.Target, msg.Port) {
+		_ = s.reg.RecordAudit(sourceID, "forward.denied", msg.Target, fmt.Sprintf("%s:%d", msg.Target, msg.Port))
+		_ = s.sendForwardError(sourceID, msg.SessionID,
+			fmt.Sprintf("forward denied: %s is not permitted to reach %s:%d", sourceID, msg.Target, msg.Port))
 		return
 	}
 
@@ -37,23 +109,31 @@ func (s *Server) handleForwardConnect(sourceID string, msg protocol.Message) {
 	_ = s.reg.RecordAudit(sourceID, "forward.connect", msg.Target, strconv.Itoa(msg.Port))
 
 	// Give WebRTC ICE time to establish a direct connection. If it does not
-	// succeed in time, fall back to relaying through the server.
-	sess.timer = time.AfterFunc(directAttemptTimeout, func() {
-		s.sessionsMu.Lock()
-		current := s.forwards[msg.SessionID]
-		if current == nil || current.direct || current.timer == nil {
-			s.sessionsMu.Unlock()
+	// succeed in time, fall back to relaying through the server. The timer is
+	// published through setTimer, so the callback never reads a field the
+	// connect path is still writing.
+	sess.setTimer(time.AfterFunc(directAttemptTimeout, func() {
+		current := s.getForward(msg.SessionID)
+		if current == nil || current != sess {
 			return
 		}
-		current.timer = nil
-		current.transport = "relay"
-		s.sessionsMu.Unlock()
-		if current.traffic != nil {
-			_ = current.traffic.registry.SetConnectionTransport(current.traffic.id, "relay")
+		traffic, ok := sess.markRelay()
+		if !ok {
+			return
+		}
+		if traffic != nil {
+			_ = traffic.registry.SetConnectionTransport(traffic.id, "relay")
 		}
 		_ = s.reg.RecordAudit(sourceID, "forward.relay", msg.Target, msg.SessionID)
 		s.startRelayFallback(msg)
-	})
+	}))
+}
+
+// getForward returns the forward session for a browser session id, or nil.
+func (s *Server) getForward(sessionID string) *forwardSession {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	return s.forwards[sessionID]
 }
 
 func (s *Server) startRelayFallback(msg protocol.Message) {
@@ -72,28 +152,19 @@ func (s *Server) startRelayFallback(msg protocol.Message) {
 }
 
 func (s *Server) handleDirectOK(deviceID string, msg protocol.Message) {
-	s.sessionsMu.Lock()
-	sess := s.forwards[msg.SessionID]
-	transitioned := sess != nil && !sess.direct
-	if transitioned {
-		sess.direct = true
-		sess.transport = "direct"
-		if sess.timer != nil {
-			sess.timer.Stop()
-			sess.timer = nil
-		}
+	sess := s.getForward(msg.SessionID)
+	var traffic *trafficRecorder
+	if sess != nil && sess.markDirect() {
+		traffic = sess.traffic
 	}
-	s.sessionsMu.Unlock()
-	if transitioned && sess.traffic != nil {
-		_ = sess.traffic.registry.SetConnectionTransport(sess.traffic.id, "direct")
+	if traffic != nil {
+		_ = traffic.registry.SetConnectionTransport(traffic.id, "direct")
 	}
 	_ = s.reg.RecordAudit(deviceID, "forward.direct", msg.SessionID, "")
 }
 
 func (s *Server) relayForward(fromID string, msg protocol.Message) {
-	s.sessionsMu.RLock()
-	sess := s.forwards[msg.SessionID]
-	s.sessionsMu.RUnlock()
+	sess := s.getForward(msg.SessionID)
 	if sess == nil {
 		return
 	}
@@ -111,7 +182,7 @@ func (s *Server) relayForward(fromID string, msg protocol.Message) {
 		s.closeForward(msg.SessionID, "interrupted")
 		return
 	}
-	if msg.Type == protocol.TypeForwardData && sess.transport == "relay" {
+	if msg.Type == protocol.TypeForwardData && sess.isRelay() {
 		if raw, err := protocol.DecodeData(msg.Data); err == nil {
 			if fromID == sess.source {
 				sess.traffic.Add(int64(len(raw)), 0)
@@ -151,10 +222,9 @@ func (s *Server) closeForward(sessionID, state string) {
 	delete(s.forwards, sessionID)
 	s.sessionsMu.Unlock()
 	if sess != nil {
-		if sess.timer != nil {
-			sess.timer.Stop()
+		if traffic := sess.stopTimer(); traffic != nil {
+			traffic.Close(state)
 		}
-		sess.traffic.Close(state)
 	}
 }
 

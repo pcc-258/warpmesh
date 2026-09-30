@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,8 +54,9 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Name  string `json:"name"`
-			Group string `json:"group"`
+			Name          string `json:"name"`
+			Group         string `json:"group"`
+			ForwardPolicy string `json:"forwardPolicy"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -74,6 +76,17 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = s.reg.RecordAudit(actor, "device.group", id, req.Group)
 		}
+		if req.ForwardPolicy != "" {
+			if !ValidForwardPolicy(req.ForwardPolicy) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "forwardPolicy must be 'any' or 'restricted'"})
+				return
+			}
+			if err := s.reg.SetForwardPolicy(id, req.ForwardPolicy); err != nil {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+				return
+			}
+			_ = s.reg.RecordAudit(actor, "device.forward-policy", id, req.ForwardPolicy)
+		}
 		d, _ := s.reg.Get(id)
 		writeJSON(w, http.StatusOK, d)
 	case http.MethodDelete:
@@ -90,6 +103,110 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// forwardGrantRequest is the payload for creating or deleting a forward grant.
+// The DELETE form may pass the same fields as query parameters so callers that
+// cannot send a request body still address one exact grant.
+type forwardGrantRequest struct {
+	SourceDevice string `json:"sourceDevice"`
+	TargetDevice string `json:"targetDevice"`
+	PortMin      int    `json:"portMin"`
+	PortMax      int    `json:"portMax"`
+}
+
+func (g forwardGrantRequest) valid() bool {
+	return g.SourceDevice != "" && g.TargetDevice != "" && g.PortMin > 0 && g.PortMax > 0
+}
+
+func (g forwardGrantRequest) detail() string {
+	return fmt.Sprintf("%s:%d-%d", g.TargetDevice, g.PortMin, g.PortMax)
+}
+
+// handleForwardPolicy reports every device with its forwarding policy and the
+// number of grants that apply to it.
+func (s *Server) handleForwardPolicy(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.authenticate(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.reg.ListForwardPolicies())
+}
+
+// handleForwardGrants manages the grants that restricted devices rely on.
+func (s *Server) handleForwardGrants(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.authenticate(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if !s.isAdmin(actor) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if source := r.URL.Query().Get("sourceDevice"); source != "" {
+			writeJSON(w, http.StatusOK, s.reg.ListForwardGrantsFor(source))
+			return
+		}
+		writeJSON(w, http.StatusOK, s.reg.ListForwardGrants())
+	case http.MethodPost:
+		var req forwardGrantRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.reg.AddForwardGrant(req.SourceDevice, req.TargetDevice, req.PortMin, req.PortMax); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		_ = s.reg.RecordAudit(actor, "forward-grant.create", req.SourceDevice, req.detail())
+		grant, _ := s.reg.GetForwardGrant(req.SourceDevice, req.TargetDevice, req.PortMin, req.PortMax)
+		writeJSON(w, http.StatusCreated, grant)
+	case http.MethodDelete:
+		req, ok := forwardGrantTarget(r)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "sourceDevice, targetDevice, portMin and portMax are required"})
+			return
+		}
+		if err := s.reg.DeleteForwardGrant(req.SourceDevice, req.TargetDevice, req.PortMin, req.PortMax); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+			return
+		}
+		_ = s.reg.RecordAudit(actor, "forward-grant.delete", req.SourceDevice, req.detail())
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// forwardGrantTarget reads one grant identity from the query string, falling
+// back to a JSON body.
+func forwardGrantTarget(r *http.Request) (forwardGrantRequest, bool) {
+	query := r.URL.Query()
+	req := forwardGrantRequest{
+		SourceDevice: query.Get("sourceDevice"),
+		TargetDevice: query.Get("targetDevice"),
+	}
+	req.PortMin, _ = strconv.Atoi(query.Get("portMin"))
+	req.PortMax, _ = strconv.Atoi(query.Get("portMax"))
+	if req.valid() {
+		return req, true
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.valid() {
+		return req, false
+	}
+	return req, true
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -177,13 +294,24 @@ func (s *Server) handleDeviceKeyByID(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/device-keys/")
-	if id == "" || strings.Contains(id, "/") {
+	// The console addresses a specific key, and rotation appends a sub-path:
+	// /api/device-keys/{id} and /api/device-keys/{id}/rotate.
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/device-keys/"), "/")
+	segments := strings.Split(rest, "/")
+	id := segments[0]
+	if id == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device id"})
 		return
 	}
-	if r.Method == http.MethodPost && strings.HasSuffix(id, "/rotate") {
-		id = strings.TrimSuffix(id, "/rotate")
+	if len(segments) > 1 {
+		if len(segments) != 2 || segments[1] != "rotate" {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown device key operation"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "rotate requires POST"})
+			return
+		}
 		key, err := s.reg.RotateDeviceKey(id, s.cfg.KeyTTL)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
@@ -194,7 +322,7 @@ func (s *Server) handleDeviceKeyByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodDelete {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
 	if err := s.reg.RevokeDeviceKey(id); err != nil {
