@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -12,7 +13,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +41,8 @@ type agentConn struct {
 	directPort int
 	ws         *websocket.Conn
 	writeMu    sync.Mutex
+	lastSyncMu sync.Mutex
+	lastSync   time.Time
 }
 
 type termSession struct {
@@ -60,14 +66,29 @@ type fileSession struct {
 	browser  *websocket.Conn
 	op       string
 	traffic  *trafficRecorder
+	writeMu  sync.Mutex
+}
+
+func (s *fileSession) write(msg any) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.browser.WriteJSON(msg)
 }
 
 type managerSession struct {
 	deviceID string
 	browser  *websocket.Conn
+	writeMu  sync.Mutex
+}
+
+func (s *managerSession) write(msg any) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.browser.WriteJSON(msg)
 }
 
 type forwardSession struct {
+	mu        sync.Mutex
 	source    string
 	target    string
 	direct    bool
@@ -110,6 +131,12 @@ type loginAttempt struct {
 const (
 	maxLoginAttempts = 5
 	loginLockoutTime = time.Minute
+
+	// Browser keepalive. The pong wait is intentionally generous: a page busy
+	// uploading or decoding desktop frames may be slow to answer a ping, and a
+	// short deadline would evict healthy sessions.
+	browserPingPeriod = 45 * time.Second
+	browserPongWait   = 3 * time.Minute
 )
 
 // Server is the relay control plane.
@@ -128,10 +155,18 @@ type Server struct {
 	sessions      map[string]sessionEntry
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
+	tickets       *ticketStore
+	stop          chan struct{}
+	stopOnce      sync.Once
 }
 
 // NewServer creates a relay server with the embedded web UI.
 func NewServer(cfg Config) (*Server, error) {
+	// Fail closed on a missing admin token. An empty token would compare equal
+	// to an empty request credential, turning every endpoint into an open door.
+	if strings.TrimSpace(cfg.AdminToken) == "" {
+		return nil, errors.New("admin token must not be empty")
+	}
 	reg, err := NewRegistry(cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -141,7 +176,7 @@ func NewServer(cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
-	return &Server{
+	s := &Server{
 		cfg: cfg,
 		reg: reg,
 		upgrader: websocket.Upgrader{
@@ -155,7 +190,55 @@ func NewServer(cfg Config) (*Server, error) {
 		screens:       make(map[string]*screenSession),
 		sessions:      make(map[string]sessionEntry),
 		loginAttempts: make(map[string]loginAttempt),
-	}, nil
+		tickets:       newTicketStore(),
+		stop:          make(chan struct{}),
+	}
+	s.startJanitor()
+	return s, nil
+}
+
+// sweepInterval is how often expired sessions and stale login attempts are
+// reaped. Without it both maps grow for the lifetime of the process.
+const sweepInterval = 10 * time.Minute
+
+// sweepAuthState drops expired sessions and expired login-lockout entries.
+func (s *Server) sweepAuthState() {
+	now := time.Now()
+	s.sessionsMu.Lock()
+	for token, entry := range s.sessions {
+		if now.After(entry.expiresAt) {
+			delete(s.sessions, token)
+		}
+	}
+	s.sessionsMu.Unlock()
+
+	s.loginMu.Lock()
+	for key, attempt := range s.loginAttempts {
+		if attempt.count >= maxLoginAttempts && now.After(attempt.until) {
+			delete(s.loginAttempts, key)
+		}
+	}
+	s.loginMu.Unlock()
+
+	// Tickets are normally removed on first use; this catches the ones that were
+	// issued and never presented.
+	s.tickets.sweep()
+}
+
+// startJanitor reaps expired in-memory auth state until the server is closed.
+func (s *Server) startJanitor() {
+	safeGo("auth state janitor", func() {
+		ticker := time.NewTicker(sweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.sweepAuthState()
+			case <-s.stop:
+				return
+			}
+		}
+	})
 }
 
 // Handler returns the full HTTP handler used by tests and single-listener
@@ -187,6 +270,9 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/users/", s.handleUserByUsername)
 	mux.HandleFunc("/api/audit", s.handleAudit)
 	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
+	mux.HandleFunc("/api/ws-ticket", s.handleWSTicket)
+	mux.HandleFunc("/api/forward-policy", s.handleForwardPolicy)
+	mux.HandleFunc("/api/forward-grants", s.handleForwardGrants)
 	if includeAgent {
 		mux.HandleFunc("/ws/agent", s.handleAgentWS)
 	}
@@ -198,7 +284,7 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 		mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
 	}
 	mux.HandleFunc("/", s.handleStatic)
-	return mux
+	return s.withRequestLog(mux)
 }
 
 // AgentHandler serves only the agent-facing data plane.
@@ -208,11 +294,12 @@ func (s *Server) AgentHandler() http.Handler {
 	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
 	mux.HandleFunc("/ws/agent", s.handleAgentWS)
 	mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
-	return mux
+	return s.withRequestLog(mux)
 }
 
 // Close releases server-owned resources.
 func (s *Server) Close() error {
+	s.stopOnce.Do(func() { close(s.stop) })
 	return s.reg.Close()
 }
 
@@ -253,9 +340,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request"})
 		return
 	}
+	if !checkCSRF(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "cross-origin request rejected"})
+		return
+	}
 	key := req.Username + "|" + clientIP(r)
 	if !s.allowLoginAttempt(key) {
 		_ = s.reg.RecordAudit(req.Username, "login.locked", req.Username, "too many failures")
+		s.logEvent("auth.login.locked", "user", req.Username, "ip", clientIP(r))
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many login attempts, try again later"})
 		return
 	}
@@ -263,6 +355,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.recordLoginFailure(key)
 		_ = s.reg.RecordAudit(req.Username, "login.failed", req.Username, "bad credentials")
+		// Also put it on the process log: an operator watching journald should
+		// not have to query the audit table to notice a brute-force run.
+		s.logEvent("auth.login.failed", "user", req.Username, "ip", clientIP(r), "reason", "bad-credentials")
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid credentials"})
 		return
 	}
@@ -275,6 +370,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.sessionsMu.Lock()
 	s.sessions[token] = sessionEntry{username: user.Username, expiresAt: time.Now().Add(24 * time.Hour)}
 	s.sessionsMu.Unlock()
+	// The cookie is the primary credential; the JSON token is still returned
+	// for CLI clients that authenticate with a header.
+	setSessionCookie(w, r, token)
 	_ = s.reg.RecordAudit(user.Username, "login.ok", user.Username, "")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":    token,
@@ -298,6 +396,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if username != "" {
 		_ = s.reg.RecordAudit(username, "logout", username, "")
 	}
+	clearSessionCookie(w, r)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -337,6 +436,11 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) validAdmin(token string) bool {
+	// Guard the empty-config case explicitly: ConstantTimeCompare reports two
+	// empty slices as equal, which would authenticate an empty credential.
+	if token == "" || s.cfg.AdminToken == "" {
+		return false
+	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) == 1
 }
 
@@ -353,10 +457,14 @@ func bearerToken(r *http.Request) string {
 }
 
 func (s *Server) authenticate(r *http.Request) (string, bool) {
-	token := r.URL.Query().Get("token")
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		token = strings.TrimPrefix(auth, "Bearer ")
+	// Cookie-based sessions are sent automatically by the browser, so a
+	// state-changing request carrying one must be same-origin. Enforcing it in
+	// the single authentication chokepoint means a new endpoint cannot forget
+	// it. Header/query callers (CLI, tests) send no cookie and are unaffected.
+	if !checkCSRF(r) {
+		return "", false
 	}
+	token := requestToken(r)
 	if s.validAdmin(token) {
 		return "admin-token", true
 	}
@@ -375,13 +483,21 @@ func (s *Server) validSession(token string) (string, bool) {
 		}
 		return "", false
 	}
-	if user, err := s.reg.GetUser(entry.username); err == nil {
-		if !user.ExpiresAt.IsZero() && time.Now().After(user.ExpiresAt) {
-			s.sessionsMu.Lock()
-			delete(s.sessions, token)
-			s.sessionsMu.Unlock()
-			return "", false
-		}
+	user, err := s.reg.GetUser(entry.username)
+	if err != nil {
+		// The account no longer exists (deleted or renamed): the session must
+		// not survive it. Previously this fell through and stayed valid until
+		// its 24h expiry.
+		s.sessionsMu.Lock()
+		delete(s.sessions, token)
+		s.sessionsMu.Unlock()
+		return "", false
+	}
+	if !user.ExpiresAt.IsZero() && time.Now().After(user.ExpiresAt) {
+		s.sessionsMu.Lock()
+		delete(s.sessions, token)
+		s.sessionsMu.Unlock()
+		return "", false
 	}
 	return entry.username, true
 }
@@ -462,21 +578,128 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// logf writes one relay event. The destination is swappable so tests can
+// capture the log instead of the process stderr.
 func (s *Server) logf(format string, args ...any) {
+	// All relay logging goes to the standard logger, which already writes to
+	// stderr; a request-log test swaps it for a buffer via log.SetOutput.
 	log.Printf("[relay] "+format, args...)
 }
 
-func (s *Server) removeAgent(id string) {
+// bind renders a compact structured event: logBind("session.start", "actor", a, "device", d).
+//
+// The relay emits key=value pairs so a line can be read by a human and still
+// be grepped or parsed without a logging pipeline: it has no external
+// dependency, and systemd's journal already stamps time and unit.
+func bind(kv ...any) string {
+	var b strings.Builder
+	for i := 0; i+1 < len(kv); i += 2 {
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		key := fmt.Sprint(kv[i])
+		b.WriteString(key)
+		b.WriteByte('=')
+		b.WriteString(formatValue(kv[i+1]))
+	}
+	return b.String()
+}
+
+// formatValue quotes values containing spaces so a field stays one token.
+func formatValue(v any) string {
+	s := fmt.Sprint(v)
+	if s == "" {
+		return "-"
+	}
+	if strings.ContainsAny(s, " \"=") {
+		return strconv.Quote(s)
+	}
+	return s
+}
+
+func (s *Server) logEvent(event string, kv ...any) {
+	if len(kv) == 0 {
+		s.logf("%s", event)
+		return
+	}
+	s.logf("%s %s", event, bind(kv...))
+}
+
+// debugRTC enables the per-candidate ICE diagnostics. They are invaluable when
+// a direct connection fails to establish and pure noise otherwise, so they are
+// opt-in via DEVICE_RELAY_DEBUG_RTC=1.
+var debugRTC = os.Getenv("DEVICE_RELAY_DEBUG_RTC") == "1"
+
+// logDebug records a diagnostic event only when debugging is enabled.
+func (s *Server) logDebug(event string, kv ...any) {
+	if !debugRTC {
+		return
+	}
+	s.logEvent("debug."+event, kv...)
+}
+
+// safeGo runs fn in its own goroutine and converts a panic into a logged error.
+// Anything spawned alongside an HTTP handler lives outside net/http's own panic
+// recovery, so without this a single bad frame could take down the relay and
+// disconnect every device.
+func safeGo(what string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[relay] panic in %s: %v\n%s", what, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
+
+// removeAgent drops the registry entry for a device only if it still points at
+// the connection that is shutting down. A reconnect replaces the entry before
+// the old handler unwinds, so an unconditional delete would evict the fresh,
+// healthy connection and mark the device offline.
+func (s *Server) removeAgent(id string, conn *agentConn) bool {
 	s.agentsMu.Lock()
+	current, ok := s.agents[id]
+	if !ok || current != conn {
+		s.agentsMu.Unlock()
+		return false
+	}
 	delete(s.agents, id)
 	s.agentsMu.Unlock()
 	_ = s.reg.SetOnline(id, false)
+	return true
 }
 
 func (s *Server) getAgent(id string) *agentConn {
 	s.agentsMu.RLock()
 	defer s.agentsMu.RUnlock()
 	return s.agents[id]
+}
+
+// agentOnlineSyncInterval throttles the last_seen write. Terminal and desktop
+// output produce thousands of inbound frames per second; writing on every one
+// would serialize the whole control plane behind SQLite.
+const agentOnlineSyncInterval = 10 * time.Second
+
+// touchAgent refreshes a device's liveness without issuing a database write on
+// every inbound frame.
+func (s *Server) touchAgent(id string) {
+	conn := s.getAgent(id)
+	if conn == nil {
+		return
+	}
+	conn.lastSyncMu.Lock()
+	due := time.Since(conn.lastSync) >= agentOnlineSyncInterval
+	if due {
+		conn.lastSync = time.Now()
+	}
+	conn.lastSyncMu.Unlock()
+	if !due {
+		return
+	}
+	if err := s.reg.SetOnline(id, true); err != nil {
+		s.logf("update last seen for %s: %v", id, err)
+	}
 }
 
 func (a *agentConn) write(v any) error {

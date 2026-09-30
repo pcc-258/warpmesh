@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -10,20 +11,11 @@ import (
 )
 
 func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
-	actor, ok := s.authenticate(r)
+	actor, ok := s.authorizeWS(w, r, "desktop")
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
 	deviceID := r.URL.Query().Get("device")
-	if deviceID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device"})
-		return
-	}
-	if !s.canAccessDevice(actor, deviceID) {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "device not granted"})
-		return
-	}
 	agent := s.getAgent(deviceID)
 	if agent == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})
@@ -59,6 +51,8 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 	s.sessionsMu.Lock()
 	s.screens[sessionID] = sess
 	s.sessionsMu.Unlock()
+	hardenBrowserConn(ws)
+	pingBrowserConn(ws, &sess.writeMu)
 	defer func() {
 		s.sessionsMu.Lock()
 		delete(s.screens, sessionID)
@@ -68,6 +62,22 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	_ = s.reg.RecordAudit(actor, "screen.start", deviceID, "")
+	s.logEvent("session.start", "kind", "desktop", "session", sessionID, "actor", actor, "device", deviceID, "ip", clientIP(r))
+	startedAt := time.Now()
+	defer func() {
+		s.sessionsMu.RLock()
+		path := sess.transport
+		s.sessionsMu.RUnlock()
+		s.logEvent("session.end",
+			"kind", "desktop",
+			"session", sessionID,
+			"actor", actor,
+			"device", deviceID,
+			"path", path,
+			"state", endState,
+			"dur", time.Since(startedAt).Round(time.Millisecond).String(),
+		)
+	}()
 	for {
 		var msg protocol.Message
 		if err := ws.ReadJSON(&msg); err != nil {
@@ -75,7 +85,7 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 		}
 		switch msg.Type {
 		case protocol.TypeRTCOffer, protocol.TypeRTCICE:
-			s.logf("browser rtc %s session=%s service=desktop", msg.Type, sessionID)
+			s.logDebug("rtc.signal", "direction", "browser", "type", msg.Type, "session", sessionID, "service", "desktop")
 			s.sessionsMu.RLock()
 			fallback := sess.transport == "relay"
 			s.sessionsMu.RUnlock()
@@ -94,7 +104,7 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case protocol.TypeRTCFallback:
-			s.logf("browser rtc fallback session=%s service=desktop", sessionID)
+			s.logDebug("rtc.fallback", "session", sessionID, "service", "desktop")
 			s.sessionsMu.Lock()
 			alreadyRelay := sess.transport == "relay"
 			sess.transport = "relay"
@@ -150,6 +160,8 @@ func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = ws.Close() }()
+	// Bound the RFB frames the agent data plane may send us.
+	ws.SetReadLimit(maxRelayMessageBytes)
 
 	s.sessionsMu.Lock()
 	sess := s.screens[sessionID]
@@ -170,6 +182,14 @@ func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func relayScreen(a, b *websocket.Conn, traffic *trafficRecorder) {
+	// Closing both sockets as soon as either direction ends prevents a
+	// half-closed peer from leaving this handler and both copy goroutines
+	// blocked forever.
+	var once sync.Once
+	shutdown := func() {
+		_ = a.Close()
+		_ = b.Close()
+	}
 	done := make(chan struct{}, 2)
 	copyOne := func(src, dst *websocket.Conn, fromBrowser bool) {
 		for {
@@ -186,14 +206,13 @@ func relayScreen(a, b *websocket.Conn, traffic *trafficRecorder) {
 				traffic.Add(0, int64(len(data)))
 			}
 		}
+		once.Do(shutdown)
 		done <- struct{}{}
 	}
-	go copyOne(a, b, true)
-	go copyOne(b, a, false)
+	safeGo("screen relay a->b", func() { copyOne(a, b, true) })
+	safeGo("screen relay b->a", func() { copyOne(b, a, false) })
 	<-done
 	<-done
-	_ = a.Close()
-	_ = b.Close()
 }
 
 // closeAgentScreens terminates desktop sessions when an agent goes offline.

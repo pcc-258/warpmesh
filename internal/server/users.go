@@ -70,17 +70,34 @@ func (s *Server) handleUserByUsername(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, user)
 	case http.MethodPatch:
+		// expiresAt is decoded via json.RawMessage so that an explicit null
+		// ("clear the expiry") is distinguishable from an omitted field
+		// ("leave it alone"). Collapsing the two into a nil pointer previously
+		// crashed the handler on a nil dereference.
 		var req struct {
-			Password  *string    `json:"password"`
-			Role      *string    `json:"role"`
-			DeviceIDs *[]string  `json:"deviceIds"`
-			ExpiresAt *time.Time `json:"expiresAt"`
+			Password  *string         `json:"password"`
+			Role      *string         `json:"role"`
+			DeviceIDs *[]string       `json:"deviceIds"`
+			ExpiresAt json.RawMessage `json:"expiresAt"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		if err := s.reg.UpdateUser(username, req.Password, req.Role, req.DeviceIDs, req.ExpiresAt); err != nil {
+		var expiresAt *time.Time
+		if len(req.ExpiresAt) > 0 {
+			if string(req.ExpiresAt) == "null" {
+				expiresAt = &time.Time{}
+			} else {
+				var parsed time.Time
+				if err := json.Unmarshal(req.ExpiresAt, &parsed); err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"error": "expiresAt must be an RFC3339 timestamp or null"})
+					return
+				}
+				expiresAt = &parsed
+			}
+		}
+		if err := s.reg.UpdateUser(username, req.Password, req.Role, req.DeviceIDs, expiresAt); err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
 			return
 		}

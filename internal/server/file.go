@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -11,19 +12,14 @@ import (
 )
 
 func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
-	actor, ok := s.authenticate(r)
+	actor, ok := s.authorizeWS(w, r, "files")
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
 	deviceID := r.URL.Query().Get("device")
 	op := r.URL.Query().Get("op")
-	if deviceID == "" || (op != "upload" && op != "download") {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device and op (upload|download) are required"})
-		return
-	}
-	if !s.canAccessDevice(actor, deviceID) {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "device not granted"})
+	if op != "upload" && op != "download" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "op (upload|download) is required"})
 		return
 	}
 	agent := s.getAgent(deviceID)
@@ -48,29 +44,55 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 	}
 	endState := "closed"
 	defer func() { traffic.Close(endState) }()
+	session := &fileSession{deviceID: deviceID, browser: ws, op: op, traffic: traffic}
 	s.sessionsMu.Lock()
-	s.files[sessionID] = &fileSession{deviceID: deviceID, browser: ws, op: op, traffic: traffic}
+	s.files[sessionID] = session
 	s.sessionsMu.Unlock()
+	hardenBrowserConn(ws)
+	pingBrowserConn(ws, &session.writeMu)
+	startedAt := time.Now()
+	s.logEvent("session.start", "kind", "file:"+op, "session", sessionID, "actor", actor, "device", deviceID, "ip", clientIP(r))
 	defer func() {
 		s.sessionsMu.Lock()
 		delete(s.files, sessionID)
 		s.sessionsMu.Unlock()
+		s.logEvent("session.end",
+			"kind", "file:"+op,
+			"session", sessionID,
+			"actor", actor,
+			"device", deviceID,
+			"state", endState,
+			"dur", time.Since(startedAt).Round(time.Millisecond).String(),
+		)
 	}()
 
+	// Validate before the session is registered: once it is reachable through
+	// s.files, the agent router may write to this socket too, and concurrent
+	// writes on one websocket are not allowed.
+	name := sanitizeName(r.URL.Query().Get("name"))
+	path := r.URL.Query().Get("path")
 	switch op {
 	case "upload":
-		name := sanitizeName(r.URL.Query().Get("name"))
 		if name == "" {
 			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing file name"})
 			return
 		}
+	case "download":
+		if path == "" {
+			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing path"})
+			return
+		}
+	}
+
+	switch op {
+	case "upload":
 		_ = s.reg.RecordAudit(actor, "file.upload", deviceID, name)
 		if err := agent.write(protocol.Message{
 			Type:      protocol.TypeFileUpload,
 			SessionID: sessionID,
 			Name:      name,
 			Size:      queryInt64(r, "size", 0),
-			Path:      r.URL.Query().Get("path"),
+			Path:      path,
 		}); err != nil {
 			return
 		}
@@ -106,11 +128,6 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 			traffic.Add(int64(len(raw)), 0)
 		}
 	case "download":
-		path := r.URL.Query().Get("path")
-		if path == "" {
-			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing path"})
-			return
-		}
 		_ = s.reg.RecordAudit(actor, "file.download", deviceID, path)
 		if err := agent.write(protocol.Message{
 			Type:      protocol.TypeFileDownload,

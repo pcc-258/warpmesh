@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,12 +16,52 @@ const (
 	agentPingPeriod = 30 * time.Second
 )
 
+// maxRelayMessageBytes bounds a single WebSocket frame. File chunks are the
+// largest legitimate payload, so 4 MiB leaves generous headroom while denying
+// an unbounded allocation to any peer. Comparable projects settle in the same
+// range (Coder uses 4 MiB; chisel caps pre-auth frames at 512 KiB).
+const maxRelayMessageBytes = 4 << 20
+
+// hardenBrowserConn applies the read limit and keepalive policy shared by every
+// browser-facing WebSocket.
+//
+// The protocol-level deadline is deliberately much longer than the ping period:
+// browsers answer pings with pongs, but a busy page (for example one uploading a
+// file) may not deliver a pong for a while, and a short deadline would evict
+// healthy sessions.
+func hardenBrowserConn(ws *websocket.Conn) {
+	ws.SetReadLimit(maxRelayMessageBytes)
+	_ = ws.SetReadDeadline(time.Now().Add(browserPongWait))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(browserPongWait))
+	})
+}
+
+// pingBrowserConn keeps a browser WebSocket warm and lets the read deadline
+// reap a connection whose peer vanished without a close handshake. It stops
+// with the connection and never blocks shutdown.
+func pingBrowserConn(ws *websocket.Conn, writeMu *sync.Mutex) {
+	go func() {
+		ticker := time.NewTicker(browserPingPeriod)
+		defer ticker.Stop()
+		for range ticker.C {
+			writeMu.Lock()
+			err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+			writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+}
+
 func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer func() { _ = ws.Close() }()
+	ws.SetReadLimit(maxRelayMessageBytes)
 
 	// The first message must carry device identity so the server can check
 	// the per-device credential instead of trusting a shared token alone.
@@ -36,6 +77,11 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeAgent(hello.DeviceID, token) {
 		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, Error: "invalid device credential"})
 		_ = s.reg.RecordAudit(hello.DeviceID, "agent.auth-failed", hello.DeviceID, "invalid device credential")
+		ip := ""
+		if host, _, err := net.SplitHostPort(ws.RemoteAddr().String()); err == nil {
+			ip = host
+		}
+		s.logEvent("auth.agent.failed", "device", hello.DeviceID, "ip", ip)
 		return
 	}
 
@@ -48,7 +94,9 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.reg.RecordAudit(hello.DeviceID, "agent.online", hello.DeviceID, hello.OS+"/"+hello.Arch)
 
-	conn := &agentConn{deviceID: hello.DeviceID, ws: ws, directPort: hello.DirectPort}
+	// The registry is already online from the hello upsert above, so the first
+	// throttled refresh is only due after agentOnlineSyncInterval.
+	conn := &agentConn{deviceID: hello.DeviceID, ws: ws, directPort: hello.DirectPort, lastSync: time.Now()}
 	if host, _, err := net.SplitHostPort(ws.RemoteAddr().String()); err == nil {
 		conn.publicIP = host
 	}
@@ -91,15 +139,29 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		if err := ws.ReadJSON(&msg); err != nil {
 			break
 		}
-		_ = s.reg.SetOnline(hello.DeviceID, true)
+		// Refresh the liveness deadline on every inbound frame, not only on
+		// pongs: a device streaming heavy terminal or file output is alive.
+		_ = ws.SetReadDeadline(time.Now().Add(agentPongWait))
+		// Stop as soon as a newer connection for this device has taken over, so
+		// the replaced connection cannot keep writing state on its behalf.
+		if s.getAgent(hello.DeviceID) != conn {
+			s.logf("agent connection replaced mid-stream: %s", hello.DeviceID)
+			break
+		}
+		s.touchAgent(hello.DeviceID)
 		s.routeAgentMessage(hello.DeviceID, msg)
 	}
 	close(done)
-	s.removeAgent(hello.DeviceID)
-	s.closeAgentForwards(hello.DeviceID)
-	s.closeAgentScreens(hello.DeviceID)
-	_ = s.reg.RecordAudit(hello.DeviceID, "agent.offline", hello.DeviceID, "")
-	s.logf("agent offline: %s", hello.DeviceID)
+	if s.removeAgent(hello.DeviceID, conn) {
+		// Only the connection that is actually current may tear down its live
+		// sessions; a replaced connection must leave the new one untouched.
+		s.closeAgentForwards(hello.DeviceID)
+		s.closeAgentScreens(hello.DeviceID)
+		_ = s.reg.RecordAudit(hello.DeviceID, "agent.offline", hello.DeviceID, "")
+		s.logf("agent offline: %s", hello.DeviceID)
+		return
+	}
+	s.logf("agent connection replaced, keeping the newer one: %s", hello.DeviceID)
 }
 
 func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
@@ -146,7 +208,7 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 			manager := s.managers[msg.SessionID]
 			s.sessionsMu.RUnlock()
 			if manager != nil && manager.deviceID == deviceID {
-				_ = manager.browser.WriteJSON(msg)
+				_ = manager.write(msg)
 				if msg.Type == protocol.TypeFileDone || msg.Type == protocol.TypeFileError {
 					s.sessionsMu.Lock()
 					delete(s.managers, msg.SessionID)
@@ -185,7 +247,7 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 		manager := s.managers[msg.SessionID]
 		s.sessionsMu.RUnlock()
 		if manager != nil && manager.deviceID == deviceID {
-			_ = manager.browser.WriteJSON(msg)
+			_ = manager.write(msg)
 		}
 	case protocol.TypeForwardConnect:
 		s.handleForwardConnect(deviceID, msg)
@@ -235,12 +297,12 @@ func (s *Server) routeBrowserRTC(deviceID string, msg protocol.Message) {
 	}
 	if browser == nil || relaying {
 		if relaying {
-			s.logf("agent rtc %s session=%s dropped: session already on relay", msg.Type, msg.SessionID)
+			s.logDebug("rtc.signal.dropped", "direction", "agent", "type", msg.Type, "session", msg.SessionID)
 		}
 		s.sessionsMu.Unlock()
 		return
 	}
-	s.logf("agent rtc %s session=%s service=%s forwarded to browser", msg.Type, msg.SessionID, msg.Service)
+	s.logDebug("rtc.signal", "direction", "agent", "type", msg.Type, "session", msg.SessionID, "service", msg.Service)
 	if msg.Type == protocol.TypeRTCDirectOK && connection != "" {
 		_ = s.reg.SetConnectionTransport(connection, "direct")
 	}

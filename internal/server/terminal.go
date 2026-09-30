@@ -4,25 +4,17 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"time"
 
 	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
-	actor, ok := s.authenticate(r)
+	actor, ok := s.authorizeWS(w, r, "terminal")
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
 	deviceID := r.URL.Query().Get("device")
-	if deviceID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device"})
-		return
-	}
-	if !s.canAccessDevice(actor, deviceID) {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "device not granted"})
-		return
-	}
 	agent := s.getAgent(deviceID)
 	if agent == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})
@@ -47,13 +39,28 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	s.sessionsMu.Lock()
 	s.terms[sessionID] = sess
 	s.sessionsMu.Unlock()
+	hardenBrowserConn(ws)
+	pingBrowserConn(ws, &sess.writeMu)
 	_ = s.reg.RecordAudit(actor, "terminal.start", deviceID, "")
+	// endReason is read by the deferred log below, so it must be declared before
+	// that defer is registered.
+	endReason := "closed"
+	s.logEvent("session.start", "kind", "terminal", "session", sessionID, "actor", actor, "device", deviceID, "ip", clientIP(r))
 	defer traffic.Close("closed")
+	startedAt := time.Now()
 	defer func() {
 		s.sessionsMu.Lock()
 		delete(s.terms, sessionID)
 		s.sessionsMu.Unlock()
 		_ = agent.write(protocol.Message{Type: protocol.TypeRTCStop, SessionID: sessionID})
+		s.logEvent("session.end",
+			"kind", "terminal",
+			"session", sessionID,
+			"actor", actor,
+			"device", deviceID,
+			"dur", time.Since(startedAt).Round(time.Millisecond).String(),
+			"reason", endReason,
+		)
 	}()
 
 	cols, rows := queryInt(r, "cols", 120), queryInt(r, "rows", 30)
@@ -63,6 +70,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		Cols:      cols,
 		Rows:      rows,
 	}); err != nil {
+		endReason = "device-write-failed"
 		traffic.Close("failed")
 		return
 	}
@@ -70,12 +78,13 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	for {
 		var msg protocol.Message
 		if err := ws.ReadJSON(&msg); err != nil {
+			endReason = "browser-disconnected"
 			_ = agent.write(protocol.Message{Type: protocol.TypeTermStop, SessionID: sessionID})
 			return
 		}
 		switch msg.Type {
 		case protocol.TypeRTCOffer, protocol.TypeRTCICE:
-			s.logf("browser rtc %s session=%s service=terminal", msg.Type, sessionID)
+			s.logDebug("rtc.signal", "direction", "browser", "type", msg.Type, "session", sessionID, "service", "terminal")
 			s.sessionsMu.RLock()
 			fallback := sess.transport == "relay"
 			s.sessionsMu.RUnlock()
@@ -88,7 +97,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case protocol.TypeRTCFallback:
-			s.logf("browser rtc fallback session=%s service=terminal", sessionID)
+			s.logDebug("rtc.fallback", "session", sessionID, "service", "terminal")
 			s.sessionsMu.Lock()
 			alreadyRelay := sess.transport == "relay"
 			sess.transport = "relay"
@@ -105,6 +114,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		case protocol.TypeTermInput, protocol.TypeTermResize, protocol.TypeTermStop:
 			msg.SessionID = sessionID
 			if err := agent.write(msg); err != nil {
+				endReason = "device-write-failed"
 				traffic.Close("failed")
 				return
 			}
@@ -115,6 +125,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 				traffic.Add(int64(len(msg.Data)), 0)
 			}
 			if msg.Type == protocol.TypeTermStop {
+				endReason = "stopped-by-client"
 				return
 			}
 		}

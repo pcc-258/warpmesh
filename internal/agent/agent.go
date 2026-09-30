@@ -5,7 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -85,23 +89,23 @@ func (f *forwardConn) Close() error {
 
 // Agent maintains one control connection to the relay server.
 type Agent struct {
-	cfg              Config
-	sessions         map[string]*TermSession
-	uploads          map[string]*os.File
-	forwards         map[string]*forwardConn
-	forwardPending   map[string]chan protocol.Message
-	directPending    map[string]chan struct{}
-	peerConns        map[string]*webrtc.PeerConnection
-	dataChannels     map[string]*webrtc.DataChannel
-	browserChannels  map[string]*webrtc.DataChannel
-	browserDirect    map[string]bool
+	cfg               Config
+	sessions          map[string]*TermSession
+	uploads           map[string]*os.File
+	forwards          map[string]*forwardConn
+	forwardPending    map[string]chan protocol.Message
+	directPending     map[string]chan struct{}
+	peerConns         map[string]*webrtc.PeerConnection
+	dataChannels      map[string]*webrtc.DataChannel
+	browserChannels   map[string]*webrtc.DataChannel
+	browserDirect     map[string]bool
 	pendingCandidates map[string][]webrtc.ICECandidateInit
-	localConns       map[string]net.Conn
-	pendingData      map[string][][]byte
-	mu               sync.Mutex
-	ws               *websocket.Conn
-	writeMu          sync.Mutex
-	forwardListeners map[string]*forwardListener
+	localConns        map[string]net.Conn
+	pendingData       map[string][][]byte
+	mu                sync.Mutex
+	ws                *websocket.Conn
+	writeMu           sync.Mutex
+	forwardListeners  map[string]*forwardListener
 }
 
 type forwardListener struct {
@@ -153,20 +157,20 @@ func New(cfg Config) (*Agent, error) {
 		cfg.VNCPort = 5900
 	}
 	a := &Agent{
-		cfg:              cfg,
-		sessions:         make(map[string]*TermSession),
-		uploads:          make(map[string]*os.File),
-		forwards:         make(map[string]*forwardConn),
-		forwardPending:   make(map[string]chan protocol.Message),
-		directPending:    make(map[string]chan struct{}),
-		peerConns:        make(map[string]*webrtc.PeerConnection),
-		dataChannels:     make(map[string]*webrtc.DataChannel),
-		browserChannels:  make(map[string]*webrtc.DataChannel),
-		browserDirect:    make(map[string]bool),
+		cfg:               cfg,
+		sessions:          make(map[string]*TermSession),
+		uploads:           make(map[string]*os.File),
+		forwards:          make(map[string]*forwardConn),
+		forwardPending:    make(map[string]chan protocol.Message),
+		directPending:     make(map[string]chan struct{}),
+		peerConns:         make(map[string]*webrtc.PeerConnection),
+		dataChannels:      make(map[string]*webrtc.DataChannel),
+		browserChannels:   make(map[string]*webrtc.DataChannel),
+		browserDirect:     make(map[string]bool),
 		pendingCandidates: make(map[string][]webrtc.ICECandidateInit),
-		localConns:       make(map[string]net.Conn),
-		pendingData:      make(map[string][][]byte),
-		forwardListeners: make(map[string]*forwardListener),
+		localConns:        make(map[string]net.Conn),
+		pendingData:       make(map[string][][]byte),
+		forwardListeners:  make(map[string]*forwardListener),
 	}
 	a.startForwardListeners()
 	if cfg.UIPort > 0 {
@@ -185,7 +189,10 @@ func (a *Agent) Run() {
 		started := time.Now()
 		err := a.connectOnce()
 		if err != nil {
-			log.Printf("agent disconnected from %s: %v", a.cfg.ServerURL, err)
+			// Report the next retry delay so a log reader can tell the
+			// difference between a flapping link and an unreachable server.
+			log.Printf("[agent] disconnected from %s after %s, retrying in %s: %v",
+				a.cfg.ServerURL, time.Since(started).Round(time.Second), (backoff + backoff/5).Round(time.Second), err)
 		}
 		// A connection that survived this long means the network recovered;
 		// restart the backoff so reconnects stay fast.
@@ -245,12 +252,50 @@ func (a *Agent) connectOnce() error {
 			return err
 		}
 		if err := a.handleMessage(msg); err != nil {
-			log.Printf("handle message: %v", err)
+			// Name the message: without the type and session this line is
+			// impossible to attribute when several sessions run at once.
+			log.Printf("[agent] handle %s session=%s: %v", msg.Type, msg.SessionID, err)
 		}
 	}
 }
 
-func (a *Agent) handleMessage(msg protocol.Message) error {
+// debugRTC enables the per-candidate ICE diagnostics, which are essential when
+// a direct path fails to establish and pure noise otherwise. Opt in with
+// DEVICE_RELAY_DEBUG_RTC=1. State transitions that an operator needs to see
+// (channel open, ICE failure) stay at the default level.
+var debugRTC = os.Getenv("DEVICE_RELAY_DEBUG_RTC") == "1"
+
+// logDebug records a diagnostic line only when debugging is enabled.
+func logDebug(format string, args ...any) {
+	if !debugRTC {
+		return
+	}
+	log.Printf("[agent] "+format, args...)
+}
+
+// safeGo runs fn in its own goroutine and converts a panic into a logged error
+// instead of letting it terminate the whole agent process.
+func safeGo(what string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[agent] panic in %s: %v\n%s", what, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
+
+func (a *Agent) handleMessage(msg protocol.Message) (err error) {
+	// A malformed or hostile frame must not be able to crash the agent: that
+	// would drop every session on this device. Convert a panic into a logged
+	// error and keep the control connection alive.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[agent] panic handling %s: %v\n%s", msg.Type, r, debug.Stack())
+			err = fmt.Errorf("panic handling %s: %v", msg.Type, r)
+		}
+	}()
 	switch msg.Type {
 	case protocol.TypePing:
 		return a.send(protocol.Message{Type: protocol.TypePong})
@@ -333,7 +378,14 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		}
 		return f.Close()
 	case protocol.TypeFileDownload:
-		return a.streamFile(msg)
+		// Stream in the background so a large transfer cannot block the control
+		// loop, which must keep answering server pings.
+		safeGo("file download", func() {
+			if err := a.streamFile(msg); err != nil {
+				log.Printf("[agent] stream %s: %v", msg.SessionID, err)
+			}
+		})
+		return nil
 	case protocol.TypeFileList:
 		return a.handleFileList(msg)
 	case protocol.TypeFileMkdir:
@@ -347,7 +399,7 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 	case protocol.TypeForwardConnect:
 		return a.handleForwardTarget(msg)
 	case protocol.TypeForwardOffer:
-		go a.handleDirectOffer(msg)
+		safeGo("forward offer", func() { a.handleDirectOffer(msg) })
 		return nil
 	case protocol.TypeForwardAnswer:
 		a.handleDirectAnswer(msg)
@@ -356,7 +408,7 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 		a.handleDirectICE(msg)
 		return nil
 	case protocol.TypeRTCOffer:
-		go a.handleBrowserOffer(msg)
+		safeGo("browser offer", func() { a.handleBrowserOffer(msg) })
 		return nil
 	case protocol.TypeRTCRelay:
 		a.closeBrowserDirect(msg.SessionID)
@@ -373,7 +425,7 @@ func (a *Agent) handleMessage(msg protocol.Message) error {
 	case protocol.TypeForwardDirectOK:
 		return nil
 	case protocol.TypeScreenStart:
-		go a.startScreenLink(msg.SessionID)
+		safeGo("screen link", func() { a.startScreenLink(msg.SessionID) })
 		return nil
 	case protocol.TypeForwardOpen, protocol.TypeForwardError:
 		a.mu.Lock()
@@ -611,22 +663,37 @@ func (a *Agent) streamFile(msg protocol.Message) error {
 			Error:     "path is outside the allowed directories",
 		})
 	}
-	raw, err := os.ReadFile(msg.Path)
+	// Stream instead of buffering the whole file: a large download used to be
+	// read into memory and pushed from the control loop, which both risked OOM
+	// and starved the read deadline until the server dropped the connection.
+	f, err := os.Open(msg.Path)
 	if err != nil {
 		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
 	}
+	defer func() { _ = f.Close() }()
+
+	if info, err := f.Stat(); err == nil && info.IsDir() {
+		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is a directory"})
+	}
+
 	const chunkSize = 64 * 1024
-	for off := 0; off < len(raw); off += chunkSize {
-		end := off + chunkSize
-		if end > len(raw) {
-			end = len(raw)
+	buf := make([]byte, chunkSize)
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if err := a.send(protocol.Message{
+				Type:      protocol.TypeFileChunk,
+				SessionID: msg.SessionID,
+				Data:      protocol.EncodeData(buf[:n]),
+			}); err != nil {
+				return err
+			}
 		}
-		if err := a.send(protocol.Message{
-			Type:      protocol.TypeFileChunk,
-			SessionID: msg.SessionID,
-			Data:      protocol.EncodeData(raw[off:end]),
-		}); err != nil {
-			return err
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: readErr.Error()})
 		}
 	}
 	return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
@@ -640,16 +707,48 @@ func (a *Agent) pathAllowed(path string) bool {
 	if err != nil {
 		return false
 	}
+	// Resolve symlinks before comparing. A purely lexical prefix check can be
+	// escaped by a symlink planted inside an allowed root that points outside
+	// it, which would expose the whole filesystem.
+	resolved := resolvePath(abs)
 	for _, root := range a.cfg.AllowPaths {
 		r, err := filepath.Abs(filepath.Clean(root))
 		if err != nil {
 			continue
 		}
-		if abs == r || strings.HasPrefix(abs, r+string(filepath.Separator)) {
+		realRoot := resolvePath(r)
+		if resolved == realRoot || strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
 			return true
 		}
 	}
 	return false
+}
+
+// resolvePath returns the real filesystem path for abs, resolving symlinks for
+// the longest existing prefix. Paths that do not exist yet (an upload target,
+// for example) are resolved through their nearest existing ancestor so that a
+// symlinked parent directory cannot be used to escape an allowed root.
+func resolvePath(abs string) string {
+	current := abs
+	var suffix []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			if len(suffix) == 0 {
+				return resolved
+			}
+			parts := append([]string{resolved}, suffix...)
+			return filepath.Join(parts...)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			// Permission or IO trouble: fail closed for this candidate.
+			return abs
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return abs
+		}
+		suffix = append([]string{filepath.Base(current)}, suffix...)
+		current = parent
+	}
 }
 
 func (a *Agent) handleFileList(msg protocol.Message) error {

@@ -14,7 +14,7 @@ import (
 )
 
 func (a *Agent) handleBrowserOffer(msg protocol.Message) {
-	log.Printf("browser direct %s (%s): offer received", msg.SessionID, msg.Service)
+	logDebug("rtc.offer.received session=%s service=%s", msg.SessionID, msg.Service)
 	if msg.Service != "terminal" && msg.Service != "desktop" {
 		_ = a.sendBrowserRTCError(msg.SessionID, msg.Service, "unsupported browser service")
 		return
@@ -62,7 +62,7 @@ func (a *Agent) handleBrowserOffer(msg protocol.Message) {
 		a.setupBrowserDataChannel(msg.SessionID, msg.Service, dc, serviceConn)
 	})
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("browser direct %s (%s): ice state %s", msg.SessionID, msg.Service, state)
+		log.Printf("[agent] browser direct %s (%s): ice state %s", msg.SessionID, msg.Service, state)
 		if state == webrtc.ICEConnectionStateFailed {
 			a.failBrowserDirect(msg.SessionID, msg.Service, "ICE connection failed")
 		}
@@ -71,7 +71,7 @@ func (a *Agent) handleBrowserOffer(msg protocol.Message) {
 		if c == nil {
 			return
 		}
-		log.Printf("browser direct %s (%s): sent candidate %s", msg.SessionID, msg.Service, c.String())
+		logDebug("rtc.candidate.sent session=%s service=%s candidate=%s", msg.SessionID, msg.Service, c.String())
 		raw, err := json.Marshal(c.ToJSON())
 		if err != nil {
 			return
@@ -126,7 +126,7 @@ func (a *Agent) handleBrowserOffer(msg protocol.Message) {
 	}); err != nil {
 		a.failBrowserDirect(msg.SessionID, msg.Service, err.Error())
 	}
-	log.Printf("browser direct %s (%s): answer sent", msg.SessionID, msg.Service)
+	logDebug("rtc.answer.sent session=%s service=%s", msg.SessionID, msg.Service)
 }
 
 func (a *Agent) flushPendingCandidates(sessionID string, pc *webrtc.PeerConnection) {
@@ -136,7 +136,7 @@ func (a *Agent) flushPendingCandidates(sessionID string, pc *webrtc.PeerConnecti
 	a.mu.Unlock()
 	for _, candidate := range pending {
 		if err := pc.AddICECandidate(candidate); err != nil {
-			log.Printf("browser direct %s: add remote candidate: %v", sessionID, err)
+			logDebug("rtc.candidate.add.failed session=%s err=%v", sessionID, err)
 		}
 	}
 }
@@ -163,10 +163,10 @@ func (a *Agent) handleBrowserICE(msg protocol.Message) {
 		return
 	}
 	if err := pc.AddICECandidate(candidate); err != nil {
-		log.Printf("browser direct %s: add remote candidate: %v", msg.SessionID, err)
+		logDebug("rtc.candidate.add.failed session=%s err=%v", msg.SessionID, err)
 		return
 	}
-	log.Printf("browser direct %s: received candidate %s", msg.SessionID, candidate.Candidate)
+	logDebug("rtc.candidate.received session=%s candidate=%s", msg.SessionID, candidate.Candidate)
 }
 
 func (a *Agent) setupBrowserDataChannel(sessionID, service string, dc *webrtc.DataChannel, serviceConn net.Conn) {
