@@ -27,6 +27,7 @@ jobs:
         run: |
           npm ci
           npx eslint .
+          npx tsc --noEmit
 
   test:
     name: Build and test
@@ -43,8 +44,15 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Go tests
         run: go test ./...
+      # The relay is heavily concurrent (session maps, per-connection write
+      # mutexes). Race regressions must fail CI, not reach main.
+      - name: Go tests (race detector)
+        run: go test -race ./...
       - name: Build web
         working-directory: web
         run: |
           npm ci
           npm run build
+      # The server embeds web/dist, so a stale committed bundle must fail CI.
+      - name: Verify embedded web assets are current
+        run: git diff --exit-code -- web/dist

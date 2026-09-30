@@ -61,6 +61,34 @@ podman build --build-arg AGENT_BINARY=bin/warpmesh-agent-linux-arm64 -t warpmesh
 podman build -f Containerfile.desktop --build-arg AGENT_BINARY=bin/warpmesh-agent-linux-arm64 -t warpmesh-desktop .
 ```
 
+## Logs
+
+Both binaries log to stderr, so `journalctl -u warpmesh.service -f` and
+`podman logs -f warpmesh-desktop` are enough to follow them.
+
+The relay prints one line per notable event, as `key=value` pairs:
+
+```text
+[relay] agent online: dev-0e3ed6d8548fed8b (linux@arm64)
+[relay] auth.login.failed user=admin ip=203.0.113.7 reason=bad-credentials
+[relay] session.start kind=terminal session=c88c0e8e actor=admin device=dev-0e3ed6d8 ip=203.0.113.7
+[relay] session.end kind=terminal session=c88c0e8e actor=admin device=dev-0e3ed6d8 dur=987ms reason=browser-disconnected
+[relay] http.request ip=203.0.113.7 method=POST path=/api/login status=401 bytes=32 dur=77ms
+[relay] filemanager.rejected session=710884ed actor=admin device=dev-0e3ed6d8 type=forward:connect
+```
+
+Notes:
+
+- Request lines cover mutations, and any authentication or authorization
+  outcome. Successful reads (which the console polls) are not logged.
+  Credentials in query strings are redacted before they reach the log.
+- TLS handshakes for hostnames this server does not serve are dropped: an
+  internet-facing IP is probed constantly and those lines bury real events.
+  A handshake failure for your own domain is always reported.
+- `DEVICE_RELAY_DEBUG_RTC=1` enables the per-candidate WebRTC/ICE diagnostics
+  on both the server and the agent. They are useful when a direct path fails to
+  establish and very noisy otherwise.
+
 ## Documentation
 
 Architecture, protocol and deployment details: [docs/architecture.md](docs/architecture.md)
