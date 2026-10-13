@@ -78,12 +78,12 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 	switch op {
 	case "upload":
 		if name == "" {
-			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing file name"})
+			_ = session.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing file name"})
 			return
 		}
 	case "download":
 		if path == "" {
-			_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing path"})
+			_ = session.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "missing path"})
 			return
 		}
 	}
@@ -100,6 +100,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return
 		}
+		uploadEnded := false
 		for {
 			kind, raw, err := ws.ReadMessage()
 			if err != nil {
@@ -112,14 +113,27 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				msg.SessionID = sessionID
-				if msg.Type == protocol.TypeFileUploadEnd || msg.Type == protocol.TypeFileError {
+				if msg.Type == protocol.TypeFileError {
 					_ = agent.write(msg)
-					if msg.Type == protocol.TypeFileError {
-						endState = "failed"
-					}
+					endState = "failed"
 					return
 				}
+				if msg.Type == protocol.TypeFileUploadEnd && !uploadEnded {
+					uploadEnded = true
+					if err := agent.write(msg); err != nil {
+						endState = "failed"
+						return
+					}
+					// The router delivers file:done/file:error and closes this
+					// socket. Returning here would drop that acknowledgement.
+				}
 				continue
+			}
+			if uploadEnded {
+				endState = "failed"
+				_ = agent.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "data after upload completion"})
+				_ = session.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "data after upload completion"})
+				return
 			}
 			if err := agent.write(protocol.Message{
 				Type:      protocol.TypeFileChunk,

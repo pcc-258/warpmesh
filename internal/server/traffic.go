@@ -14,6 +14,7 @@ type trafficRecorder struct {
 	toDevice   int64
 	fromDevice int64
 	lastFlush  time.Time
+	closed     bool
 }
 
 func newTrafficRecorder(registry *Registry, id string) *trafficRecorder {
@@ -26,6 +27,9 @@ func (t *trafficRecorder) Add(toDevice, fromDevice int64) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
 	t.toDevice += toDevice
 	t.fromDevice += fromDevice
 	if time.Since(t.lastFlush) >= time.Second || t.toDevice+t.fromDevice >= 1024*1024 {
@@ -49,6 +53,10 @@ func (t *trafficRecorder) Close(state string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	t.closed = true
 	t.flushLocked()
 	_ = t.registry.EndConnection(t.id, state)
 }

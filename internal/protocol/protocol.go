@@ -4,18 +4,29 @@ package protocol
 
 import "encoding/base64"
 
+// DeviceCapabilities reports services the agent can currently offer.
+// Desktop means the local VNC endpoint is reachable, not that a user session
+// or operating-system capture permission has been verified.
+type DeviceCapabilities struct {
+	Terminal    bool   `json:"terminal"`
+	Files       bool   `json:"files"`
+	Desktop     bool   `json:"desktop"`
+	DesktopHint string `json:"desktopHint"`
+}
+
 // Message is the shared envelope for all WebSocket traffic.
 type Message struct {
 	Type string `json:"type"`
 
 	// Agent hello metadata.
-	DeviceID   string   `json:"deviceId,omitempty"`
-	Name       string   `json:"name,omitempty"`
-	Hostname   string   `json:"hostname,omitempty"`
-	OS         string   `json:"os,omitempty"`
-	Arch       string   `json:"arch,omitempty"`
-	LANIPs     []string `json:"lanIPs,omitempty"`
-	DirectPort int      `json:"directPort,omitempty"`
+	DeviceID     string              `json:"deviceId,omitempty"`
+	Name         string              `json:"name,omitempty"`
+	Hostname     string              `json:"hostname,omitempty"`
+	OS           string              `json:"os,omitempty"`
+	Arch         string              `json:"arch,omitempty"`
+	LANIPs       []string            `json:"lanIPs,omitempty"`
+	DirectPort   int                 `json:"directPort,omitempty"`
+	Capabilities *DeviceCapabilities `json:"capabilities,omitempty"`
 
 	// Terminal and file sessions.
 	SessionID string `json:"sessionId,omitempty"`
@@ -48,6 +59,7 @@ type FileEntry struct {
 // Message types used by agents, the server and the web UI.
 const (
 	TypeHello           = "hello"
+	TypeStatus          = "device:status"
 	TypePing            = "ping"
 	TypePong            = "pong"
 	TypeTermStart       = "terminal:start"

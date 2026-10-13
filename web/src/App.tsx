@@ -28,14 +28,11 @@ import {
   clearSessionFlag,
   clearToken,
   createDeviceKey,
-  createInvite,
   createUser,
   deleteInvite,
-  deleteDevice,
   deleteUser,
   getAnalytics,
   hasSession,
-  lastSeenLabel,
   listAudit,
   listDeviceKeys,
   listDevices,
@@ -43,11 +40,8 @@ import {
   listUsers,
   login,
   logout,
-  renameDevice,
-  setForwardPolicy,
   revokeDeviceKey,
   rotateDeviceKey,
-  updateUser,
   type AuditEntry,
   type AnalyticsData,
   type ConnectionRecord,
@@ -55,6 +49,7 @@ import {
   type DeviceKey,
   type Invite,
   type UserAccount,
+  optionalDate,
   wsUrl,
 } from "./api";
 import {
@@ -67,6 +62,11 @@ import {
   type SessionKind,
   type StageAttempt,
 } from "./sessionStage";
+
+import { downloadFile, requestFiles, uploadFile } from "./fileTransport";
+import { canFallback, createDeadline, HANDSHAKE_BUDGET_MS, negotiateOffer, refreshFailure, terminalOutputIsLive } from "./sessionLifecycle";
+
+import { AccountEditor, ActionDialog, DeviceManager, EnrollmentDialog, type ActionRequest } from "./ManagementUI";
 
 type Page = "dashboard" | "devices" | "access" | "activity";
 
@@ -139,7 +139,7 @@ function createBrowserRTC(
   socket: WebSocket,
   service: "terminal" | "desktop",
   handlers: {
-    onOfferSent?: () => void;
+    onFailure?: () => void;
     onLocalCandidate?: () => void;
     onStateChange?: (state: RTCPeerConnectionState) => void;
   } = {},
@@ -167,18 +167,10 @@ function createBrowserRTC(
       );
     }
   };
-  void (async () => {
-    try {
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      if (socket.readyState === WebSocket.OPEN && peer.localDescription) {
-        socket.send(JSON.stringify({ type: "rtc:offer", service, data: btoa(JSON.stringify(peer.localDescription)) }));
-        handlers.onOfferSent?.();
-      }
-    } catch {
-      // The direct attempt budget below will switch to the WebSocket relay.
-    }
-  })();
+  void negotiateOffer(peer, (description) => {
+    if (socket.readyState !== WebSocket.OPEN) throw new Error("Control channel closed");
+    socket.send(JSON.stringify({ type: "rtc:offer", service, data: btoa(JSON.stringify(description)) }));
+  }, () => handlers.onFailure?.());
   return { peer, channel };
 }
 
@@ -266,6 +258,12 @@ export default function App() {
     [goToPath],
   );
 
+  const handleLogout = useCallback(async () => {
+    try { await logout(); } catch { /* local logout works offline */ }
+    history.replaceState({}, "", "/");
+    clearToken(); clearSessionFlag(); setTokenState(false);
+  }, []);
+
   if (!token) {
     return <Login onLogin={() => setTokenState(true)} />;
   }
@@ -289,17 +287,7 @@ export default function App() {
       onTerminal={(d) => openDeviceView("terminal", d)}
       onDesktop={(d) => openDeviceView("desktop", d)}
       onFiles={(d) => openDeviceView("files", d)}
-      onLogout={async () => {
-        try {
-          await logout();
-        } catch {
-          // local logout must still work when the server is unreachable
-        }
-        history.replaceState({}, "", "/");
-        clearToken();
-        clearSessionFlag();
-        setTokenState(false);
-      }}
+      onLogout={handleLogout}
     />
   );
 }
@@ -380,14 +368,22 @@ function Console({
   const [canManageUsers, setCanManageUsers] = useState(false);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshError, setRefreshError] = useState("");
+  const [analyticsError, setAnalyticsError] = useState("");
+  const [action, setAction] = useState<ActionRequest | null>(null);
+  const [enrolling, setEnrolling] = useState(false);
+  const [notice, setNotice] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const deviceList = await listDevices();
-      setDevices(deviceList);
-    } catch {
-      onLogout();
+      setDevices(deviceList ?? []);
+      setRefreshError("");
+    } catch (error) {
+      const failure = refreshFailure(error);
+      if (failure.logout) onLogout();
+      else setRefreshError(failure.message);
     } finally {
       setLoading(false);
     }
@@ -397,12 +393,16 @@ function Console({
     setAnalyticsLoading(true);
     try {
       setAnalytics(await getAnalytics(analyticsRange));
-    } catch {
-      setAnalytics(null);
+      setAnalyticsError("");
+    } catch (error) {
+      const failure = refreshFailure(error);
+      if (failure.logout) onLogout();
+      else setAnalyticsError(failure.message.replace("devices", "analytics"));
+      // Retain the last successful snapshot during transient failures.
     } finally {
       setAnalyticsLoading(false);
     }
-  }, [analyticsRange]);
+  }, [analyticsRange, onLogout]);
 
   const loadKeys = useCallback(async () => {
     try {
@@ -453,55 +453,14 @@ function Console({
     return () => clearInterval(timer);
   }, [loadAnalytics]);
 
-  const handleCreateKey = async () => {
-    const name = prompt("Device name for the new key");
-    if (!name?.trim()) return;
-    try {
-      const key = await createDeviceKey(name.trim());
-      alert(`Device key created.\n\nDevice ID: ${key.deviceId}\nToken: ${key.token}\n\nUse both in the agent.`);
-      loadKeys();
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "failed to create key");
-    }
-  };
-
-  const handleRevokeKey = async (key: DeviceKey) => {
-    if (confirm(`Revoke device key for ${key.name}?`)) {
-      await revokeDeviceKey(key.deviceId);
-      loadKeys();
-    }
-  };
-
-  const handleRotateKey = async (key: DeviceKey) => {
-    if (confirm(`Rotate the device key for ${key.name}? The old token stops working.`)) {
-      try {
-        const rotated = await rotateDeviceKey(key.deviceId);
-        alert(`New device token:\n\n${rotated.token}\n\nIt is shown once.`);
-        loadKeys();
-      } catch (err) {
-        alert(err instanceof Error ? err.message : "rotation failed");
-      }
-    }
-  };
-
-  const handleCreateInvite = async () => {
-    const name = prompt("Device name for the invite");
-    if (!name?.trim()) return;
-    try {
-      const inv = await createInvite(name.trim());
-      alert(`Invite code:\n\n${inv.code}\n\nRun on the device:\nwarpmesh-agent enroll -server https://warpmesh.ddns.net -code ${inv.code} -name ${name.trim()}`);
-      loadInvites();
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "invite creation failed");
-    }
-  };
-
-  const handleDeleteInvite = async (inv: Invite) => {
-    if (confirm(`Delete invite ${inv.code}?`)) {
-      await deleteInvite(inv.code);
-      loadInvites();
-    }
-  };
+  const handleCreateKey = () => setAction({ title: "Create device key", fields: [{ name: "name", label: "Device name", required: true }], run: async (values) => {
+    const key = await createDeviceKey(values.name.trim()); await loadKeys();
+    return `Device ID: ${key.deviceId}\nToken: ${key.token}\n\nUse the Add device wizard for guided enrollment.`;
+  } });
+  const handleRevokeKey = (key: DeviceKey) => setAction({ title: `Revoke key: ${key.name}`, destructive: true, description: "This device will be unable to authenticate on its next connection.", run: async () => { await revokeDeviceKey(key.deviceId); await loadKeys(); } });
+  const handleRotateKey = (key: DeviceKey) => setAction({ title: `Rotate key: ${key.name}`, description: "The old token will stop working. Update the agent with the new token.", run: async () => { const rotated = await rotateDeviceKey(key.deviceId); await loadKeys(); return `New device token:\n${rotated.token}`; } });
+  const handleCreateInvite = () => setEnrolling(true);
+  const handleDeleteInvite = (inv: Invite) => setAction({ title: "Delete invite", destructive: true, description: `Revoke the enrollment invite for ${inv.name}?`, run: async () => { await deleteInvite(inv.code); await loadInvites(); } });
 
   const title = page === "dashboard" ? "Dashboard" : page === "devices" ? "Devices" : page === "access" ? "Access" : "Activity";
 
@@ -586,6 +545,9 @@ function Console({
         </header>
 
         <div className="content">
+          {notice && <div className="management-notice" role="status">{notice}<button className="icon-btn" aria-label="Dismiss notification" onClick={() => setNotice("")}><X size={14} /></button></div>}
+          {refreshError && <div className="file-message" role="alert">{refreshError} <button disabled={loading} onClick={() => void refresh()}>Retry</button></div>}
+          {analyticsError && <div className="file-message" role="alert">{analyticsError} <button disabled={analyticsLoading} onClick={() => void loadAnalytics()}>Retry</button></div>}
           {page === "dashboard" && (
             <DashboardPage
               analytics={analytics}
@@ -595,7 +557,7 @@ function Console({
             />
           )}
           {page === "devices" && (
-            <DevicesPage devices={devices} onTerminal={onTerminal} onDesktop={onDesktop} onFiles={onFiles} />
+            <DeviceManager devices={devices} canManage={canManageUsers} onChanged={refresh} onAction={setAction} onAdd={() => setEnrolling(true)} onTerminal={onTerminal} onDesktop={onDesktop} onFiles={onFiles} />
           )}
           {page === "access" && (
             <AccessPage
@@ -605,6 +567,7 @@ function Console({
               devices={devices}
               canManageUsers={canManageUsers}
               onUsersChanged={loadUsers}
+              onAction={setAction}
               onCreate={handleCreateKey}
               onRevoke={handleRevokeKey}
               onRotate={handleRotateKey}
@@ -615,6 +578,8 @@ function Console({
           {page === "activity" && <ActivityPage audit={audit} />}
         </div>
       </section>
+      {action && <ActionDialog request={action} onClose={() => setAction(null)} onSuccess={setNotice} />}
+      {enrolling && <EnrollmentDialog devices={devices} onClose={() => setEnrolling(false)} onInvitesChanged={loadInvites} />}
     </div>
   );
 }
@@ -829,134 +794,6 @@ function stateLabel(state: string): string {
   return "Closed";
 }
 
-function DevicesPage({
-  devices,
-  onTerminal,
-  onDesktop,
-  onFiles,
-}: {
-  devices: Device[];
-  onTerminal: (d: Device) => void;
-  onDesktop: (d: Device) => void;
-  onFiles: (d: Device) => void;
-}) {
-  const [group, setGroup] = useState("");
-  const groups = Array.from(new Set(devices.map((d) => d.group).filter((value): value is string => Boolean(value))));
-  const filtered = group ? devices.filter((d) => d.group === group) : devices;
-
-  const handleRename = async (device: Device) => {
-    const name = prompt("New device name", device.name);
-    if (name && name.trim()) {
-      await renameDevice(device.id, name.trim());
-      location.reload();
-    }
-  };
-
-  const handleDelete = async (device: Device) => {
-    if (confirm(`Remove ${device.name} from the catalog?`)) {
-      await deleteDevice(device.id);
-      location.reload();
-    }
-  };
-
-  // Forwarding is allow-any by default so a personal fleet needs no setup.
-  // This is the control point for tightening it later.
-  const handleForwardPolicy = async (device: Device) => {
-    const next = device.forwardPolicy === "restricted" ? "any" : "restricted";
-    const explain =
-      next === "restricted"
-        ? `Restrict forwarding for ${device.name}? It will only reach devices you grant explicitly.`
-        : `Allow ${device.name} to forward to any device and port?`;
-    if (!confirm(explain)) return;
-    try {
-      await setForwardPolicy(device.id, next);
-      location.reload();
-    } catch (error) {
-      alert(error instanceof Error ? error.message : "Could not update the forwarding policy.");
-    }
-  };
-
-  return (
-    <>
-      {groups.length > 0 && (
-        <div className="filter-chips">
-          <button className={group === "" ? "active" : ""} onClick={() => setGroup("")}>
-            All
-          </button>
-          {groups.map((g) => (
-            <button key={g} className={group === g ? "active" : ""} onClick={() => setGroup(g)}>
-              {g}
-            </button>
-          ))}
-        </div>
-      )}
-      <section className="panel">
-        {filtered.length === 0 ? (
-          <div className="inline-empty">No devices yet. Run an agent with a device key and it will appear here.</div>
-        ) : (
-          <div className="device-table">
-            <div className="device-row device-row-head">
-              <span>Status</span>
-              <span>Name</span>
-              <span>System</span>
-              <span>Network</span>
-              <span>Last seen</span>
-              <span>Actions</span>
-            </div>
-            {filtered.map((device) => (
-              <div className="device-row" key={device.id}>
-                <span>
-                  <span className={`status-dot ${device.online ? "online" : "offline"}`} />
-                  {device.online ? "Online" : "Offline"}
-                </span>
-                <span>
-                  <strong>{device.name}</strong>
-                  <small>{device.hostname || device.id}</small>
-                  {device.group && <em>{device.group}</em>}
-                </span>
-                <span>
-                  {device.os} / {device.arch}
-                  <button
-                    type="button"
-                    className={`policy-badge ${device.forwardPolicy === "restricted" ? "restricted" : ""}`}
-                    title={
-                      device.forwardPolicy === "restricted"
-                        ? "Forwarding is restricted to explicit grants. Click to allow any."
-                        : "This device may forward to any device and port. Click to restrict."
-                    }
-                    onClick={() => handleForwardPolicy(device)}
-                  >
-                    {device.forwardPolicy === "restricted" ? "forward: restricted" : "forward: any"}
-                  </button>
-                </span>
-                <span>{device.lanIPs?.join(", ") || "no LAN IP"}</span>
-                <span>{lastSeenLabel(device.lastSeen)}</span>
-                <span className="row-actions">
-                  <button className="icon-btn" title="Remote desktop" disabled={!device.online} onClick={() => onDesktop(device)}>
-                    <Monitor size={15} />
-                  </button>
-                  <button className="icon-btn" title="Remote terminal" disabled={!device.online} onClick={() => onTerminal(device)}>
-                    <TerminalSquare size={15} />
-                  </button>
-                  <button className="icon-btn" title="File transfer" disabled={!device.online} onClick={() => onFiles(device)}>
-                    <Download size={15} />
-                  </button>
-                  <button className="icon-btn" title="Rename" onClick={() => handleRename(device)}>
-                    <Pencil size={14} />
-                  </button>
-                  <button className="icon-btn danger" title="Delete" onClick={() => handleDelete(device)}>
-                    <Trash2 size={14} />
-                  </button>
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-    </>
-  );
-}
-
 function AccessPage({
   keys,
   invites,
@@ -964,6 +801,7 @@ function AccessPage({
   devices,
   canManageUsers,
   onUsersChanged,
+  onAction,
   onCreate,
   onRevoke,
   onRotate,
@@ -976,12 +814,15 @@ function AccessPage({
   devices: Device[];
   canManageUsers: boolean;
   onUsersChanged: () => Promise<void>;
+  onAction: (request: ActionRequest) => void;
   onCreate: () => void;
   onRevoke: (key: DeviceKey) => void;
   onRotate: (key: DeviceKey) => void;
   onCreateInvite: () => void;
   onDeleteInvite: (inv: Invite) => void;
 }) {
+  const [accountNotice, setAccountNotice] = useState("");
+  const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newRole, setNewRole] = useState("operator");
@@ -1037,45 +878,7 @@ function AccessPage({
     }
   };
 
-  const handleResetPassword = async (user: UserAccount) => {
-    const password = prompt(`New password for ${user.username}`);
-    if (password) {
-      await updateUser(user.username, { password });
-      onUsersChanged();
-    }
-  };
-
-  const handleRole = async (user: UserAccount) => {
-    const role = prompt("Role (admin / operator)", user.role);
-    if (role === "admin" || role === "operator") {
-      await updateUser(user.username, { role });
-      onUsersChanged();
-    }
-  };
-
-  const handleExpiry = async (user: UserAccount) => {
-    const value = prompt("Expiry date (YYYY-MM-DD), empty for none", user.expiresAt ? user.expiresAt.slice(0, 10) : "");
-    if (value !== null) {
-      await updateUser(user.username, { expiresAt: value ? new Date(value).toISOString() : "" });
-      onUsersChanged();
-    }
-  };
-
-  const handleDevices = async (user: UserAccount) => {
-    const value = prompt("Allowed device ids, comma separated", (user.deviceIds ?? []).join(","));
-    if (value !== null) {
-      const ids = value.split(",").map((s) => s.trim()).filter(Boolean);
-      await updateUser(user.username, { deviceIds: ids });
-      onUsersChanged();
-    }
-  };
-
-  const handleDeleteUser = async (user: UserAccount) => {
-    if (confirm(`Delete account ${user.username}?`)) {
-      await deleteUser(user.username);
-      onUsersChanged();
-    }
-  };
+  const handleDeleteUser = (user: UserAccount) => onAction({ title: `Delete account: ${user.username}`, destructive: true, description: "This account will lose access to the console.", run: async () => { await deleteUser(user.username); await onUsersChanged(); } });
 
   return (
     <section className="panel">
@@ -1098,7 +901,7 @@ function AccessPage({
               <div>
                 <strong>{key.name}</strong>
                 <span>{key.deviceId}</span>
-                {key.expiresAt && <small>expires {new Date(key.expiresAt).toLocaleDateString()}</small>}
+                {optionalDate(key.expiresAt) ? <small>expires {new Date(key.expiresAt!).toLocaleDateString()}</small> : <small>No expiry</small>}
               </div>
               <button className="icon-btn" title="Rotate key" onClick={() => onRotate(key)}>
                 <RefreshCw size={14} />
@@ -1138,6 +941,8 @@ function AccessPage({
         </div>
       )}
 
+      {accountNotice && <div className="management-notice" role="status">{accountNotice}<button className="icon-btn" aria-label="Dismiss account notification" onClick={() => setAccountNotice("")}><X size={14} /></button></div>}
+      {editingUser && <AccountEditor user={editingUser} devices={devices} onClose={() => setEditingUser(null)} onSaved={async () => { await onUsersChanged(); setAccountNotice("Account saved."); }} />}
       {canManageUsers && (
         <>
           <div className="panel-head">
@@ -1158,22 +963,11 @@ function AccessPage({
                   <div>
                     <strong>{user.username}</strong>
                     <span>
-                      {user.role} · {(user.deviceIds ?? []).length} devices
-                      {user.expiresAt ? ` · expires ${new Date(user.expiresAt).toLocaleDateString()}` : ""}
+                      {user.role} · {user.role === "admin" ? "all devices" : `${(user.deviceIds ?? []).length} devices`}
+                      {optionalDate(user.expiresAt) ? ` · expires ${new Date(user.expiresAt!).toLocaleDateString()}` : ""}
                     </span>
                   </div>
-                  <button className="icon-btn" title="Reset password" onClick={() => handleResetPassword(user)}>
-                    <Pencil size={14} />
-                  </button>
-                  <button className="icon-btn" title="Change role" onClick={() => handleRole(user)}>
-                    <ShieldCheck size={14} />
-                  </button>
-                  <button className="icon-btn" title="Set expiry" onClick={() => handleExpiry(user)}>
-                    <RefreshCw size={14} />
-                  </button>
-                  <button className="icon-btn" title="Edit devices" onClick={() => handleDevices(user)}>
-                    <MonitorSmartphone size={14} />
-                  </button>
+                  <button className="secondary-btn" onClick={() => setEditingUser(user)}>Edit account</button>
                   <button className="icon-btn danger" title="Delete account" onClick={() => handleDeleteUser(user)}>
                     <Trash2 size={14} />
                   </button>
@@ -1397,30 +1191,39 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     );
     let rtc: BrowserRTC | null = null;
     let directActive = false;
+    let relayActive = false;
+    let receivedOutput = false;
     let directAcknowledged = false;
     let fallbackRequested = false;
-    let fallbackTimer = 0;
+    const directDeadline = createDeadline();
+    const relayDeadline = createDeadline();
     let disposed = false;
     // A live session must not be torn down by a stale fallback.
     let live = false;
 
-    const startFallback = () => {
-      // Never tear down a session that is already live: the direct channel may
-      // have opened after the budget was armed.
-      if (fallbackRequested || disposed || live) return;
+    const startFallback = (failed = false) => {
+      // Ignore stale deadlines, but recover real failures even after connect.
+      if (!canFallback(disposed, fallbackRequested, live, failed)) return;
+      live = false;
       fallbackRequested = true;
       directActive = false;
-      window.clearTimeout(fallbackTimer);
+      directDeadline.cancel();
+      termStopBudget();
       rtc?.peer.close();
       setStage("switching");
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "rtc:fallback" }));
-      }
+        relayDeadline.arm(HANDSHAKE_BUDGET_MS, () => {
+          markFailed("Terminal relay timed out. Return and retry the session.");
+          socket.close();
+        });
+      } else markFailed("The control channel closed before relay recovery.");
     };
 
     const markLive = () => {
       live = true;
-      window.clearTimeout(fallbackTimer);
+      directDeadline.cancel();
+      relayDeadline.cancel();
       termStopBudget();
       markConnected();
     };
@@ -1438,15 +1241,16 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
     };
 
     socket.onopen = () => {
+      if (disposed) return;
       term.focus();
+      startBudget(DIRECT_BUDGET_MS);
+      directDeadline.arm(DIRECT_BUDGET_MS, startFallback);
       try {
         rtc = createBrowserRTC(socket, "terminal", {
-          onOfferSent: () => {
-            fallbackTimer = window.setTimeout(startFallback, DIRECT_BUDGET_MS);
-          },
+          onFailure: () => startFallback(true),
           onLocalCandidate: noteLocalCandidate,
           onStateChange: (state) => {
-            if (state === "failed") startFallback();
+            if (state === "failed" || state === "disconnected") startFallback(true);
             if (state === "new" || state === "connecting") setStage("checking");
           },
         });
@@ -1456,22 +1260,20 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
       }
       rtc.channel.onopen = activateDirect;
       rtc.channel.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
+        if (!disposed && !fallbackRequested && event.data instanceof ArrayBuffer) {
           term.write(new Uint8Array(event.data));
           markLive();
         }
       };
       rtc.channel.onclose = () => {
-        if (directAcknowledged) startFallback();
+        startFallback(true);
       };
       rtc.channel.onerror = () => {
-        if (directAcknowledged) startFallback();
-      };
-      rtc.peer.onconnectionstatechange = () => {
-        if (rtc?.peer.connectionState === "failed") startFallback();
+        startFallback(true);
       };
     };
     socket.onmessage = async (event) => {
+      if (disposed) return;
       let msg: { type: string; data?: string; error?: string };
       try {
         msg = JSON.parse(event.data as string) as typeof msg;
@@ -1479,6 +1281,7 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         return;
       }
       if (msg.type === "rtc:answer" && msg.data && rtc && !fallbackRequested) {
+        setStage("negotiating");
         try {
           await rtc.peer.setRemoteDescription(decodeRTCDescription(msg.data));
         } catch {
@@ -1487,6 +1290,7 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         return;
       }
       if (msg.type === "rtc:ice" && msg.data && rtc && !fallbackRequested) {
+        noteRemoteCandidate();
         try {
           await rtc.peer.addIceCandidate(decodeRTCCandidate(msg.data));
         } catch {
@@ -1500,24 +1304,29 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         return;
       }
       if (msg.type === "rtc:direct-error") {
-        startFallback();
+        startFallback(true);
         return;
       }
       if (msg.type === "rtc:relay") {
         directActive = false;
+        relayActive = true;
         fallbackRequested = true;
+        directDeadline.cancel();
+        rtc?.peer.close();
         markRelaying();
         sendResize();
+        if (receivedOutput) markLive();
+        else relayDeadline.arm(HANDSHAKE_BUDGET_MS, () => {
+          markFailed("Terminal output timed out. Return and retry the session.");
+          socket.close();
+        });
         return;
       }
       if (msg.type === "terminal:output" && typeof msg.data === "string") {
-        // Output means the session is live. Set the flag before clearing the
-        // timer: onOfferSent runs from an async task and could otherwise re-arm
-        // a fallback that later tears the live session down.
-        live = true;
-        window.clearTimeout(fallbackTimer);
-        termStopBudget();
-        markConnected();
+        // The agent can emit welcome output during negotiation. It does not
+        // prove a direct transport and must not cancel its attempt budget.
+        receivedOutput = true;
+        if (terminalOutputIsLive(directActive, relayActive)) markLive();
         const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
         term.write(bytes);
       }
@@ -1527,8 +1336,13 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         socket.close();
       }
     };
-    socket.onerror = () => markFailed("The control channel failed.");
+    socket.onerror = () => { if (!disposed) markFailed("The control channel failed."); };
     socket.onclose = () => {
+      if (disposed) return;
+      directDeadline.cancel();
+      relayDeadline.cancel();
+      fallbackRequested = true;
+      rtc?.peer.close();
       markDisconnected("The control channel closed.");
       term.writeln("\r\n\x1b[90m[connection closed]\x1b[0m");
     };
@@ -1551,7 +1365,8 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
 
     return () => {
       disposed = true;
-      window.clearTimeout(fallbackTimer);
+      directDeadline.dispose();
+      relayDeadline.dispose();
       observer.disconnect();
       dataDisposable.dispose();
       rtc?.peer.close();
@@ -1598,7 +1413,8 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
     let rtc: BrowserRTC | null = null;
     let directAcknowledged = false;
     let fallbackRequested = false;
-    let fallbackTimer = 0;
+    const directDeadline = createDeadline();
+    const handshakeDeadline = createDeadline();
     // A live session must not be torn down by a stale fallback.
     let live = false;
     const connect = async () => {
@@ -1609,23 +1425,34 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
 
         const attachRFB = (channel: RTCDataChannel | WebSocket, mode: "direct" | "relay") => {
           if (!hostRef.current || disposed) return;
+          handshakeDeadline.arm(HANDSHAKE_BUDGET_MS, () => {
+            if (mode === "direct") startFallback(true);
+            else {
+              markFailed("Desktop handshake timed out. Return and retry the session.");
+              rfbRef.current?.disconnect();
+              rfbRef.current = null;
+              socket?.close();
+            }
+          });
           const rfb = new RFB(hostRef.current, channel, { credentials: { password: "" } });
           rfbRef.current = rfb;
           rfb.scaleViewport = true;
           rfb.resizeSession = false;
           rfb.addEventListener("connect", () => {
-            if (disposed) return;
+            if (disposed || rfbRef.current !== rfb || (mode === "direct" && fallbackRequested)) return;
             // The session is live: stop the direct-attempt budget and the
             // fallback timer so they cannot tear it down mid-stream.
             live = true;
-            window.clearTimeout(fallbackTimer);
+            directDeadline.cancel();
+            handshakeDeadline.cancel();
             rfbStopBudget();
             markConnected();
           });
           rfb.addEventListener("disconnect", () => {
-            if (!disposed && !(mode === "direct" && fallbackRequested)) {
-              markDisconnected("The device closed the desktop session.");
-            }
+            if (disposed || rfbRef.current !== rfb || (mode === "direct" && fallbackRequested)) return;
+            handshakeDeadline.cancel();
+            if (mode === "direct") startFallback(true);
+            else markDisconnected("The device closed the desktop session.");
           });
           rfb.addEventListener("credentialsrequired", () => {
             const password = prompt("VNC password (leave empty if not set)") || "";
@@ -1633,19 +1460,28 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           });
           rfb.addEventListener("securityfailure", (event: CustomEvent) => {
             const reason = (event.detail as { reason?: string })?.reason || "authentication failed";
-            if (!disposed) markFailed(reason);
+            if (!disposed) {
+              handshakeDeadline.cancel();
+              directDeadline.cancel();
+              fallbackRequested = true;
+              markFailed(reason);
+              rtc?.peer.close();
+              socket?.close();
+            }
           });
           if (mode === "direct" && socket?.readyState === WebSocket.OPEN) {
-            window.clearTimeout(fallbackTimer);
             socket.send(JSON.stringify({ type: "rtc:ready" }));
           }
         };
 
-        const startFallback = () => {
-          // Never tear down a session that is already live.
-          if (fallbackRequested || disposed || live) return;
+        const startFallback = (failed = false) => {
+          // Ignore stale deadlines, but recover real failures even after connect.
+          if (!canFallback(disposed, fallbackRequested, live, failed)) return;
+          live = false;
           fallbackRequested = true;
-          window.clearTimeout(fallbackTimer);
+          directDeadline.cancel();
+          handshakeDeadline.cancel();
+          rfbStopBudget();
           if (rfbRef.current) {
             rfbRef.current.disconnect();
             rfbRef.current = null;
@@ -1654,7 +1490,11 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           setStage("switching");
           if (socket?.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "rtc:fallback" }));
-          }
+            handshakeDeadline.arm(HANDSHAKE_BUDGET_MS, () => {
+              markFailed("Desktop relay timed out. Return and retry the session.");
+              socket?.close();
+            });
+          } else markFailed("The control channel closed before relay recovery.");
         };
 
         const maybeAttachDirect = () => {
@@ -1663,14 +1503,15 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
         };
 
         socket.onopen = () => {
+          if (disposed) return;
+          startBudget(DIRECT_BUDGET_MS);
+          directDeadline.arm(DIRECT_BUDGET_MS, startFallback);
           try {
             rtc = createBrowserRTC(socket!, "desktop", {
-              onOfferSent: () => {
-                fallbackTimer = window.setTimeout(startFallback, DIRECT_BUDGET_MS);
-              },
+              onFailure: () => startFallback(true),
               onLocalCandidate: noteLocalCandidate,
               onStateChange: (state) => {
-                if (state === "failed") startFallback();
+                if (state === "failed" || state === "disconnected") startFallback(true);
                 if (state === "new" || state === "connecting") setStage("checking");
               },
             });
@@ -1680,13 +1521,14 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           }
           rtc.channel.onopen = maybeAttachDirect;
           rtc.channel.onclose = () => {
-            if (directAcknowledged) startFallback();
+            startFallback(true);
           };
           rtc.channel.onerror = () => {
-            if (directAcknowledged) startFallback();
+            startFallback(true);
           };
         };
         socket.onmessage = async (event) => {
+          if (disposed) return;
           let msg: { type: string; data?: string; error?: string };
           try {
             msg = JSON.parse(event.data as string) as typeof msg;
@@ -1717,11 +1559,15 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
             return;
           }
           if (msg.type === "rtc:direct-error") {
-            startFallback();
+            startFallback(true);
             return;
           }
           if (msg.type === "rtc:relay") {
-            window.clearTimeout(fallbackTimer);
+            fallbackRequested = true;
+            directDeadline.cancel();
+            handshakeDeadline.cancel();
+            rfbRef.current?.disconnect();
+            rfbRef.current = null;
             rtc?.peer.close();
             markRelaying();
             attachRFB(socket!, "relay");
@@ -1735,7 +1581,15 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
           if (!disposed) markFailed("The control channel failed.");
         };
         socket.onclose = () => {
-          if (!disposed) markDisconnected("The control channel closed.");
+          if (!disposed) {
+            directDeadline.cancel();
+            handshakeDeadline.cancel();
+            fallbackRequested = true;
+            rfbRef.current?.disconnect();
+            rfbRef.current = null;
+            rtc?.peer.close();
+            markDisconnected("The control channel closed.");
+          }
         };
       } catch (err) {
         if (!disposed) markFailed(err instanceof Error ? err.message : String(err));
@@ -1744,8 +1598,10 @@ function DesktopView({ device, onBack }: { device: Device; onBack: () => void })
     connect();
     return () => {
       disposed = true;
-      window.clearTimeout(fallbackTimer);
+      directDeadline.dispose();
+      handshakeDeadline.dispose();
       rfbRef.current?.disconnect();
+      rfbRef.current = null;
       rtc?.peer.close();
       socket?.close();
     };
@@ -1790,43 +1646,39 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
   const [dragOver, setDragOver] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  const operations = useRef(new AbortController());
+
   const fileOp = (type: string, payload: Record<string, unknown> = {}) =>
-    new Promise<{ type: string; entries?: RemoteEntry[]; error?: string }>((resolve, reject) => {
-      const ws = new WebSocket(wsUrl("/ws/files", { device: device.id }));
-      ws.onopen = () => ws.send(JSON.stringify({ type, ...payload }));
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "file:list:result" || msg.type === "file:roots:result" || msg.type === "file:done") {
-          ws.close();
-          resolve(msg);
-        }
-        if (msg.type === "file:error") {
-          ws.close();
-          reject(new Error(msg.error || "operation failed"));
-        }
-      };
-      ws.onerror = () => reject(new Error("websocket error"));
-    });
+    requestFiles<{ type: string; entries?: RemoteEntry[]; error?: string }>(
+      new WebSocket(wsUrl("/ws/files", { device: device.id })),
+      { type, ...payload },
+      { signal: operations.current.signal },
+    );
 
   const loadDir = async (p: string) => {
+    const signal = operations.current.signal;
     setBusy(true);
     setMessage("");
     try {
       const msg = await fileOp("file:list", { path: p });
+      if (signal.aborted) return;
       setEntries(msg.entries || []);
       setPath(p);
       setSelected(new Set());
     } catch (err) {
-      setMessage(String(err));
+      if (!signal.aborted) setMessage(String(err));
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setBusy(false);
     }
   };
 
   useEffect(() => {
+    const controller = new AbortController();
+    operations.current = controller;
     (async () => {
       try {
         const msg = await fileOp("file:roots");
+        if (controller.signal.aborted) return;
         const roots = msg.entries || [];
         if (roots.length > 0) {
           await loadDir(roots[0].path);
@@ -1834,101 +1686,69 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
           setMessage("No allowed file roots configured on the agent.");
         }
       } catch (err) {
-        setMessage(String(err));
+        if (!controller.signal.aborted) setMessage(String(err));
       }
     })();
+    return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [device.id]);
 
   const separator = path.includes("\\") ? "\\" : "/";
   const joinPath = (dir: string, name: string) => (dir.endsWith(separator) ? dir + name : dir + separator + name);
 
-  const uploadOne = (file: File) =>
-    new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(
-        wsUrl("/ws/file", {
-          device: device.id,
-          op: "upload",
-          name: file.name,
-          path,
-          size: file.size,
-        }),
-      );
-      ws.onopen = async () => {
-        const raw = new Uint8Array(await file.arrayBuffer());
-        const CHUNK = 64 * 1024;
-        for (let i = 0; i < raw.length; i += CHUNK) {
-          ws.send(raw.slice(i, i + CHUNK));
-        }
-        ws.send(JSON.stringify({ type: "file:upload:done" }));
-      };
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "file:done") {
-          resolve();
-        }
-        if (msg.type === "file:error") {
-          reject(new Error(msg.error || "upload failed"));
-        }
-      };
-      ws.onerror = () => reject(new Error("upload websocket error"));
-    });
+  const uploadOne = (file: File) => uploadFile(
+    new WebSocket(wsUrl("/ws/file", { device: device.id, op: "upload", name: file.name, path, size: file.size })),
+    file,
+    { signal: operations.current.signal },
+  );
 
   const handleUpload = async (files: FileList | File[]) => {
+    const signal = operations.current.signal;
     setBusy(true);
     setMessage("");
     try {
       for (const file of Array.from(files)) {
         await uploadOne(file);
+        if (signal.aborted) return;
       }
       await loadDir(path);
     } catch (err) {
-      setMessage(String(err));
+      if (!signal.aborted) setMessage(String(err));
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setBusy(false);
       if (fileRef.current) {
         fileRef.current.value = "";
       }
     }
   };
 
-  const downloadPath = (p: string, name: string) =>
-    new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(
-        wsUrl("/ws/file", {
-          device: device.id,
-          op: "download",
-          path: p,
-        }),
-      );
-      ws.binaryType = "arraybuffer";
-      const chunks: BlobPart[] = [];
-      ws.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "file:done") {
-            const blob = new Blob(chunks);
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = name;
-            a.click();
-            URL.revokeObjectURL(url);
-            ws.close();
-            resolve();
-          }
-          if (msg.type === "file:error") {
-            ws.close();
-            reject(new Error(msg.error || "download failed"));
-          }
-        } else {
-          chunks.push(event.data);
-        }
-      };
-      ws.onerror = () => reject(new Error("download websocket error"));
-    });
+  const downloadPath = async (p: string, name: string) => {
+    const signal = operations.current.signal;
+    const blob = await downloadFile(
+      new WebSocket(wsUrl("/ws/file", { device: device.id, op: "download", path: p })),
+      { signal },
+    );
+    if (signal.aborted) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    // Give the browser time to consume the URL before revoking it.
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleDownload = async (p: string, name: string) => {
+    const signal = operations.current.signal;
+    setBusy(true);
+    setMessage("");
+    try { await downloadPath(p, name); }
+    catch (err) { if (!signal.aborted) setMessage(String(err)); }
+    finally { if (!signal.aborted) setBusy(false); }
+  };
 
   const handleDownloadSelected = async () => {
+    const signal = operations.current.signal;
     setBusy(true);
     setMessage("");
     try {
@@ -1936,27 +1756,31 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
         const entry = entries.find((e) => e.path === p);
         if (entry && !entry.isDir) {
           await downloadPath(p, entry.name);
+          if (signal.aborted) return;
         }
       }
     } catch (err) {
-      setMessage(String(err));
+      if (!signal.aborted) setMessage(String(err));
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setBusy(false);
     }
   };
 
   const handleNewFolder = async () => {
+    const signal = operations.current.signal;
     const name = prompt("New folder name");
     if (!name?.trim()) return;
     try {
       await fileOp("file:mkdir", { path: joinPath(path, name.trim()) });
+      if (signal.aborted) return;
       await loadDir(path);
     } catch (err) {
-      setMessage(String(err));
+      if (!signal.aborted) setMessage(String(err));
     }
   };
 
   const handleRename = async (entry: RemoteEntry) => {
+    const signal = operations.current.signal;
     const name = prompt("New name", entry.name);
     if (!name?.trim() || name.trim() === entry.name) return;
     try {
@@ -1964,25 +1788,28 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
         path: entry.path,
         target: joinPath(path, name.trim()),
       });
+      if (signal.aborted) return;
       await loadDir(path);
     } catch (err) {
-      setMessage(String(err));
+      if (!signal.aborted) setMessage(String(err));
     }
   };
 
   const handleDeleteSelected = async () => {
+    const signal = operations.current.signal;
     if (selected.size === 0 || !confirm(`Delete ${selected.size} item(s)?`)) return;
     setBusy(true);
     setMessage("");
     try {
       for (const p of selected) {
         await fileOp("file:delete", { path: p });
+        if (signal.aborted) return;
       }
       await loadDir(path);
     } catch (err) {
-      setMessage(String(err));
+      if (!signal.aborted) setMessage(String(err));
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setBusy(false);
     }
   };
 
@@ -2015,6 +1842,7 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
       </header>
 
       <main className="content">
+        <p className="file-message">Downloads are buffered in browser memory (maximum 128 MiB). Use another file transfer tool for larger files.</p>
         <div className="file-toolbar">
           <div className="breadcrumbs">
             {segments.map((seg, i) => {
@@ -2081,7 +1909,7 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
                 </span>
                 <button
                   className="file-name"
-                  onClick={() => (entry.isDir ? loadDir(entry.path) : downloadPath(entry.path, entry.name))}
+                  onClick={() => (entry.isDir ? loadDir(entry.path) : handleDownload(entry.path, entry.name))}
                 >
                   {entry.isDir ? <Folder size={16} /> : <FileText size={16} />}
                   {entry.name}

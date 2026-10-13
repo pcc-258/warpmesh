@@ -24,7 +24,8 @@ export type SessionStage =
 export type SessionKind = "terminal" | "desktop";
 
 /** How long a direct path is attempted before falling back to the relay. */
-export const DIRECT_BUDGET_MS = 20000;
+import { DIRECT_BUDGET_MS } from "./sessionLifecycle";
+export { DIRECT_BUDGET_MS };
 
 /**
  * Which path carries the session.
@@ -149,7 +150,8 @@ export function useSessionStage() {
   const markDisconnected = useCallback(
     (why?: string) => {
       stopBudget();
-      applyStage("disconnected", why);
+      // Closing resources after failure must not hide the useful error reason.
+      if (stageRef.current !== "error") applyStage("disconnected", why);
     },
     [applyStage, stopBudget],
   );
@@ -261,7 +263,7 @@ const TERMINAL_STAGES: SessionStage[] = ["connected", "disconnected", "error"];
  */
 export function shouldAdvanceStage(current: SessionStage, next: SessionStage): boolean {
   const currentTerminal = TERMINAL_STAGES.includes(current);
-  if (currentTerminal) return TERMINAL_STAGES.includes(next);
+  if (currentTerminal) return TERMINAL_STAGES.includes(next) || (current === "connected" && (next === "switching" || next === "relaying"));
   return stageRank(next) >= stageRank(current);
 }
 

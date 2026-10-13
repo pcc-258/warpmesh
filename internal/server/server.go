@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pcc-258/warpmesh/internal/protocol"
 )
 
 // Config controls the relay server.
@@ -33,16 +34,19 @@ type Config struct {
 	AdminPassword string
 	AgentListen   string
 	KeyTTL        time.Duration
+	AgentDir      string
 }
 
 type agentConn struct {
-	deviceID   string
-	publicIP   string
-	directPort int
-	ws         *websocket.Conn
-	writeMu    sync.Mutex
-	lastSyncMu sync.Mutex
-	lastSync   time.Time
+	deviceID     string
+	publicIP     string
+	directPort   int
+	ws           *websocket.Conn
+	writeMu      sync.Mutex
+	lastSyncMu   sync.Mutex
+	lastSync     time.Time
+	capMu        sync.RWMutex
+	capabilities *protocol.DeviceCapabilities
 }
 
 type termSession struct {
@@ -73,6 +77,12 @@ func (s *fileSession) write(msg any) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.browser.WriteJSON(msg)
+}
+
+func (s *fileSession) writeBinary(raw []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.browser.WriteMessage(websocket.BinaryMessage, raw)
 }
 
 type managerSession struct {
@@ -276,6 +286,8 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/audit", s.handleAudit)
 	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
 	mux.HandleFunc("/api/ws-ticket", s.handleWSTicket)
+	mux.HandleFunc("/api/agent-downloads", s.handleAgentDownloads)
+	mux.HandleFunc("/api/agent-downloads/", s.handleAgentDownloads)
 	mux.HandleFunc("/api/forward-policy", s.handleForwardPolicy)
 	mux.HandleFunc("/api/forward-grants", s.handleForwardGrants)
 	if includeAgent {
@@ -378,12 +390,24 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 	if r.TLS != nil {
 		scheme = "wss"
 	}
-	port := strings.TrimPrefix(s.cfg.AgentListen, ":")
-	if port == "" {
-		port = "443"
+	// A single-listener deployment advertises the actual request port. A
+	// separate agent listener may be configured as either :port or host:port.
+	port := ""
+	if s.cfg.AgentListen != "" {
+		_, port, _ = net.SplitHostPort(s.cfg.AgentListen)
 	}
+	if port == "" {
+		_, port, _ = net.SplitHostPort(r.Host)
+	}
+	if port == "" {
+		port = "80"
+		if r.TLS != nil {
+			port = "443"
+		}
+	}
+	host = strings.Trim(host, "[]")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"agentWSS": fmt.Sprintf("%s://%s:%s/ws/agent", scheme, host, port),
+		"agentWSS": fmt.Sprintf("%s://%s/ws/agent", scheme, net.JoinHostPort(host, port)),
 	})
 }
 
@@ -442,10 +466,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		token = strings.TrimPrefix(auth, "Bearer ")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "logout requires POST"})
+		return
 	}
+	if !checkCSRF(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "cross-origin request rejected"})
+		return
+	}
+	// Use the same credential precedence as authenticate: clearing the cookie
+	// alone leaves its server-side session replayable for up to 24 hours.
+	token := requestToken(r)
 	username := ""
 	s.sessionsMu.Lock()
 	if entry, ok := s.sessions[token]; ok {

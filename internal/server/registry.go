@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pcc-258/warpmesh/internal/protocol"
+
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
@@ -32,17 +34,18 @@ func ValidForwardPolicy(p string) bool {
 
 // Device is the persisted metadata for one managed device.
 type Device struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Hostname      string    `json:"hostname"`
-	OS            string    `json:"os"`
-	Arch          string    `json:"arch"`
-	LANIPs        []string  `json:"lanIPs,omitempty"`
-	Group         string    `json:"group,omitempty"`
-	ForwardPolicy string    `json:"forwardPolicy"`
-	CreatedAt     time.Time `json:"createdAt"`
-	LastSeen      time.Time `json:"lastSeen"`
-	Online        bool      `json:"online"`
+	ID            string                       `json:"id"`
+	Name          string                       `json:"name"`
+	Hostname      string                       `json:"hostname"`
+	OS            string                       `json:"os"`
+	Arch          string                       `json:"arch"`
+	LANIPs        []string                     `json:"lanIPs,omitempty"`
+	Group         string                       `json:"group,omitempty"`
+	ForwardPolicy string                       `json:"forwardPolicy"`
+	CreatedAt     time.Time                    `json:"createdAt"`
+	LastSeen      time.Time                    `json:"lastSeen"`
+	Online        bool                         `json:"online"`
+	Capabilities  *protocol.DeviceCapabilities `json:"capabilities"`
 }
 
 // ForwardGrant authorizes a restricted source device to reach a target device
@@ -540,6 +543,20 @@ func (r *Registry) UpdateUser(username string, password *string, role *string, d
 	if err != nil {
 		return errors.New("user not found")
 	}
+	if role != nil {
+		if *role != "admin" && *role != "operator" {
+			return errors.New("role must be admin or operator")
+		}
+		if u.Role == "admin" && *role != "admin" {
+			var admins int
+			if err := r.db.QueryRow("SELECT COUNT(*) FROM users WHERE role = 'admin'").Scan(&admins); err != nil {
+				return err
+			}
+			if admins <= 1 {
+				return errors.New("cannot demote the last admin")
+			}
+		}
+	}
 	newPasswordHash := ""
 	if password != nil {
 		hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
@@ -620,7 +637,9 @@ func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string)
 	case err != nil:
 		return nil, err
 	default:
-		if name == "" {
+		// Inventory names are managed in the console. A reconnect may refresh
+		// host metadata but must not overwrite an operator's rename.
+		if existingName != "" {
 			name = existingName
 		}
 		_, err = r.db.Exec(`

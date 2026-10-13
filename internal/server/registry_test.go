@@ -13,6 +13,11 @@ func TestRegistryLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := reg.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if _, err := reg.Upsert("dev-1", "home", "home-pc", "linux", "amd64", []string{"192.168.1.2"}); err != nil {
 		t.Fatal(err)
 	}
