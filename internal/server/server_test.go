@@ -481,11 +481,8 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 	defer func() { _ = agentA.Close() }()
 	agentB := dialAgent(keyB)
 	defer func() { _ = agentB.Close() }()
-	waitFor(t, func() bool {
-		_, okA := srv.reg.Get(keyA.DeviceID)
-		_, okB := srv.reg.Get(keyB.DeviceID)
-		return okA && okB
-	})
+	waitForAgent(t, srv, keyA.DeviceID)
+	waitForAgent(t, srv, keyB.DeviceID)
 
 	if err := agentA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
@@ -581,11 +578,8 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 	defer func() { _ = agentA.Close() }()
 	agentB := dialAgent(keyB)
 	defer func() { _ = agentB.Close() }()
-	waitFor(t, func() bool {
-		_, okA := srv.reg.Get(keyA.DeviceID)
-		_, okB := srv.reg.Get(keyB.DeviceID)
-		return okA && okB
-	})
+	waitForAgent(t, srv, keyA.DeviceID)
+	waitForAgent(t, srv, keyB.DeviceID)
 
 	if err := agentA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
