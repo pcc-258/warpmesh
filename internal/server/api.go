@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -19,6 +20,9 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	devices := s.reg.List()
+	for i := range devices {
+		s.attachCapabilities(&devices[i])
+	}
 	if !s.isAdmin(actor) {
 		user, _ := s.actorInfo(actor)
 		allowed := make(map[string]bool)
@@ -48,15 +52,27 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.Method {
+	case http.MethodGet:
+		if !s.canAccessDevice(actor, id) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "device not granted"})
+			return
+		}
+		d, found := s.reg.Get(id)
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "device not found"})
+			return
+		}
+		s.attachCapabilities(&d)
+		writeJSON(w, http.StatusOK, d)
 	case http.MethodPatch:
 		if !s.isAdmin(actor) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin only"})
 			return
 		}
 		var req struct {
-			Name          string `json:"name"`
-			Group         string `json:"group"`
-			ForwardPolicy string `json:"forwardPolicy"`
+			Name          string  `json:"name"`
+			Group         *string `json:"group"`
+			ForwardPolicy string  `json:"forwardPolicy"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -69,12 +85,12 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = s.reg.RecordAudit(actor, "device.rename", id, req.Name)
 		}
-		if req.Group != "" {
-			if err := s.reg.SetGroup(id, req.Group); err != nil {
+		if req.Group != nil {
+			if err := s.reg.SetGroup(id, *req.Group); err != nil {
 				writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
 				return
 			}
-			_ = s.reg.RecordAudit(actor, "device.group", id, req.Group)
+			_ = s.reg.RecordAudit(actor, "device.group", id, *req.Group)
 		}
 		if req.ForwardPolicy != "" {
 			if !ValidForwardPolicy(req.ForwardPolicy) {
@@ -88,6 +104,7 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 			_ = s.reg.RecordAudit(actor, "device.forward-policy", id, req.ForwardPolicy)
 		}
 		d, _ := s.reg.Get(id)
+		s.attachCapabilities(&d)
 		writeJSON(w, http.StatusOK, d)
 	case http.MethodDelete:
 		if !s.isAdmin(actor) {
@@ -102,6 +119,19 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) attachCapabilities(d *Device) {
+	conn := s.getAgent(d.ID)
+	if conn == nil {
+		return
+	}
+	conn.capMu.RLock()
+	defer conn.capMu.RUnlock()
+	if conn.capabilities != nil {
+		copy := *conn.capabilities
+		d.Capabilities = &copy
 	}
 }
 
@@ -238,12 +268,27 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			online++
 		}
 	}
+	// Derive groups from the same visible inventory as the counts. Audit data
+	// is admin-only, just like /api/audit; the dashboard must not bypass that.
+	groups := make([]string, 0)
+	seenGroups := make(map[string]bool)
+	for _, device := range devices {
+		if device.Group != "" && !seenGroups[device.Group] {
+			groups = append(groups, device.Group)
+			seenGroups[device.Group] = true
+		}
+	}
+	sort.Strings(groups)
+	activity := make([]AuditEntry, 0)
+	if s.isAdmin(actor) {
+		activity = s.reg.ListAudit(10)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"total":          len(devices),
 		"online":         online,
-		"groups":         s.reg.Groups(),
+		"groups":         groups,
 		"byOS":           byOS,
-		"recentActivity": s.reg.ListAudit(10),
+		"recentActivity": activity,
 	})
 }
 

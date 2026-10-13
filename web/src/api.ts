@@ -11,6 +11,7 @@ export interface Device {
   createdAt: string;
   lastSeen: string;
   online: boolean;
+  capabilities?: { terminal: boolean; files: boolean; desktop: boolean; desktopHint: string } | null;
 }
 
 export interface Stats {
@@ -140,8 +141,8 @@ export function optionalDate(value?: string | null): string | undefined {
 export class ApiError extends Error {
   readonly status: number;
 
-  constructor(status: number) {
-    super(`request failed: ${status}`);
+  constructor(status: number, message?: string) {
+    super(message || `Request failed (${status}). Please retry.`);
     this.name = "ApiError";
     this.status = status;
   }
@@ -160,7 +161,8 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
-    throw new ApiError(res.status);
+    const body = await res.json().catch(() => null);
+    throw new ApiError(res.status, typeof body?.error === "string" ? body.error : undefined);
   }
   if (res.status === 204) {
     return undefined as T;
@@ -188,6 +190,14 @@ export function renameDevice(id: string, name: string): Promise<Device> {
     method: "PATCH",
     body: JSON.stringify({ name }),
   });
+}
+
+export function updateDevice(id: string, patch: { name?: string; group?: string }): Promise<Device> {
+  return api<Device>(`/api/devices/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) });
+}
+
+export function listAgentDownloads(): Promise<{ platform: string; available: boolean }[]> {
+  return api("/api/agent-downloads");
 }
 
 export function deleteDevice(id: string): Promise<void> {
@@ -279,11 +289,11 @@ export function updateUser(username: string, patch: {
   /** null clears the expiry; the server parses this as *time.Time. */
   expiresAt?: string | null;
 }): Promise<void> {
-  return api<void>(`/api/users/${username}`, { method: "PATCH", body: JSON.stringify(patch) });
+  return api<void>(`/api/users/${encodeURIComponent(username)}`, { method: "PATCH", body: JSON.stringify(patch) });
 }
 
 export function deleteUser(username: string): Promise<void> {
-  return api<void>(`/api/users/${username}`, { method: "DELETE" });
+  return api<void>(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" });
 }
 
 export function listAudit(limit = 50): Promise<AuditEntry[]> {

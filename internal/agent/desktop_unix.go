@@ -43,13 +43,17 @@ func (a *Agent) ensureVNCServer() {
 		time.Sleep(time.Second)
 		_ = os.Setenv("DISPLAY", ":1")
 	}
-	cmd := exec.Command("x11vnc", "-display", os.Getenv("DISPLAY"), "-forever", "-shared",
-		"-rfbport", fmt.Sprintf("%d", a.cfg.VNCPort), "-nopw", "-bg")
+	cmd := exec.Command("x11vnc", vncArgs(os.Getenv("DISPLAY"), a.cfg.VNCPort)...)
 	if err := cmd.Start(); err == nil {
 		log.Printf("started x11vnc on port %d", a.cfg.VNCPort)
 	} else {
 		log.Printf("start x11vnc failed: %v", err)
 	}
+}
+
+func vncArgs(display string, port int) []string {
+	return []string{"-display", display, "-forever", "-shared", "-localhost",
+		"-rfbport", fmt.Sprintf("%d", port), "-nopw", "-bg"}
 }
 
 func vncListening(port int) bool {

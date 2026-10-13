@@ -45,13 +45,21 @@ func (a *Agent) startScreenLink(sessionID string) {
 	}
 	defer func() { _ = conn.Close() }()
 
+	bridgeScreen(ws, conn)
+}
+
+// The first direction to stop tears down both transports, unblocking the
+// other direction even when its peer stays connected but sends no more data.
+func bridgeScreen(ws *websocket.Conn, conn net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				_ = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+				if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+					break
+				}
 			}
 			if err != nil {
 				break
@@ -65,10 +73,14 @@ func (a *Agent) startScreenLink(sessionID string) {
 			if err != nil {
 				break
 			}
-			_, _ = conn.Write(data)
+			if _, err := conn.Write(data); err != nil {
+				break
+			}
 		}
 		done <- struct{}{}
 	}()
 	<-done
+	_ = ws.Close()
+	_ = conn.Close()
 	<-done
 }

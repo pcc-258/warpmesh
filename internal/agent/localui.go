@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -29,6 +31,9 @@ func (a *Agent) uiIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) uiForwards(w http.ResponseWriter, r *http.Request) {
+	if !localUIRequest(w, r) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeLocalJSON(w, http.StatusOK, map[string]any{
@@ -52,6 +57,9 @@ func (a *Agent) uiForwards(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) uiForwardByPort(w http.ResponseWriter, r *http.Request) {
+	if !localUIRequest(w, r) {
+		return
+	}
 	if r.Method != http.MethodDelete {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -67,6 +75,28 @@ func (a *Agent) uiForwardByPort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Loopback binding alone does not prevent browser CSRF or DNS rebinding.
+// Origin-less clients remain supported, but browser origins must match exactly.
+func localUIRequest(w http.ResponseWriter, r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	allowed := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		allowed = allowed && err == nil && u.Scheme == "http" && u.Host == r.Host && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == ""
+	}
+	if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		allowed = false
+	}
+	if !allowed {
+		writeLocalJSON(w, http.StatusForbidden, map[string]any{"error": "local same-origin requests only"})
+	}
+	return allowed
 }
 
 func writeLocalJSON(w http.ResponseWriter, status int, v any) {
@@ -112,10 +142,13 @@ a{color:#2dd4bf}
 async function load(){
   const r=await fetch('/api/forwards'); const data=await r.json();
   document.getElementById('meta').textContent='device: '+data.device;
-  const list=document.getElementById('list'); list.innerHTML='';
-  for(const f of data.forwards){
+  const list=document.getElementById('list'); list.replaceChildren();
+  for(const f of data.forwards ?? []){
     const row=document.createElement('div'); row.className='row';
-    row.innerHTML='<div><strong>127.0.0.1:'+f.localPort+'</strong><br><small>'+f.targetDeviceId+':'+f.targetPort+'</small></div>';
+    const info=document.createElement('div');
+    const port=document.createElement('strong'); port.textContent='127.0.0.1:'+f.localPort;
+    const target=document.createElement('small'); target.textContent=f.targetDeviceId+':'+f.targetPort;
+    info.append(port,document.createElement('br'),target); row.appendChild(info);
     const btn=document.createElement('button'); btn.className='del'; btn.textContent='Delete'; btn.onclick=async()=>{await fetch('/api/forwards/'+f.localPort,{method:'DELETE'});load();};
     row.appendChild(btn); list.appendChild(row);
   }

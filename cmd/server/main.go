@@ -52,6 +52,7 @@ func run() error {
 	adminPassword := flag.String("admin-password", os.Getenv("DEVICE_RELAY_ADMIN_PASSWORD"), "initial console password; required")
 	keyTTL := flag.String("key-ttl", envOr("DEVICE_RELAY_KEY_TTL", "8760h"), "device key lifetime")
 	dataDir := flag.String("data-dir", envOr("DEVICE_RELAY_DATA_DIR", "./data"), "directory for persisted state")
+	agentDir := flag.String("agent-dir", envOr("DEVICE_RELAY_AGENT_DIR", "/opt/warpmesh/agents"), "directory containing downloadable agent binaries")
 	tlsCert := flag.String("tls-cert", os.Getenv("DEVICE_RELAY_TLS_CERT"), "optional TLS certificate file")
 	tlsKey := flag.String("tls-key", os.Getenv("DEVICE_RELAY_TLS_KEY"), "optional TLS private key file")
 	flag.Parse()
@@ -70,6 +71,21 @@ func run() error {
 		return errors.New(`the default admin password "admin" is not allowed: set DEVICE_RELAY_ADMIN_PASSWORD to a strong value`)
 	}
 
+	tlsEnabled := *domain != "" || (*tlsCert != "" && *tlsKey != "")
+	if (*tlsCert == "") != (*tlsKey == "") {
+		return errors.New("tls-cert and tls-key must be configured together")
+	}
+	if *altHTTPSListen != "" && !tlsEnabled {
+		return errors.New("alt-https-listen requires -domain or -tls-cert/-tls-key")
+	}
+	agentListen := *listen
+	if tlsEnabled {
+		agentListen = *httpsListen
+	}
+	if *altHTTPSListen != "" {
+		agentListen = *altHTTPSListen
+	}
+
 	web, err := fs.Sub(relay.WebFS, "web/dist")
 	if err != nil {
 		return fmt.Errorf("embedded web ui unavailable: %w", err)
@@ -80,13 +96,14 @@ func run() error {
 		WebFS:         web,
 		AdminUser:     *adminUser,
 		AdminPassword: *adminPassword,
-		AgentListen:   *altHTTPSListen,
+		AgentListen:   agentListen,
 		KeyTTL:        parsedTTL,
+		AgentDir:      *agentDir,
 	})
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}
-	handler := srv.WebHandler()
+	handler := primaryHandler(srv, *altHTTPSListen != "")
 	agentHandler := srv.AgentHandler()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -132,6 +149,15 @@ func run() error {
 	serveAll(ctx, starters)
 	shutdownServers(servers)
 	return nil
+}
+
+// primaryHandler includes the agent routes unless a dedicated TLS listener
+// serves them. Both plain HTTP and single-port HTTPS must accept agents.
+func primaryHandler(srv *server.Server, separateAgentPlane bool) http.Handler {
+	if separateAgentPlane {
+		return srv.WebHandler()
+	}
+	return srv.Handler()
 }
 
 // newHTTPServer builds a listener with the shared timeout policy and a

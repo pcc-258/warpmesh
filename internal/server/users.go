@@ -35,6 +35,10 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		if req.Role == "" {
 			req.Role = "operator"
 		}
+		if req.Role != "admin" && req.Role != "operator" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "role must be admin or operator"})
+			return
+		}
 		if err := s.reg.CreateUser(req.Username, req.Password, req.Role, req.DeviceIDs, req.ExpiresAt); err != nil {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 			return
@@ -98,7 +102,14 @@ func (s *Server) handleUserByUsername(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := s.reg.UpdateUser(username, req.Password, req.Role, req.DeviceIDs, expiresAt); err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+			status := http.StatusBadRequest
+			if err.Error() == "user not found" {
+				status = http.StatusNotFound
+			}
+			if err.Error() == "cannot demote the last admin" {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
 		_ = s.reg.RecordAudit(actor, "user.update", username, "")

@@ -100,7 +100,7 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	// The registry is already online from the hello upsert above, so the first
 	// throttled refresh is only due after agentOnlineSyncInterval.
-	conn := &agentConn{deviceID: hello.DeviceID, ws: ws, directPort: hello.DirectPort, lastSync: time.Now()}
+	conn := &agentConn{deviceID: hello.DeviceID, ws: ws, directPort: hello.DirectPort, lastSync: time.Now(), capabilities: hello.Capabilities}
 	if host, _, err := net.SplitHostPort(ws.RemoteAddr().String()); err == nil {
 		conn.publicIP = host
 	}
@@ -170,6 +170,12 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 	switch msg.Type {
+	case protocol.TypeStatus:
+		if conn := s.getAgent(deviceID); conn != nil {
+			conn.capMu.Lock()
+			conn.capabilities = msg.Capabilities
+			conn.capMu.Unlock()
+		}
 	case protocol.TypePong:
 		return
 	case protocol.TypeTermOutput, protocol.TypeTermExit, protocol.TypeTermError:
@@ -231,10 +237,14 @@ func (s *Server) routeAgentMessage(deviceID string, msg protocol.Message) {
 				return
 			}
 			sess.traffic.Add(0, int64(len(raw)))
-			_ = sess.browser.WriteMessage(websocket.BinaryMessage, raw)
+			if err := sess.writeBinary(raw); err != nil {
+				_ = sess.browser.Close()
+			}
 			return
 		}
-		_ = sess.browser.WriteJSON(msg)
+		if err := sess.write(msg); err != nil {
+			_ = sess.browser.Close()
+		}
 		if msg.Type == protocol.TypeFileDone || msg.Type == protocol.TypeFileError {
 			state := "closed"
 			if msg.Type == protocol.TypeFileError {

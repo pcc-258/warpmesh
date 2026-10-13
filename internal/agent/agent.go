@@ -2,6 +2,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -48,43 +49,166 @@ type Config struct {
 // ForwardSpec exposes a local TCP listener that reaches a port on another
 // device, direct-first with server relay fallback.
 type ForwardSpec struct {
-	LocalPort      int
-	TargetDeviceID string
-	TargetPort     int
+	LocalPort      int    `json:"localPort"`
+	TargetDeviceID string `json:"targetDeviceId"`
+	TargetPort     int    `json:"targetPort"`
 }
 
 type forwardConn struct {
-	mu     sync.Mutex
-	conn   net.Conn
-	closed bool
+	mu         sync.Mutex
+	conn       net.Conn
+	closed     bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	writes     chan forwardWrite
+	ws         *websocket.Conn
+	writing    bool
+	draining   bool
+	drainTimer *time.Timer
 }
 
-func (f *forwardConn) Read(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, net.ErrClosed
-	}
-	return f.conn.Read(p)
+type forwardWrite struct {
+	data  []byte
+	close bool
 }
 
-func (f *forwardConn) Write(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, net.ErrClosed
-	}
-	return f.conn.Write(p)
+const forwardDrainTimeout = 5 * time.Second
+
+func newForwardConn(conn net.Conn, ws *websocket.Conn) *forwardConn {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &forwardConn{conn: conn, ctx: ctx, cancel: cancel, writes: make(chan forwardWrite, 65), ws: ws}
 }
 
-func (f *forwardConn) Close() error {
+// Never hold mu across network IO: Close must interrupt blocked reads/writes.
+func (f *forwardConn) connection() net.Conn {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
 		return nil
 	}
+	return f.conn
+}
+
+func (f *forwardConn) attach(conn net.Conn) bool {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	f.conn = conn
+	f.mu.Unlock()
+	return true
+}
+
+func (f *forwardConn) Read(p []byte) (int, error) {
+	if conn := f.connection(); conn != nil {
+		return conn.Read(p)
+	}
+	return 0, net.ErrClosed
+}
+
+func (f *forwardConn) Write(p []byte) (int, error) {
+	if conn := f.connection(); conn != nil {
+		return conn.Write(p)
+	}
+	return 0, net.ErrClosed
+}
+
+func (f *forwardConn) Close() error {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return nil
+	}
 	f.closed = true
-	return f.conn.Close()
+	conn := f.conn
+	timer := f.drainTimer
+	f.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	if f.cancel != nil {
+		f.cancel()
+	}
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
+}
+
+// Preserve frame order without letting a slow TCP peer block the control loop.
+// A peer exceeding the bounded backlog loses its session rather than growing RAM.
+func (f *forwardConn) enqueue(data []byte) {
+	f.mu.Lock()
+	if f.closed || f.draining {
+		f.mu.Unlock()
+		return
+	}
+	// Reserve one slot for an EOF marker even when the data backlog is full.
+	if len(f.writes) >= cap(f.writes)-1 {
+		f.mu.Unlock()
+		_ = f.Close()
+		return
+	}
+	f.writes <- forwardWrite{data: data}
+	f.mu.Unlock()
+}
+
+func (f *forwardConn) startWriter() {
+	f.mu.Lock()
+	if f.closed || f.writing {
+		f.mu.Unlock()
+		return
+	}
+	f.writing = true
+	f.mu.Unlock()
+	safeGo("forward writer", f.writeLoop)
+}
+
+func (f *forwardConn) isDraining() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.draining
+}
+
+// Relay EOF is ordered behind all preceding data, unlike forced cancellation.
+// Keep the session registered while draining so reconnect can still abort it.
+func (f *forwardConn) gracefulClose(timeout time.Duration) {
+	f.mu.Lock()
+	if f.closed || f.draining {
+		f.mu.Unlock()
+		return
+	}
+	if !f.writing || f.conn == nil {
+		f.mu.Unlock()
+		_ = f.Close()
+		return
+	}
+	f.draining = true
+	f.drainTimer = time.AfterFunc(timeout, func() { _ = f.Close() })
+	conn := f.conn
+	f.writes <- forwardWrite{close: true}
+	f.mu.Unlock()
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+}
+
+func (f *forwardConn) writeLoop() {
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case item := <-f.writes:
+			if item.close {
+				_ = f.Close()
+				return
+			}
+			if _, err := f.Write(item.data); err != nil {
+				_ = f.Close()
+				return
+			}
+		}
+	}
 }
 
 // Agent maintains one control connection to the relay server.
@@ -234,17 +358,34 @@ func (a *Agent) connectOnce() error {
 	}()
 
 	if err := a.send(protocol.Message{
-		Type:     protocol.TypeHello,
-		DeviceID: a.cfg.DeviceID,
-		Name:     a.cfg.Name,
-		Hostname: a.cfg.Name,
-		OS:       runtime.GOOS,
-		Arch:     runtime.GOARCH,
-		LANIPs:   lanIPs(),
+		Type:         protocol.TypeHello,
+		DeviceID:     a.cfg.DeviceID,
+		Name:         a.cfg.Name,
+		Hostname:     a.cfg.Name,
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		LANIPs:       lanIPs(),
+		Capabilities: a.capabilities(),
 	}); err != nil {
 		return err
 	}
 	log.Printf("agent %s connected to %s", a.cfg.DeviceID, u.Host)
+	statusDone := make(chan struct{})
+	defer close(statusDone)
+	safeGo("device capabilities", func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-statusDone:
+				return
+			case <-ticker.C:
+				if err := a.sendOn(ws, protocol.Message{Type: protocol.TypeStatus, Capabilities: a.capabilities()}); err != nil {
+					return
+				}
+			}
+		}
+	})
 
 	for {
 		var msg protocol.Message
@@ -341,24 +482,29 @@ func (a *Agent) handleMessage(msg protocol.Message) (err error) {
 		if msg.Path != "" {
 			dir = msg.Path
 		}
-		if !a.pathAllowed(dir) {
-			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is outside the allowed directories"})
-		}
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
-		}
-		f, err := os.Create(filepath.Join(dir, name))
+		f, err := a.openUpload(dir, name)
 		if err != nil {
 			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
 		}
 		a.mu.Lock()
+		previous := a.uploads[msg.SessionID]
 		a.uploads[msg.SessionID] = f
 		a.mu.Unlock()
+		if previous != nil {
+			_ = previous.Close()
+		}
 		return nil
 	case protocol.TypeFileChunk:
 		raw, err := protocol.DecodeData(msg.Data)
 		if err != nil {
-			return err
+			a.mu.Lock()
+			f := a.uploads[msg.SessionID]
+			delete(a.uploads, msg.SessionID)
+			a.mu.Unlock()
+			if f != nil {
+				_ = f.Close()
+			}
+			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
 		}
 		a.mu.Lock()
 		f := a.uploads[msg.SessionID]
@@ -366,22 +512,43 @@ func (a *Agent) handleMessage(msg protocol.Message) (err error) {
 		if f == nil {
 			return nil
 		}
-		_, err = f.Write(raw)
-		return err
+		if _, err := f.Write(raw); err != nil {
+			a.mu.Lock()
+			if a.uploads[msg.SessionID] == f {
+				delete(a.uploads, msg.SessionID)
+			}
+			a.mu.Unlock()
+			_ = f.Close()
+			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+		}
+		return nil
 	case protocol.TypeFileUploadEnd, protocol.TypeFileError:
 		a.mu.Lock()
 		f := a.uploads[msg.SessionID]
 		delete(a.uploads, msg.SessionID)
 		a.mu.Unlock()
 		if f == nil {
+			if msg.Type == protocol.TypeFileUploadEnd {
+				return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "upload session not found"})
+			}
 			return nil
 		}
-		return f.Close()
+		err := f.Close()
+		if msg.Type == protocol.TypeFileError {
+			return err
+		}
+		if err != nil {
+			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+		}
+		return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
 	case protocol.TypeFileDownload:
 		// Stream in the background so a large transfer cannot block the control
 		// loop, which must keep answering server pings.
+		a.mu.Lock()
+		ws := a.ws
+		a.mu.Unlock()
 		safeGo("file download", func() {
-			if err := a.streamFile(msg); err != nil {
+			if err := a.streamFileOn(msg, ws); err != nil {
 				log.Printf("[agent] stream %s: %v", msg.SessionID, err)
 			}
 		})
@@ -430,9 +597,20 @@ func (a *Agent) handleMessage(msg protocol.Message) (err error) {
 	case protocol.TypeForwardOpen, protocol.TypeForwardError:
 		a.mu.Lock()
 		pending := a.forwardPending[msg.SessionID]
+		var failed *forwardConn
+		if msg.Type == protocol.TypeForwardError {
+			failed = a.forwards[msg.SessionID]
+			delete(a.forwards, msg.SessionID)
+		}
 		a.mu.Unlock()
+		if failed != nil {
+			_ = failed.Close()
+		}
 		if pending != nil {
-			pending <- msg
+			select {
+			case pending <- msg:
+			default:
+			}
 		}
 		return nil
 	case protocol.TypeForwardData:
@@ -444,16 +622,15 @@ func (a *Agent) handleMessage(msg protocol.Message) (err error) {
 		fc := a.forwards[msg.SessionID]
 		a.mu.Unlock()
 		if fc != nil {
-			_, _ = fc.Write(raw)
+			fc.enqueue(raw)
 		}
 		return nil
 	case protocol.TypeForwardClose:
 		a.mu.Lock()
 		fc := a.forwards[msg.SessionID]
-		delete(a.forwards, msg.SessionID)
 		a.mu.Unlock()
 		if fc != nil {
-			_ = fc.Close()
+			fc.gracefulClose(forwardDrainTimeout)
 		}
 		return nil
 	}
@@ -537,17 +714,21 @@ func (a *Agent) handleForwardClient(conn net.Conn, spec ForwardSpec) {
 	relayReady := make(chan protocol.Message, 2)
 	directReady := make(chan struct{}, 1)
 	a.mu.Lock()
+	fc := newForwardConn(conn, a.ws)
+	a.forwards[sessionID] = fc
 	a.forwardPending[sessionID] = relayReady
 	a.directPending[sessionID] = directReady
 	a.mu.Unlock()
+	fc.startWriter()
 	defer func() {
 		a.mu.Lock()
 		delete(a.forwardPending, sessionID)
 		delete(a.directPending, sessionID)
 		a.mu.Unlock()
+		a.finishForward(sessionID, fc)
 	}()
 
-	if err := a.send(protocol.Message{
+	if err := a.sendOn(fc.ws, protocol.Message{
 		Type:      protocol.TypeForwardConnect,
 		SessionID: sessionID,
 		Target:    spec.TargetDeviceID,
@@ -562,6 +743,8 @@ func (a *Agent) handleForwardClient(conn net.Conn, spec ForwardSpec) {
 	}
 
 	select {
+	case <-fc.ctx.Done():
+		return
 	case msg := <-relayReady:
 		if msg.Type == protocol.TypeForwardError || msg.Type == protocol.TypeForwardClose {
 			_ = conn.Close()
@@ -569,6 +752,10 @@ func (a *Agent) handleForwardClient(conn net.Conn, spec ForwardSpec) {
 		}
 	case <-directReady:
 		a.mu.Lock()
+		if fc.ctx.Err() != nil || a.forwards[sessionID] != fc {
+			a.mu.Unlock()
+			return
+		}
 		dc := a.dataChannels[sessionID]
 		a.localConns[sessionID] = conn
 		a.mu.Unlock()
@@ -583,66 +770,72 @@ func (a *Agent) handleForwardClient(conn net.Conn, spec ForwardSpec) {
 		return
 	}
 
-	fc := &forwardConn{conn: conn}
-	a.mu.Lock()
-	a.forwards[sessionID] = fc
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.forwards, sessionID)
-		a.mu.Unlock()
-		_ = fc.Close()
-	}()
-
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			if serr := a.send(protocol.Message{
-				Type:      protocol.TypeForwardData,
-				SessionID: sessionID,
-				Data:      protocol.EncodeData(buf[:n]),
-			}); serr != nil {
-				break
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	_ = a.send(protocol.Message{Type: protocol.TypeForwardClose, SessionID: sessionID})
+	fc.startWriter()
+	a.readForward(sessionID, fc)
 }
 
 func (a *Agent) handleForwardTarget(msg protocol.Message) error {
-	if msg.SessionID == "" || msg.Port <= 0 {
+	if msg.SessionID == "" || msg.Port <= 0 || msg.Port > 65535 {
 		return a.send(protocol.Message{Type: protocol.TypeForwardError, SessionID: msg.SessionID, Error: "invalid forward request"})
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", msg.Port), 5*time.Second)
-	if err != nil {
-		return a.send(protocol.Message{Type: protocol.TypeForwardError, SessionID: msg.SessionID, Error: err.Error()})
-	}
-	fc := &forwardConn{conn: conn}
+	// Reserve synchronously, before spawning: an immediately following close or
+	// disconnect must cancel even a dial which has not started yet.
 	a.mu.Lock()
+	fc := newForwardConn(nil, a.ws)
+	previous := a.forwards[msg.SessionID]
 	a.forwards[msg.SessionID] = fc
 	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.forwards, msg.SessionID)
-		a.mu.Unlock()
-		_ = fc.Close()
-	}()
-
-	if err := a.send(protocol.Message{Type: protocol.TypeForwardOpen, SessionID: msg.SessionID}); err != nil {
-		return err
+	if previous != nil {
+		_ = previous.Close()
 	}
+	safeGo("forward target", func() {
+		defer a.finishForward(msg.SessionID, fc)
+		dialer := net.Dialer{Timeout: 5 * time.Second}
+		conn, err := dialer.DialContext(fc.ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", msg.Port))
+		if err != nil {
+			if fc.ctx.Err() == nil {
+				_ = a.sendOn(fc.ws, protocol.Message{Type: protocol.TypeForwardError, SessionID: msg.SessionID, Error: err.Error()})
+			}
+			return
+		}
+		if !fc.attach(conn) {
+			return
+		}
+		fc.startWriter()
+		if err := a.sendOn(fc.ws, protocol.Message{Type: protocol.TypeForwardOpen, SessionID: msg.SessionID}); err != nil {
+			return
+		}
+		a.readForward(msg.SessionID, fc)
+	})
+	return nil
+}
+
+func (a *Agent) finishForward(sessionID string, fc *forwardConn) {
+	a.mu.Lock()
+	if a.forwards[sessionID] == fc {
+		delete(a.forwards, sessionID)
+	}
+	a.mu.Unlock()
+	_ = fc.Close()
+}
+
+func (a *Agent) readForward(sessionID string, fc *forwardConn) {
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := conn.Read(buf)
+		n, err := fc.Read(buf)
+		if fc.ctx.Err() != nil {
+			break
+		}
+		if fc.isDraining() {
+			if err != nil {
+				break
+			}
+			continue
+		}
 		if n > 0 {
-			if serr := a.send(protocol.Message{
-				Type:      protocol.TypeForwardData,
-				SessionID: msg.SessionID,
-				Data:      protocol.EncodeData(buf[:n]),
+			if serr := a.sendOn(fc.ws, protocol.Message{
+				Type: protocol.TypeForwardData, SessionID: sessionID,
+				Data: protocol.EncodeData(buf[:n]),
 			}); serr != nil {
 				break
 			}
@@ -651,29 +844,36 @@ func (a *Agent) handleForwardTarget(msg protocol.Message) error {
 			break
 		}
 	}
-	_ = a.send(protocol.Message{Type: protocol.TypeForwardClose, SessionID: msg.SessionID})
-	return nil
+	// A TCP read-half EOF must not cancel queued writes during relay EOF drain.
+	if fc.isDraining() {
+		<-fc.ctx.Done()
+		return
+	}
+	// Local IO errors/backlog overflow still need to notify the relay. Replacement
+	// and reconnect already removed this exact registration.
+	a.mu.Lock()
+	registered := a.forwards[sessionID] == fc
+	a.mu.Unlock()
+	if registered {
+		_ = a.sendOn(fc.ws, protocol.Message{Type: protocol.TypeForwardClose, SessionID: sessionID})
+	}
 }
 
-func (a *Agent) streamFile(msg protocol.Message) error {
-	if !a.pathAllowed(msg.Path) {
-		return a.send(protocol.Message{
-			Type:      protocol.TypeFileError,
-			SessionID: msg.SessionID,
-			Error:     "path is outside the allowed directories",
-		})
-	}
-	// Stream instead of buffering the whole file: a large download used to be
-	// read into memory and pushed from the control loop, which both risked OOM
-	// and starved the read deadline until the server dropped the connection.
-	f, err := os.Open(msg.Path)
+func (a *Agent) streamFileOn(msg protocol.Message, ws *websocket.Conn) error {
+	send := func(v any) error { return a.sendOn(ws, v) }
+	root, rel, err := a.fileRoot(msg.Path)
 	if err != nil {
-		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+		return send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
+	}
+	defer func() { _ = root.Close() }()
+	f, err := root.Open(rel)
+	if err != nil {
+		return send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: err.Error()})
 	}
 	defer func() { _ = f.Close() }()
 
 	if info, err := f.Stat(); err == nil && info.IsDir() {
-		return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is a directory"})
+		return send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: "path is a directory"})
 	}
 
 	const chunkSize = 64 * 1024
@@ -681,10 +881,9 @@ func (a *Agent) streamFile(msg protocol.Message) error {
 	for {
 		n, readErr := f.Read(buf)
 		if n > 0 {
-			if err := a.send(protocol.Message{
-				Type:      protocol.TypeFileChunk,
-				SessionID: msg.SessionID,
-				Data:      protocol.EncodeData(buf[:n]),
+			if err := send(protocol.Message{
+				Type: protocol.TypeFileChunk, SessionID: msg.SessionID,
+				Data: protocol.EncodeData(buf[:n]),
 			}); err != nil {
 				return err
 			}
@@ -693,10 +892,10 @@ func (a *Agent) streamFile(msg protocol.Message) error {
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return a.send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: readErr.Error()})
+			return send(protocol.Message{Type: protocol.TypeFileError, SessionID: msg.SessionID, Error: readErr.Error()})
 		}
 	}
-	return a.send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
+	return send(protocol.Message{Type: protocol.TypeFileDone, SessionID: msg.SessionID})
 }
 
 func (a *Agent) pathAllowed(path string) bool {
@@ -835,8 +1034,19 @@ func (a *Agent) send(v any) error {
 	if ws == nil {
 		return net.ErrClosed
 	}
+	return a.sendOn(ws, v)
+}
+
+// Background work belongs to its original control connection, not a reconnect.
+func (a *Agent) sendOn(ws *websocket.Conn, v any) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
+	a.mu.Lock()
+	current := a.ws
+	a.mu.Unlock()
+	if ws == nil || current != ws {
+		return net.ErrClosed
+	}
 	return ws.WriteJSON(v)
 }
 

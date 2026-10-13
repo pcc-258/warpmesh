@@ -84,10 +84,12 @@ Recommended deployment:
 TCP 80 and 443 must be open. The server redirects HTTP to HTTPS and
 automatically renews certificates.
 
-Port split: the web console and browser WebSockets live on 443; the agent
-control plane and screen-link data plane live on a server-configured port
-(`DEVICE_RELAY_ALT_HTTPS_LISTEN`). Agents discover it via `/api/agent-config`
-and never hardcode the port.
+By default the web console, browser WebSockets, agent control plane and
+screen-link data plane share the primary listener (443 for built-in HTTPS).
+An optional `DEVICE_RELAY_ALT_HTTPS_LISTEN` separates the agent control plane
+and screen-link data plane onto another HTTPS port. Plain HTTP mode uses the
+configured HTTP listener for all routes. Agents discover the active agent port
+via `/api/agent-config` and never hardcode it.
 
 ## 4. Authentication and Access Model
 
@@ -106,11 +108,13 @@ flowchart LR
 There are two credential paths:
 
 1. Operator sessions: username/password is checked with bcrypt and produces a
-   24-hour session token. The legacy static `ADMIN_TOKEN` still works.
+   24-hour session token. Browsers use an HttpOnly, SameSite=Strict cookie;
+   logout revokes the server-side session, not just the cookie. CLI clients may
+   use Bearer authentication. The static `DEVICE_RELAY_ADMIN_TOKEN` remains
+   available for administration.
 2. Device credentials: each device gets a unique key. The plaintext token is
-   returned once at creation and only its SHA-256 hash is stored. Agents that
-   use the legacy shared `DEVICE_TOKEN` are still accepted for migration, but
-   new devices should always use per-device keys.
+   returned once at creation and only its SHA-256 hash is stored. An agent must
+   present that device's key and identity; a shared token is not sufficient.
 
 ## 5. Device Registration Sequence
 
@@ -128,10 +132,9 @@ sequenceDiagram
     API->>DB: insert token hash
     API-->>Admin: deviceId + token (shown once)
     Admin-->>Agent: provision deviceId + token
-    Agent->>API: WSS /ws/agent?token=...
-    API->>DB: validate device key
-    API-->>Agent: hello accepted
-    Agent->>API: hello {deviceId, os, arch, ip}
+    Agent->>API: WSS /ws/agent with Bearer device key
+    Agent->>API: hello {deviceId, os, arch, lanIPs}
+    API->>DB: validate device key and identity
     API->>DB: upsert device, audit agent.online
 ```
 
@@ -142,7 +145,7 @@ sequenceDiagram
     participant S as Relay Server
     participant A as Device Agent
 
-    loop every 25s
+    loop every 30s
         S->>A: ping
         A-->>S: pong
         S->>S: update last_seen
@@ -155,9 +158,11 @@ agent brings the device back online, so liveness never lies.
 
 ## 7. Remote Terminal
 
-The browser never talks to the device directly. The server forwards a
-WebSocket session to the agent, which runs a real PTY (Unix) or ConPTY
-(Windows) shell.
+The agent runs a real PTY (Unix) or ConPTY (Windows) shell. The browser uses a
+server WebSocket for authorization and signaling, then attempts a direct
+WebRTC DataChannel. Negotiation has a 20-second budget, including asynchronous
+offer creation. Failure or timeout switches to the server relay shown below;
+initial shell output does not prove a direct connection or cancel the budget.
 
 ```mermaid
 sequenceDiagram
@@ -227,8 +232,15 @@ sequenceDiagram
     end
 ```
 
-The agent rejects paths outside its configured roots (home directory by
-default), so a compromised web session cannot read arbitrary server files.
+The agent rejects upload/download paths outside its configured roots (home
+directory by default). Files are opened through `os.Root` so symlinks or path
+replacement cannot escape the selected root during the actual open operation.
+Uploads use 64 KiB browser Blob slices with send-queue backpressure; success is
+reported only after the agent closes the file and sends `file:done`. A failure
+or cancellation may leave a partial file because uploads are not atomic.
+Browser file requests reject on disconnect, cancellation or 60 seconds of
+inactivity. Downloads currently assemble a Blob in memory and reject payloads
+above 128 MiB; larger files require another transfer tool.
 
 ## 9. Device-to-Device Forwarding
 
