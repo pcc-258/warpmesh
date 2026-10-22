@@ -1,6 +1,6 @@
 module github.com/pcc-258/warpmesh
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/UserExistsError/conpty v0.1.4
