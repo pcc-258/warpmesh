@@ -10,8 +10,8 @@ require (
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/pion/webrtc/v4 v4.2.20
 	golang.org/x/crypto v0.57.0
-	golang.org/x/sys v0.48.0
-	golang.org/x/term v0.46.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.48.0
 	modernc.org/sqlite v1.59.0
 )
 
