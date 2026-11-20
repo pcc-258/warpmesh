@@ -1,15 +1,20 @@
-.PHONY: web server agent build test test-race test-web typecheck lint-go lint-web checksmell build-linux build-agent-windows build-agent-darwin cross verify
+.PHONY: web server node client-windows build test test-race test-web typecheck lint-go lint-web checksmell build-linux build-node-windows build-node-darwin cross verify
 
 web:
 	cd web && npm ci && npm run build
 
 server:
-	go build -o bin/warpmesh-server ./cmd/server
+	go build -ldflags="$(BUILD_INFO)" -o bin/warpmesh-server ./cmd/server
 
-agent:
-	go build -o bin/warpmesh-agent ./cmd/agent
+node:
+	go build -ldflags="$(BUILD_INFO)" -o bin/warpmesh-node ./cmd/node
 
-build: web server agent
+BUILD_INFO := $(shell bash .github/scripts/build-info.sh)
+
+client-windows:
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-H windowsgui $(BUILD_INFO)" -o bin/warpmesh-client.exe ./cmd/windowsclient
+
+build: web server node
 
 test:
 	go test ./...
@@ -32,17 +37,18 @@ lint-web:
 
 checksmell: lint-go lint-web
 
-# Full pre-PR gate: everything AGENTS.md requires before a PR.
+# Full pre-PR gate required by the repository instructions.
 verify: test test-race test-web lint-go lint-web typecheck web
 
 build-linux:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/warpmesh-server-linux-amd64 ./cmd/server
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/warpmesh-agent-linux-amd64 ./cmd/agent
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$(BUILD_INFO)" -o bin/warpmesh-server-linux-amd64 ./cmd/server
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$(BUILD_INFO)" -o bin/warpmesh-node-linux-amd64 ./cmd/node
 
-build-agent-windows:
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/warpmesh-agent-windows-amd64.exe ./cmd/agent
+build-node-windows:
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="$(BUILD_INFO)" -o bin/warpmesh-node-windows-amd64.exe ./cmd/node
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-H windowsgui $(BUILD_INFO)" -o bin/warpmesh-client.exe ./cmd/windowsclient
 
-build-agent-darwin:
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o bin/warpmesh-agent-darwin-arm64 ./cmd/agent
+build-node-darwin:
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="$(BUILD_INFO)" -o bin/warpmesh-node-darwin-arm64 ./cmd/node
 
-cross: build-linux build-agent-windows build-agent-darwin
+cross: build-linux build-node-windows build-node-darwin

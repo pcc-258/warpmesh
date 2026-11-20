@@ -30,4 +30,4 @@ dbus-run-session -- startxfce4 >/tmp/xfce-session.log 2>&1 &
 
 x11vnc -display :1 -forever -shared -rfbport 5900 -nopw -bg
 
-exec /usr/local/bin/warpmesh-agent "$@"
+exec /usr/local/bin/warpmesh-node "$@"

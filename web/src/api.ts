@@ -12,6 +12,25 @@ export interface Device {
   lastSeen: string;
   online: boolean;
   capabilities?: { terminal: boolean; files: boolean; desktop: boolean; desktopHint: string } | null;
+  version: string;
+  updateState: string;
+  updateError: string;
+  updateVersion: string;
+}
+
+export interface ForwardPolicyRecord {
+  deviceId: string;
+  name: string;
+  forwardPolicy: "any" | "restricted";
+  grantCount: number;
+}
+
+export interface ForwardGrant {
+  sourceDevice: string;
+  targetDevice: string;
+  portMin: number;
+  portMax: number;
+  createdAt: string;
 }
 
 export interface Stats {
@@ -185,6 +204,38 @@ export function setForwardPolicy(id: string, policy: "any" | "restricted"): Prom
   return api<Device>(`/api/devices/${id}`, { method: "PATCH", body: JSON.stringify({ forwardPolicy: policy }) });
 }
 
+export function listForwardPolicies(): Promise<ForwardPolicyRecord[]> {
+  return api<ForwardPolicyRecord[]>("/api/forward-policy");
+}
+
+export function listForwardGrants(sourceDevice?: string): Promise<ForwardGrant[]> {
+  const suffix = sourceDevice ? `?sourceDevice=${encodeURIComponent(sourceDevice)}` : "";
+  return api<ForwardGrant[]>(`/api/forward-grants${suffix}`);
+}
+
+export function createForwardGrant(input: {
+  sourceDevice: string;
+  targetDevice: string;
+  portMin: number;
+  portMax: number;
+}): Promise<ForwardGrant> {
+  return api<ForwardGrant>("/api/forward-grants", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function deleteForwardGrant(input: {
+  sourceDevice: string;
+  targetDevice: string;
+  portMin: number;
+  portMax: number;
+}): Promise<void> {
+  const query = new URLSearchParams();
+  query.set("sourceDevice", input.sourceDevice);
+  query.set("targetDevice", input.targetDevice);
+  query.set("portMin", String(input.portMin));
+  query.set("portMax", String(input.portMax));
+  return api<void>(`/api/forward-grants?${query.toString()}`, { method: "DELETE" });
+}
+
 export function renameDevice(id: string, name: string): Promise<Device> {
   return api<Device>(`/api/devices/${id}`, {
     method: "PATCH",
@@ -196,12 +247,35 @@ export function updateDevice(id: string, patch: { name?: string; group?: string 
   return api<Device>(`/api/devices/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) });
 }
 
-export function listAgentDownloads(): Promise<{ platform: string; available: boolean }[]> {
-  return api("/api/agent-downloads");
+export function listNodeDownloads(): Promise<{ platform: string; available: boolean }[]> {
+  return api("/api/node-downloads");
 }
 
 export function deleteDevice(id: string): Promise<void> {
   return api<void>(`/api/devices/${id}`, { method: "DELETE" });
+}
+
+export interface NodeUpdateBuild {
+  platform: string;
+  version: string;
+  sha256: string;
+  size: number;
+}
+
+export function listNodeUpdates(): Promise<NodeUpdateBuild[]> {
+  return api<NodeUpdateBuild[]>("/api/node-updates");
+}
+
+export function startNodeUpdate(deviceId: string, version?: string): Promise<{
+  updateId: string;
+  deviceId: string;
+  version: string;
+  state: string;
+}> {
+  return api(`/api/devices/${encodeURIComponent(deviceId)}/update`, {
+    method: "POST",
+    body: JSON.stringify(version ? { version } : {}),
+  });
 }
 
 export async function login(username: string, password: string): Promise<void> {

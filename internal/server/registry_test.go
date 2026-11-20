@@ -18,7 +18,7 @@ func TestRegistryLifecycle(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if _, err := reg.Upsert("dev-1", "home", "home-pc", "linux", "amd64", []string{"192.168.1.2"}); err != nil {
+	if _, err := reg.Upsert("dev-1", "home", "home-pc", "linux", "amd64", []string{"10.0.0.3"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	dev, ok := reg.Get("dev-1")
@@ -99,7 +99,7 @@ func TestForwardGrantAuthorization(t *testing.T) {
 	}
 	defer func() { _ = reg.Close() }()
 	for _, id := range []string{"dev-a", "dev-b", "dev-c"} {
-		if _, err := reg.Upsert(id, id, id, "linux", "amd64", nil); err != nil {
+		if _, err := reg.Upsert(id, id, id, "linux", "amd64", nil, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -214,10 +214,10 @@ func TestListForwardPoliciesCountsGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reg.Close() }()
-	if _, err := reg.Upsert("dev-b", "beta", "beta", "linux", "amd64", nil); err != nil {
+	if _, err := reg.Upsert("dev-b", "beta", "beta", "linux", "amd64", nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.Upsert("dev-a", "alpha", "alpha", "linux", "amd64", nil); err != nil {
+	if _, err := reg.Upsert("dev-a", "alpha", "alpha", "linux", "amd64", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.SetForwardPolicy("dev-a", ForwardPolicyRestricted); err != nil {

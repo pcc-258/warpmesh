@@ -123,7 +123,7 @@ func (s *Server) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) attachCapabilities(d *Device) {
-	conn := s.getAgent(d.ID)
+	conn := s.getNode(d.ID)
 	if conn == nil {
 		return
 	}

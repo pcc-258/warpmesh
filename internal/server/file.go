@@ -22,8 +22,8 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "op (upload|download) is required"})
 		return
 	}
-	agent := s.getAgent(deviceID)
-	if agent == nil {
+	node := s.getNode(deviceID)
+	if node == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})
 		return
 	}
@@ -71,7 +71,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Validate before the session is registered: once it is reachable through
-	// s.files, the agent router may write to this socket too, and concurrent
+	// s.files, the node router may write to this socket too, and concurrent
 	// writes on one websocket are not allowed.
 	name := sanitizeName(r.URL.Query().Get("name"))
 	path := r.URL.Query().Get("path")
@@ -91,7 +91,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 	switch op {
 	case "upload":
 		_ = s.reg.RecordAudit(actor, "file.upload", deviceID, name)
-		if err := agent.write(protocol.Message{
+		if err := node.write(protocol.Message{
 			Type:      protocol.TypeFileUpload,
 			SessionID: sessionID,
 			Name:      name,
@@ -104,7 +104,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 		for {
 			kind, raw, err := ws.ReadMessage()
 			if err != nil {
-				_ = agent.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "upload aborted"})
+				_ = node.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "upload aborted"})
 				return
 			}
 			if kind == websocket.TextMessage {
@@ -114,13 +114,13 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 				}
 				msg.SessionID = sessionID
 				if msg.Type == protocol.TypeFileError {
-					_ = agent.write(msg)
+					_ = node.write(msg)
 					endState = "failed"
 					return
 				}
 				if msg.Type == protocol.TypeFileUploadEnd && !uploadEnded {
 					uploadEnded = true
-					if err := agent.write(msg); err != nil {
+					if err := node.write(msg); err != nil {
 						endState = "failed"
 						return
 					}
@@ -131,11 +131,11 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 			}
 			if uploadEnded {
 				endState = "failed"
-				_ = agent.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "data after upload completion"})
+				_ = node.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "data after upload completion"})
 				_ = session.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "data after upload completion"})
 				return
 			}
-			if err := agent.write(protocol.Message{
+			if err := node.write(protocol.Message{
 				Type:      protocol.TypeFileChunk,
 				SessionID: sessionID,
 				Data:      protocol.EncodeData(raw),
@@ -147,7 +147,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 		}
 	case "download":
 		_ = s.reg.RecordAudit(actor, "file.download", deviceID, path)
-		if err := agent.write(protocol.Message{
+		if err := node.write(protocol.Message{
 			Type:      protocol.TypeFileDownload,
 			SessionID: sessionID,
 			Path:      path,
@@ -157,7 +157,7 @@ func (s *Server) handleFileWS(w http.ResponseWriter, r *http.Request) {
 		for {
 			var msg protocol.Message
 			if err := ws.ReadJSON(&msg); err != nil {
-				_ = agent.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "download aborted"})
+				_ = node.write(protocol.Message{Type: protocol.TypeFileError, SessionID: sessionID, Error: "download aborted"})
 				return
 			}
 			if msg.Type == protocol.TypeFileError {

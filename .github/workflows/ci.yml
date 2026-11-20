@@ -129,7 +129,7 @@ jobs:
           go version
           go env GOOS GOARCH CGO_ENABLED
           mkdir -p reports bin
-      # integration/TestNativeAgentSmoke builds and launches the real binaries.
+      # integration/TestNativeNodeSmoke builds and launches the real binaries.
       # It checks enrollment, PTY/ConPTY, multi-chunk file transfer and restart.
       - name: Native Go tests and process smoke
         run: |
@@ -143,14 +143,18 @@ jobs:
         env:
           EXE: ${{ matrix.exe }}
         run: |
-          go build -o "bin/warpmesh-server${EXE}" ./cmd/server
-          go build -o "bin/warpmesh-agent${EXE}" ./cmd/agent
+          build_info=$(bash .github/scripts/build-info.sh)
+          go build -ldflags="$build_info" -o "bin/warpmesh-server${EXE}" ./cmd/server
+          go build -ldflags="$build_info" -o "bin/warpmesh-node${EXE}" ./cmd/node
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            go build -trimpath -ldflags="-H windowsgui $build_info" -o bin/warpmesh-client.exe ./cmd/windowsclient
+          fi
       - name: Acceptance coverage
         if: always()
         run: |
           {
             echo "### ${{ matrix.name }}"
-            echo "Native tests cover server/agent startup, enrollment and persisted identity, terminal command execution, binary upload/download, and reconnect preserving inventory edits."
+            echo "Native tests cover server/node startup, enrollment and persisted identity, terminal command execution, binary upload/download, and reconnect preserving inventory edits."
             echo "**Not covered:** real desktop capture/input, macOS screen permissions, Windows UAC/login screen, or multi-monitor behavior. VNC TCP readiness is not desktop GUI acceptance."
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -178,7 +182,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Package server and agent with checksums
+      - name: Package server, node, and Windows client with checksums
         run: bash .github/scripts/package.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

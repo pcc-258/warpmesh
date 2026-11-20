@@ -22,7 +22,7 @@ test("enrollment commands use deployment origin and quote shell metacharacters",
  assert.ok(!unix.includes("warpmesh.ddns.net"));
  assert.equal((unix.match(/-data-dir/g) ?? []).length, 2);
  const windows = enrollmentCommands("https://custom.example", "invite", "O'Brien", "windows-amd64");
- assert.ok(windows.includes(".\\warpmesh-agent.exe"));
+ assert.ok(windows.includes(".\\warpmesh-node.exe"));
  assert.ok(windows.includes("'O''Brien'"));
 });
 

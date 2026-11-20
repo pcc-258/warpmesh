@@ -46,6 +46,11 @@ type Device struct {
 	LastSeen      time.Time                    `json:"lastSeen"`
 	Online        bool                         `json:"online"`
 	Capabilities  *protocol.DeviceCapabilities `json:"capabilities"`
+	Version       string                       `json:"version"`
+	UpdateState   string                       `json:"updateState"`
+	UpdateError   string                       `json:"updateError"`
+	UpdateVersion string                       `json:"updateVersion"`
+	UpdateService string                       `json:"updateService"`
 }
 
 // ForwardGrant authorizes a restricted source device to reach a target device
@@ -133,7 +138,11 @@ CREATE TABLE IF NOT EXISTS devices (
 	forward_policy TEXT NOT NULL DEFAULT 'any',
 	created_at TEXT NOT NULL,
 	last_seen  TEXT NOT NULL,
-	online     INTEGER NOT NULL DEFAULT 0
+	online     INTEGER NOT NULL DEFAULT 0,
+	version TEXT NOT NULL DEFAULT '',
+	update_state TEXT NOT NULL DEFAULT 'idle',
+	update_error TEXT NOT NULL DEFAULT '',
+	update_version TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -243,6 +252,21 @@ func NewRegistry(dataDir string) (*Registry, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{"version", "version TEXT NOT NULL DEFAULT ''"},
+		{"update_state", "update_state TEXT NOT NULL DEFAULT 'idle'"},
+		{"update_error", "update_error TEXT NOT NULL DEFAULT ''"},
+		{"update_version", "update_version TEXT NOT NULL DEFAULT ''"},
+		{"update_service", "update_service TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := r.ensureColumn("devices", column.name, column.ddl); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	if err := r.ensureColumn("device_keys", "expires_at", "expires_at TEXT NOT NULL DEFAULT ''"); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -259,7 +283,7 @@ func NewRegistry(dataDir string) (*Registry, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	// Agents reconnect after a restart; nothing is online until it says hello.
+	// Nodes reconnect after a restart; nothing is online until it says hello.
 	if _, err := db.Exec("UPDATE devices SET online = 0"); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -613,7 +637,7 @@ func formatTime(t time.Time) string {
 }
 
 // Upsert registers metadata for a device and returns the stored record.
-func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string) (*Device, error) {
+func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string, version string) (*Device, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
@@ -627,9 +651,9 @@ func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		_, err = r.db.Exec(`
-			INSERT INTO devices (id, name, hostname, os, arch, lan_ips, group_name, created_at, last_seen, online)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-			id, name, hostname, osName, arch, string(lanIPs), "", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
+			INSERT INTO devices (id, name, hostname, os, arch, lan_ips, group_name, created_at, last_seen, online, version, update_state)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'idle')`,
+			id, name, hostname, osName, arch, string(lanIPs), "", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), version,
 		)
 		if err != nil {
 			return nil, err
@@ -644,9 +668,9 @@ func (r *Registry) Upsert(id, name, hostname, osName, arch string, ips []string)
 		}
 		_, err = r.db.Exec(`
 			UPDATE devices
-			SET name = ?, hostname = ?, os = ?, arch = ?, lan_ips = ?, last_seen = ?, online = 1
+			SET name = ?, hostname = ?, os = ?, arch = ?, lan_ips = ?, last_seen = ?, online = 1, version = ?
 			WHERE id = ?`,
-			name, hostname, osName, arch, string(lanIPs), now.Format(time.RFC3339Nano), id,
+			name, hostname, osName, arch, string(lanIPs), now.Format(time.RFC3339Nano), version, id,
 		)
 		if err != nil {
 			return nil, err
@@ -668,6 +692,34 @@ func (r *Registry) SetOnline(id string, online bool) error {
 	return err
 }
 
+func (r *Registry) SetVersion(id, version string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec("UPDATE devices SET version = ? WHERE id = ?", version, id)
+	return err
+}
+
+func (r *Registry) SetUpdateService(id, service string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec("UPDATE devices SET update_service = ? WHERE id = ?", service, id)
+	return err
+}
+
+// SetUpdateState records the last known controlled-update state for a device.
+func (r *Registry) SetUpdateState(id, state, targetVersion, detail, service string) error {
+	if state == "" {
+		state = "idle"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.db.Exec(
+		"UPDATE devices SET update_state = ?, update_version = ?, update_error = ?, update_service = ? WHERE id = ?",
+		state, targetVersion, detail, service, id,
+	)
+	return err
+}
+
 // Get returns a copy of one device.
 func (r *Registry) Get(id string) (Device, bool) {
 	r.mu.RLock()
@@ -684,7 +736,7 @@ func (r *Registry) List() []Device {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rows, err := r.db.Query(`
-		SELECT id, name, hostname, os, arch, lan_ips, group_name, forward_policy, created_at, last_seen, online
+		SELECT id, name, hostname, os, arch, lan_ips, group_name, forward_policy, created_at, last_seen, online, version, update_state, update_error, update_version, update_service
 		FROM devices
 		ORDER BY name COLLATE NOCASE`)
 	if err != nil {
@@ -1156,7 +1208,7 @@ func (r *Registry) Groups() []string {
 
 func (r *Registry) getLocked(id string) (Device, error) {
 	row := r.db.QueryRow(`
-		SELECT id, name, hostname, os, arch, lan_ips, group_name, forward_policy, created_at, last_seen, online
+		SELECT id, name, hostname, os, arch, lan_ips, group_name, forward_policy, created_at, last_seen, online, version, update_state, update_error, update_version, update_service
 		FROM devices
 		WHERE id = ?`, id)
 	return scanDevice(row)
@@ -1170,7 +1222,7 @@ func scanDevice(row rowScanner) (Device, error) {
 	var d Device
 	var lanIPs, created, lastSeen string
 	var online int
-	if err := row.Scan(&d.ID, &d.Name, &d.Hostname, &d.OS, &d.Arch, &lanIPs, &d.Group, &d.ForwardPolicy, &created, &lastSeen, &online); err != nil {
+	if err := row.Scan(&d.ID, &d.Name, &d.Hostname, &d.OS, &d.Arch, &lanIPs, &d.Group, &d.ForwardPolicy, &created, &lastSeen, &online, &d.Version, &d.UpdateState, &d.UpdateError, &d.UpdateVersion, &d.UpdateService); err != nil {
 		return Device{}, err
 	}
 	_ = json.Unmarshal([]byte(lanIPs), &d.LANIPs)

@@ -16,8 +16,8 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := r.URL.Query().Get("device")
-	agent := s.getAgent(deviceID)
-	if agent == nil {
+	node := s.getNode(deviceID)
+	if node == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})
 		return
 	}
@@ -62,7 +62,7 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 		delete(s.screens, sessionID)
 		s.sessionsMu.Unlock()
 		close(sess.done)
-		_ = agent.write(protocol.Message{Type: protocol.TypeRTCStop, SessionID: sessionID})
+		_ = node.write(protocol.Message{Type: protocol.TypeRTCStop, SessionID: sessionID})
 	}()
 
 	_ = s.reg.RecordAudit(actor, "screen.start", deviceID, "")
@@ -98,12 +98,12 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 			}
 			msg.SessionID = sessionID
 			msg.Service = "desktop"
-			if err := agent.write(msg); err != nil {
+			if err := node.write(msg); err != nil {
 				endState = "failed"
 				return
 			}
 		case protocol.TypeRTCReady:
-			if err := agent.write(protocol.Message{Type: protocol.TypeRTCReady, SessionID: sessionID}); err != nil {
+			if err := node.write(protocol.Message{Type: protocol.TypeRTCReady, SessionID: sessionID}); err != nil {
 				endState = "failed"
 				return
 			}
@@ -120,11 +120,11 @@ func (s *Server) handleScreenWS(w http.ResponseWriter, r *http.Request) {
 			if sess.traffic != nil {
 				_ = s.reg.SetConnectionTransport(sess.connection, "relay")
 			}
-			if err := agent.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID}); err != nil {
+			if err := node.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID}); err != nil {
 				endState = "failed"
 				return
 			}
-			if err := agent.write(protocol.Message{Type: protocol.TypeScreenStart, SessionID: sessionID}); err != nil {
+			if err := node.write(protocol.Message{Type: protocol.TypeScreenStart, SessionID: sessionID}); err != nil {
 				endState = "failed"
 				return
 			}
@@ -149,7 +149,7 @@ func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
 	if token == "" {
 		token = r.URL.Query().Get("token")
 	}
-	if !s.authorizeAgent(r.URL.Query().Get("device"), token) {
+	if !s.authorizeNode(r.URL.Query().Get("device"), token) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
@@ -164,7 +164,7 @@ func (s *Server) handleScreenLinkWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = ws.Close() }()
-	// Bound the RFB frames the agent data plane may send us.
+	// Bound the RFB frames the node data plane may send us.
 	ws.SetReadLimit(maxRelayMessageBytes)
 
 	s.sessionsMu.Lock()
@@ -219,8 +219,8 @@ func relayScreen(a, b *websocket.Conn, traffic *trafficRecorder) {
 	<-done
 }
 
-// closeAgentScreens terminates desktop sessions when an agent goes offline.
-func (s *Server) closeAgentScreens(deviceID string) {
+// closeNodeScreens terminates desktop sessions when a node goes offline.
+func (s *Server) closeNodeScreens(deviceID string) {
 	s.sessionsMu.Lock()
 	var browsers []*websocket.Conn
 	for id, sess := range s.screens {

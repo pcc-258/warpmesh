@@ -15,8 +15,8 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := r.URL.Query().Get("device")
-	agent := s.getAgent(deviceID)
-	if agent == nil {
+	node := s.getNode(deviceID)
+	if node == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})
 		return
 	}
@@ -56,7 +56,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		s.sessionsMu.Lock()
 		delete(s.terms, sessionID)
 		s.sessionsMu.Unlock()
-		_ = agent.write(protocol.Message{Type: protocol.TypeRTCStop, SessionID: sessionID})
+		_ = node.write(protocol.Message{Type: protocol.TypeRTCStop, SessionID: sessionID})
 		s.logEvent("session.end",
 			"kind", "terminal",
 			"session", sessionID,
@@ -68,7 +68,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	cols, rows := queryInt(r, "cols", 120), queryInt(r, "rows", 30)
-	if err := agent.write(protocol.Message{
+	if err := node.write(protocol.Message{
 		Type:      protocol.TypeTermStart,
 		SessionID: sessionID,
 		Cols:      cols,
@@ -83,7 +83,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		var msg protocol.Message
 		if err := ws.ReadJSON(&msg); err != nil {
 			endReason = "browser-disconnected"
-			_ = agent.write(protocol.Message{Type: protocol.TypeTermStop, SessionID: sessionID})
+			_ = node.write(protocol.Message{Type: protocol.TypeTermStop, SessionID: sessionID})
 			return
 		}
 		switch msg.Type {
@@ -97,7 +97,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			}
 			msg.SessionID = sessionID
 			msg.Service = "terminal"
-			if err := agent.write(msg); err != nil {
+			if err := node.write(msg); err != nil {
 				return
 			}
 		case protocol.TypeRTCFallback:
@@ -113,11 +113,11 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			if sess.traffic != nil {
 				_ = s.reg.SetConnectionTransport(sess.connection, "relay")
 			}
-			_ = agent.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID})
+			_ = node.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID})
 			_ = sess.write(protocol.Message{Type: protocol.TypeRTCRelay, SessionID: sessionID})
 		case protocol.TypeTermInput, protocol.TypeTermResize, protocol.TypeTermStop:
 			msg.SessionID = sessionID
-			if err := agent.write(msg); err != nil {
+			if err := node.write(msg); err != nil {
 				endReason = "device-write-failed"
 				traffic.Close("failed")
 				return

@@ -22,29 +22,29 @@ func TestUploadWaitsForDeviceAcknowledgement(t *testing.T) {
 			defer ts.Close()
 			base := "ws" + strings.TrimPrefix(ts.URL, "http")
 			key := newTestKey(t, srv)
-			agent, _, err := websocket.DefaultDialer.Dial(base+"/ws/agent?token="+key.Token, nil)
+			node, _, err := websocket.DefaultDialer.Dial(base+"/ws/node?token="+key.Token, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = agent.Close() }()
-			if err := agent.WriteJSON(protocol.Message{Type: protocol.TypeHello, DeviceID: key.DeviceID}); err != nil {
+			defer func() { _ = node.Close() }()
+			if err := node.WriteJSON(protocol.Message{Type: protocol.TypeHello, DeviceID: key.DeviceID}); err != nil {
 				t.Fatal(err)
 			}
-			waitForAgent(t, srv, key.DeviceID)
+			waitForNode(t, srv, key.DeviceID)
 			browser, _, err := websocket.DefaultDialer.Dial(base+"/ws/file?token=admin-token&device="+key.DeviceID+"&op=upload&name=test.txt", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = browser.Close() }()
-			_ = agent.SetReadDeadline(time.Now().Add(3 * time.Second))
-			start := readAgentMessage(t, agent)
+			_ = node.SetReadDeadline(time.Now().Add(3 * time.Second))
+			start := readNodeMessage(t, node)
 			if start.Type != protocol.TypeFileUpload {
 				t.Fatalf("expected upload, got %+v", start)
 			}
 			if err := browser.WriteMessage(websocket.BinaryMessage, []byte("payload")); err != nil {
 				t.Fatal(err)
 			}
-			chunk := readAgentMessage(t, agent)
+			chunk := readNodeMessage(t, node)
 			data, err := protocol.DecodeData(chunk.Data)
 			if err != nil || chunk.Type != protocol.TypeFileChunk || string(data) != "payload" {
 				t.Fatalf("chunk=%+v error=%v", chunk, err)
@@ -52,7 +52,7 @@ func TestUploadWaitsForDeviceAcknowledgement(t *testing.T) {
 			if err := browser.WriteJSON(protocol.Message{Type: protocol.TypeFileUploadEnd}); err != nil {
 				t.Fatal(err)
 			}
-			end := readAgentMessage(t, agent)
+			end := readNodeMessage(t, node)
 			if end.Type != protocol.TypeFileUploadEnd {
 				t.Fatalf("expected completion, got %+v", end)
 			}
@@ -87,7 +87,7 @@ func TestUploadWaitsForDeviceAcknowledgement(t *testing.T) {
 			if ackType == protocol.TypeFileError {
 				ack.Error = "disk full"
 			}
-			if err := agent.WriteJSON(ack); err != nil {
+			if err := node.WriteJSON(ack); err != nil {
 				t.Fatal(err)
 			}
 			select {

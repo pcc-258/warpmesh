@@ -30,12 +30,12 @@ RUN apt-get update \
     && chown -R warpmesh:warpmesh /home/warpmesh \
     && rm -rf /var/lib/apt/lists/*
 
-ARG AGENT_BINARY=bin/warpmesh-agent-linux-arm64
+ARG NODE_BINARY=bin/warpmesh-node-linux-arm64
 
-COPY ${AGENT_BINARY} /usr/local/bin/warpmesh-agent
+COPY ${NODE_BINARY} /usr/local/bin/warpmesh-node
 COPY entrypoint-desktop.sh /entrypoint-desktop.sh
 
-RUN chmod +x /entrypoint-desktop.sh /usr/local/bin/warpmesh-agent
+RUN chmod +x /entrypoint-desktop.sh /usr/local/bin/warpmesh-node
 
 WORKDIR /home/warpmesh
 USER warpmesh

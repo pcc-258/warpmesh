@@ -1,10 +1,10 @@
 // Package protocol defines the JSON messages exchanged between the browser,
-// the relay server and the device agents.
+// the relay server and managed device nodes.
 package protocol
 
 import "encoding/base64"
 
-// DeviceCapabilities reports services the agent can currently offer.
+// DeviceCapabilities reports services the node can currently offer.
 // Desktop means the local VNC endpoint is reachable, not that a user session
 // or operating-system capture permission has been verified.
 type DeviceCapabilities struct {
@@ -18,7 +18,7 @@ type DeviceCapabilities struct {
 type Message struct {
 	Type string `json:"type"`
 
-	// Agent hello metadata.
+	// Node hello metadata.
 	DeviceID     string              `json:"deviceId,omitempty"`
 	Name         string              `json:"name,omitempty"`
 	Hostname     string              `json:"hostname,omitempty"`
@@ -27,6 +27,17 @@ type Message struct {
 	LANIPs       []string            `json:"lanIPs,omitempty"`
 	DirectPort   int                 `json:"directPort,omitempty"`
 	Capabilities *DeviceCapabilities `json:"capabilities,omitempty"`
+	Version      string              `json:"version,omitempty"`
+
+	// Controlled Node updates use a server-issued task and a fixed download
+	// path. UpdateURL is never supplied by the browser.
+	UpdateID      string `json:"updateId,omitempty"`
+	UpdateVersion string `json:"updateVersion,omitempty"`
+	UpdateSHA256  string `json:"updateSha256,omitempty"`
+	UpdateURL     string `json:"updateUrl,omitempty"`
+	UpdateState   string `json:"updateState,omitempty"`
+	UpdateService string `json:"updateService,omitempty"`
+	UpdateError   string `json:"updateError,omitempty"`
 
 	// Terminal and file sessions.
 	SessionID string `json:"sessionId,omitempty"`
@@ -56,7 +67,7 @@ type FileEntry struct {
 	ModTime string `json:"modTime"`
 }
 
-// Message types used by agents, the server and the web UI.
+// Message types used by nodes, the server and the web UI.
 const (
 	TypeHello           = "hello"
 	TypeStatus          = "device:status"
@@ -102,6 +113,8 @@ const (
 	TypeRTCStop         = "rtc:stop"
 	TypeScreenStart     = "screen:start"
 	TypeScreenError     = "screen:error"
+	TypeNodeUpdate      = "node:update"
+	TypeNodeUpdateState = "node:update:state"
 )
 
 // EncodeData base64-encodes raw bytes for JSON transport.

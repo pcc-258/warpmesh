@@ -41,12 +41,12 @@ func TestTerminalRelay(t *testing.T) {
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
 	key := newTestKey(t, srv)
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "test box",
@@ -56,7 +56,7 @@ func TestTerminalRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 
 	waitFor(t, func() bool {
 		resp, err := http.Get(ts.URL + "/api/health")
@@ -86,25 +86,25 @@ func TestTerminalRelay(t *testing.T) {
 	}
 	defer func() { _ = browserWS.Close() }()
 
-	start := readAgentMessage(t, agentWS)
+	start := readNodeMessage(t, nodeWS)
 	if start.Type != protocol.TypeTermStart || start.SessionID == "" || start.Cols != 80 {
 		t.Fatalf("unexpected start message: %+v", start)
 	}
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCOffer, Data: "offer-sdp"}); err != nil {
 		t.Fatal(err)
 	}
-	offer := readAgentMessage(t, agentWS)
+	offer := readNodeMessage(t, nodeWS)
 	if offer.Type != protocol.TypeRTCOffer || offer.SessionID != start.SessionID || offer.Service != "terminal" {
 		t.Fatalf("unexpected browser offer: %+v", offer)
 	}
-	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCAnswer, SessionID: start.SessionID, Service: "terminal", Data: "answer-sdp"}); err != nil {
+	if err := nodeWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCAnswer, SessionID: start.SessionID, Service: "terminal", Data: "answer-sdp"}); err != nil {
 		t.Fatal(err)
 	}
 	var answer protocol.Message
 	if err := browserWS.ReadJSON(&answer); err != nil || answer.Type != protocol.TypeRTCAnswer || answer.Data != "answer-sdp" {
 		t.Fatalf("unexpected browser answer: %+v err=%v", answer, err)
 	}
-	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCDirectOK, SessionID: start.SessionID, Service: "terminal"}); err != nil {
+	if err := nodeWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCDirectOK, SessionID: start.SessionID, Service: "terminal"}); err != nil {
 		t.Fatal(err)
 	}
 	var direct protocol.Message
@@ -114,7 +114,7 @@ func TestTerminalRelay(t *testing.T) {
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCFallback}); err != nil {
 		t.Fatal(err)
 	}
-	if relay := readAgentMessage(t, agentWS); relay.Type != protocol.TypeRTCRelay || relay.SessionID != start.SessionID {
+	if relay := readNodeMessage(t, nodeWS); relay.Type != protocol.TypeRTCRelay || relay.SessionID != start.SessionID {
 		t.Fatalf("unexpected relay fallback request: %+v", relay)
 	}
 	var relayStatus protocol.Message
@@ -122,7 +122,7 @@ func TestTerminalRelay(t *testing.T) {
 		t.Fatalf("unexpected relay status: %+v err=%v", relayStatus, err)
 	}
 
-	if err := agentWS.WriteJSON(protocol.Message{
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:      protocol.TypeTermOutput,
 		SessionID: start.SessionID,
 		Data:      protocol.EncodeData([]byte("hello\n")),
@@ -142,12 +142,12 @@ func TestTerminalRelay(t *testing.T) {
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeTermInput, Data: "ls\r"}); err != nil {
 		t.Fatal(err)
 	}
-	input := readAgentMessage(t, agentWS)
+	input := readNodeMessage(t, nodeWS)
 	if input.Type != protocol.TypeTermInput || input.Data != "ls\r" {
 		t.Fatalf("unexpected input message: %+v", input)
 	}
 
-	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeTermExit, SessionID: start.SessionID, Code: 0}); err != nil {
+	if err := nodeWS.WriteJSON(protocol.Message{Type: protocol.TypeTermExit, SessionID: start.SessionID, Code: 0}); err != nil {
 		t.Fatal(err)
 	}
 	var exit protocol.Message
@@ -197,12 +197,12 @@ func TestBrowserRTCTrickleICE(t *testing.T) {
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
 	key := newTestKey(t, srv)
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "rtc box",
@@ -212,7 +212,7 @@ func TestBrowserRTCTrickleICE(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/terminal?token=admin-token&device="+key.DeviceID+"&cols=80&rows=24", nil,
@@ -222,14 +222,14 @@ func TestBrowserRTCTrickleICE(t *testing.T) {
 	}
 	defer func() { _ = browserWS.Close() }()
 
-	start := readAgentMessage(t, agentWS)
+	start := readNodeMessage(t, nodeWS)
 	if start.Type != protocol.TypeTermStart || start.SessionID == "" {
 		t.Fatalf("unexpected start message: %+v", start)
 	}
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCOffer, Data: "offer-sdp"}); err != nil {
 		t.Fatal(err)
 	}
-	offer := readAgentMessage(t, agentWS)
+	offer := readNodeMessage(t, nodeWS)
 	if offer.Type != protocol.TypeRTCOffer || offer.SessionID != start.SessionID || offer.Service != "terminal" {
 		t.Fatalf("unexpected browser offer: %+v", offer)
 	}
@@ -239,18 +239,18 @@ func TestBrowserRTCTrickleICE(t *testing.T) {
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCICE, Data: "browser-candidate"}); err != nil {
 		t.Fatal(err)
 	}
-	candidate := readAgentMessage(t, agentWS)
+	candidate := readNodeMessage(t, nodeWS)
 	if candidate.Type != protocol.TypeRTCICE || candidate.SessionID != start.SessionID || candidate.Service != "terminal" || candidate.Data != "browser-candidate" {
 		t.Fatalf("unexpected browser candidate: %+v", candidate)
 	}
 
-	// The agent trickles a candidate; the browser must receive it unchanged.
-	if err := agentWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCICE, SessionID: start.SessionID, Service: "terminal", Data: "agent-candidate"}); err != nil {
+	// The node trickles a candidate; the browser must receive it unchanged.
+	if err := nodeWS.WriteJSON(protocol.Message{Type: protocol.TypeRTCICE, SessionID: start.SessionID, Service: "terminal", Data: "node-candidate"}); err != nil {
 		t.Fatal(err)
 	}
 	var remote protocol.Message
-	if err := browserWS.ReadJSON(&remote); err != nil || remote.Type != protocol.TypeRTCICE || remote.Data != "agent-candidate" {
-		t.Fatalf("unexpected agent candidate: %+v err=%v", remote, err)
+	if err := browserWS.ReadJSON(&remote); err != nil || remote.Type != protocol.TypeRTCICE || remote.Data != "node-candidate" {
+		t.Fatalf("unexpected node candidate: %+v err=%v", remote, err)
 	}
 }
 
@@ -299,14 +299,14 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 		t.Fatalf("expected device key with token, got %+v", key)
 	}
 
-	// The per-device key must be able to bring an agent online.
+	// The per-device key must be able to bring an node online.
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "home pc",
@@ -317,7 +317,7 @@ func TestLoginStatsAndDeviceKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 
 	statsReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/stats", nil)
 	statsReq.Header.Set("Authorization", "Bearer "+loginResp.Token)
@@ -459,8 +459,8 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 
 	keyA := newTestKey(t, srv)
 	keyB := newTestKey(t, srv)
-	dialAgent := func(key DeviceKey) *websocket.Conn {
-		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	dialNode := func(key DeviceKey) *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -477,14 +477,14 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 		return ws
 	}
 
-	agentA := dialAgent(keyA)
-	defer func() { _ = agentA.Close() }()
-	agentB := dialAgent(keyB)
-	defer func() { _ = agentB.Close() }()
-	waitForAgent(t, srv, keyA.DeviceID)
-	waitForAgent(t, srv, keyB.DeviceID)
+	nodeA := dialNode(keyA)
+	defer func() { _ = nodeA.Close() }()
+	nodeB := dialNode(keyB)
+	defer func() { _ = nodeB.Close() }()
+	waitForNode(t, srv, keyA.DeviceID)
+	waitForNode(t, srv, keyB.DeviceID)
 
-	if err := agentA.WriteJSON(protocol.Message{
+	if err := nodeA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
 		SessionID: "s1",
 		Target:    keyB.DeviceID,
@@ -493,49 +493,49 @@ func TestDeviceToDeviceForwardRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	connectB := readAgentMessage(t, agentB)
+	connectB := readNodeMessage(t, nodeB)
 	if connectB.Type != protocol.TypeForwardConnect || connectB.SessionID != "s1" || connectB.Port != 22 {
 		t.Fatalf("unexpected connect for target: %+v", connectB)
 	}
 
-	if err := agentB.WriteJSON(protocol.Message{Type: protocol.TypeForwardOpen, SessionID: "s1"}); err != nil {
+	if err := nodeB.WriteJSON(protocol.Message{Type: protocol.TypeForwardOpen, SessionID: "s1"}); err != nil {
 		t.Fatal(err)
 	}
-	openA := readAgentMessage(t, agentA)
+	openA := readNodeMessage(t, nodeA)
 	if openA.Type != protocol.TypeForwardOpen {
 		t.Fatalf("expected forward:open, got %+v", openA)
 	}
 
-	if err := agentA.WriteJSON(protocol.Message{
+	if err := nodeA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardData,
 		SessionID: "s1",
 		Data:      protocol.EncodeData([]byte("ping")),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	dataB := readAgentMessage(t, agentB)
+	dataB := readNodeMessage(t, nodeB)
 	raw, _ := protocol.DecodeData(dataB.Data)
 	if dataB.Type != protocol.TypeForwardData || string(raw) != "ping" {
 		t.Fatalf("unexpected data at target: %+v", dataB)
 	}
 
-	if err := agentB.WriteJSON(protocol.Message{
+	if err := nodeB.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardData,
 		SessionID: "s1",
 		Data:      protocol.EncodeData([]byte("pong")),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	dataA := readAgentMessage(t, agentA)
+	dataA := readNodeMessage(t, nodeA)
 	raw, _ = protocol.DecodeData(dataA.Data)
 	if dataA.Type != protocol.TypeForwardData || string(raw) != "pong" {
 		t.Fatalf("unexpected data at source: %+v", dataA)
 	}
 
-	if err := agentA.WriteJSON(protocol.Message{Type: protocol.TypeForwardClose, SessionID: "s1"}); err != nil {
+	if err := nodeA.WriteJSON(protocol.Message{Type: protocol.TypeForwardClose, SessionID: "s1"}); err != nil {
 		t.Fatal(err)
 	}
-	closeB := readAgentMessage(t, agentB)
+	closeB := readNodeMessage(t, nodeB)
 	if closeB.Type != protocol.TypeForwardClose {
 		t.Fatalf("expected forward:close, got %+v", closeB)
 	}
@@ -556,8 +556,8 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 
 	keyA := newTestKey(t, srv)
 	keyB := newTestKey(t, srv)
-	dialAgent := func(key DeviceKey) *websocket.Conn {
-		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	dialNode := func(key DeviceKey) *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -574,14 +574,14 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 		return ws
 	}
 
-	agentA := dialAgent(keyA)
-	defer func() { _ = agentA.Close() }()
-	agentB := dialAgent(keyB)
-	defer func() { _ = agentB.Close() }()
-	waitForAgent(t, srv, keyA.DeviceID)
-	waitForAgent(t, srv, keyB.DeviceID)
+	nodeA := dialNode(keyA)
+	defer func() { _ = nodeA.Close() }()
+	nodeB := dialNode(keyB)
+	defer func() { _ = nodeB.Close() }()
+	waitForNode(t, srv, keyA.DeviceID)
+	waitForNode(t, srv, keyB.DeviceID)
 
-	if err := agentA.WriteJSON(protocol.Message{
+	if err := nodeA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
 		SessionID: "s-direct",
 		Target:    keyB.DeviceID,
@@ -596,16 +596,16 @@ func TestForwardDirectAttemptSuppressesRelay(t *testing.T) {
 		return ok
 	})
 
-	if err := agentB.WriteJSON(protocol.Message{Type: protocol.TypeForwardDirectOK, SessionID: "s-direct"}); err != nil {
+	if err := nodeB.WriteJSON(protocol.Message{Type: protocol.TypeForwardDirectOK, SessionID: "s-direct"}); err != nil {
 		t.Fatal(err)
 	}
 
 	// The direct-ok must cancel the relay fallback: no forward:connect should
 	// reach the target within the timeout window.
-	_ = agentB.SetReadDeadline(time.Now().Add(directAttemptTimeout + 2*time.Second))
+	_ = nodeB.SetReadDeadline(time.Now().Add(directAttemptTimeout + 2*time.Second))
 	for {
 		var unexpected protocol.Message
-		err := agentB.ReadJSON(&unexpected)
+		err := nodeB.ReadJSON(&unexpected)
 		if err != nil {
 			break
 		}
@@ -632,15 +632,15 @@ func newForwardTestServer(t *testing.T) (*Server, *httptest.Server, string) {
 	return srv, ts, "ws" + strings.TrimPrefix(ts.URL, "http")
 }
 
-// enrollTestAgent issues a device key, attaches the agent socket, and waits
+// enrollTestNode issues a device key, attaches the node socket, and waits
 // until the relay lists the device as online.
-func enrollTestAgent(t *testing.T, srv *Server, baseWS string) (*websocket.Conn, string) {
+func enrollTestNode(t *testing.T, srv *Server, baseWS string) (*websocket.Conn, string) {
 	t.Helper()
 	key, err := srv.reg.CreateDeviceKey("test-device", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	ws, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,12 +655,12 @@ func enrollTestAgent(t *testing.T, srv *Server, baseWS string) (*websocket.Conn,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 	return ws, key.DeviceID
 }
 
 // expectForwardRelayed asserts the relay accepted a session and forwarded the
-// target-bound message. A real agent sends forward:connect and then its WebRTC
+// target-bound message. A real node sends forward:connect and then its WebRTC
 // offer, so the test mirrors that sequence and closes the session afterwards to
 // disarm the relay fallback timer.
 func expectForwardRelayed(t *testing.T, srv *Server, source, target *websocket.Conn, targetID, sessionID string, port int) {
@@ -686,14 +686,14 @@ func expectForwardRelayed(t *testing.T, srv *Server, source, target *websocket.C
 	}); err != nil {
 		t.Fatal(err)
 	}
-	offer := readAgentMessage(t, target)
+	offer := readNodeMessage(t, target)
 	if offer.Type != protocol.TypeForwardOffer || offer.SessionID != sessionID || offer.Port != port {
 		t.Fatalf("expected the relay to forward session %s on port %d, got %+v", sessionID, port, offer)
 	}
 	if err := source.WriteJSON(protocol.Message{Type: protocol.TypeForwardClose, SessionID: sessionID}); err != nil {
 		t.Fatal(err)
 	}
-	if closed := readAgentMessage(t, target); closed.Type != protocol.TypeForwardClose {
+	if closed := readNodeMessage(t, target); closed.Type != protocol.TypeForwardClose {
 		t.Fatalf("expected forward:close, got %+v", closed)
 	}
 }
@@ -701,7 +701,7 @@ func expectForwardRelayed(t *testing.T, srv *Server, source, target *websocket.C
 // expectForwardRefused asserts the source is refused, no session is started, no
 // connection metric is consumed, and the refusal is audited. It deliberately
 // does not read the target socket: gorilla caches the error of a timed-out read,
-// so the silence check (expectNoAgentMessage) must be the last thing a target
+// so the silence check (expectNoNodeMessage) must be the last thing a target
 // socket is used for.
 func expectForwardRefused(t *testing.T, srv *Server, source *websocket.Conn, targetID, sessionID string, port int) {
 	t.Helper()
@@ -726,7 +726,7 @@ func expectForwardRefused(t *testing.T, srv *Server, source *websocket.Conn, tar
 		t.Fatal(err)
 	}
 
-	refusal := readAgentMessage(t, source)
+	refusal := readNodeMessage(t, source)
 	if refusal.Type != protocol.TypeForwardError || refusal.SessionID != sessionID {
 		t.Fatalf("expected forward:error for session %s, got %+v", sessionID, refusal)
 	}
@@ -755,10 +755,10 @@ func expectForwardRefused(t *testing.T, srv *Server, source *websocket.Conn, tar
 	}
 }
 
-// expectNoAgentMessage fails if any application message reached the agent.
+// expectNoNodeMessage fails if any application message reached the node.
 // Traffic heartbeats are ignored. A timed-out read permanently poisons the
 // socket for reads, so callers must not read it again afterwards.
-func expectNoAgentMessage(t *testing.T, ws *websocket.Conn, wait time.Duration) {
+func expectNoNodeMessage(t *testing.T, ws *websocket.Conn, wait time.Duration) {
 	t.Helper()
 	if err := ws.SetReadDeadline(time.Now().Add(wait)); err != nil {
 		t.Fatal(err)
@@ -791,13 +791,13 @@ func findAudit(entries []AuditEntry, action string) (AuditEntry, bool) {
 // devices that never touched the ACL can forward immediately.
 func TestForwardDefaultPolicyAllowsConnect(t *testing.T) {
 	srv, _, baseWS := newForwardTestServer(t)
-	agentA, idA := enrollTestAgent(t, srv, baseWS)
-	agentB, idB := enrollTestAgent(t, srv, baseWS)
+	nodeA, idA := enrollTestNode(t, srv, baseWS)
+	nodeB, idB := enrollTestNode(t, srv, baseWS)
 
 	if dev, ok := srv.reg.Get(idA); !ok || dev.ForwardPolicy != ForwardPolicyAny {
 		t.Fatalf("a fresh device must default to %q, got %+v", ForwardPolicyAny, dev)
 	}
-	if err := agentA.WriteJSON(protocol.Message{
+	if err := nodeA.WriteJSON(protocol.Message{
 		Type:      protocol.TypeForwardConnect,
 		SessionID: "s1",
 		Target:    idB,
@@ -805,7 +805,7 @@ func TestForwardDefaultPolicyAllowsConnect(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connect := readAgentMessage(t, agentB)
+	connect := readNodeMessage(t, nodeB)
 	if connect.Type != protocol.TypeForwardConnect || connect.SessionID != "s1" || connect.Port != 22 {
 		t.Fatalf("default policy must relay the connect, got %+v", connect)
 	}
@@ -815,15 +815,15 @@ func TestForwardDefaultPolicyAllowsConnect(t *testing.T) {
 // a restricted device with no grants cannot turn the relay into an open proxy.
 func TestForwardRestrictedDeviceWithoutGrantIsDenied(t *testing.T) {
 	srv, _, baseWS := newForwardTestServer(t)
-	agentA, idA := enrollTestAgent(t, srv, baseWS)
-	agentB, idB := enrollTestAgent(t, srv, baseWS)
+	nodeA, idA := enrollTestNode(t, srv, baseWS)
+	nodeB, idB := enrollTestNode(t, srv, baseWS)
 	if err := srv.reg.SetForwardPolicy(idA, ForwardPolicyRestricted); err != nil {
 		t.Fatal(err)
 	}
 
-	expectForwardRefused(t, srv, agentA, idB, "s-denied", 22)
+	expectForwardRefused(t, srv, nodeA, idB, "s-denied", 22)
 	// Nothing may reach the target — the denial happens before the offer.
-	expectNoAgentMessage(t, agentB, 300*time.Millisecond)
+	expectNoNodeMessage(t, nodeB, 300*time.Millisecond)
 
 	// The denial must be recorded even when the target is online and reachable.
 	if entry, ok := findAudit(srv.reg.ListAudit(50), "forward.denied"); !ok || entry.Target != idB {
@@ -839,10 +839,10 @@ func TestForwardRestrictedDeviceWithoutGrantIsDenied(t *testing.T) {
 // everything else is denied.
 func TestForwardGrantMatchesTargetAndPort(t *testing.T) {
 	srv, _, baseWS := newForwardTestServer(t)
-	agentA, idA := enrollTestAgent(t, srv, baseWS)
-	agentB, idB := enrollTestAgent(t, srv, baseWS)
-	agentC, idC := enrollTestAgent(t, srv, baseWS)
-	agentD, idD := enrollTestAgent(t, srv, baseWS)
+	nodeA, idA := enrollTestNode(t, srv, baseWS)
+	nodeB, idB := enrollTestNode(t, srv, baseWS)
+	nodeC, idC := enrollTestNode(t, srv, baseWS)
+	nodeD, idD := enrollTestNode(t, srv, baseWS)
 	if err := srv.reg.SetForwardPolicy(idA, ForwardPolicyRestricted); err != nil {
 		t.Fatal(err)
 	}
@@ -851,32 +851,32 @@ func TestForwardGrantMatchesTargetAndPort(t *testing.T) {
 	}
 
 	// A device outside the grant is refused, as are ports outside its range.
-	expectForwardRefused(t, srv, agentA, idC, "s-other-target", 22)
-	expectForwardRefused(t, srv, agentA, idB, "s-wrong-port-low", 21)
-	expectForwardRefused(t, srv, agentA, idB, "s-wrong-port-high", 23)
+	expectForwardRefused(t, srv, nodeA, idC, "s-other-target", 22)
+	expectForwardRefused(t, srv, nodeA, idB, "s-wrong-port-low", 21)
+	expectForwardRefused(t, srv, nodeA, idB, "s-wrong-port-high", 23)
 
 	// The granted pair is relayed.
-	expectForwardRelayed(t, srv, agentA, agentB, idB, "s-granted", 22)
+	expectForwardRelayed(t, srv, nodeA, nodeB, idB, "s-granted", 22)
 
 	// A second grant extends access to another exact target.
 	if err := srv.reg.AddForwardGrant(idA, idD, 22, 22); err != nil {
 		t.Fatal(err)
 	}
-	expectForwardRelayed(t, srv, agentA, agentD, idD, "s-granted-d", 22)
+	expectForwardRelayed(t, srv, nodeA, nodeD, idD, "s-granted-d", 22)
 
 	// Both refused targets must be silent. These drains come last because a
 	// timed-out read leaves the socket unusable.
-	expectNoAgentMessage(t, agentB, 300*time.Millisecond)
-	expectNoAgentMessage(t, agentC, 300*time.Millisecond)
+	expectNoNodeMessage(t, nodeB, 300*time.Millisecond)
+	expectNoNodeMessage(t, nodeC, 300*time.Millisecond)
 }
 
 // TestForwardWildcardGrantAllowsAnyTargetInRange checks that a "*" target grant
 // covers every device but still honours the inclusive port range.
 func TestForwardWildcardGrantAllowsAnyTargetInRange(t *testing.T) {
 	srv, _, baseWS := newForwardTestServer(t)
-	agentA, idA := enrollTestAgent(t, srv, baseWS)
-	agentB, idB := enrollTestAgent(t, srv, baseWS)
-	agentC, idC := enrollTestAgent(t, srv, baseWS)
+	nodeA, idA := enrollTestNode(t, srv, baseWS)
+	nodeB, idB := enrollTestNode(t, srv, baseWS)
+	nodeC, idC := enrollTestNode(t, srv, baseWS)
 	if err := srv.reg.SetForwardPolicy(idA, ForwardPolicyRestricted); err != nil {
 		t.Fatal(err)
 	}
@@ -885,30 +885,30 @@ func TestForwardWildcardGrantAllowsAnyTargetInRange(t *testing.T) {
 	}
 
 	for _, allowed := range []struct {
-		agent  *websocket.Conn
+		node   *websocket.Conn
 		device string
 		port   int
 	}{
-		{agentB, idB, 8080},
-		{agentC, idC, 8000},
-		{agentB, idB, 9000},
+		{nodeB, idB, 8080},
+		{nodeC, idC, 8000},
+		{nodeB, idB, 9000},
 	} {
-		expectForwardRelayed(t, srv, agentA, allowed.agent, allowed.device, fmt.Sprintf("s-%d", allowed.port), allowed.port)
+		expectForwardRelayed(t, srv, nodeA, allowed.node, allowed.device, fmt.Sprintf("s-%d", allowed.port), allowed.port)
 	}
-	expectForwardRefused(t, srv, agentA, idB, "s-below", 7999)
-	expectForwardRefused(t, srv, agentA, idC, "s-above", 9001)
+	expectForwardRefused(t, srv, nodeA, idB, "s-below", 7999)
+	expectForwardRefused(t, srv, nodeA, idC, "s-above", 9001)
 
 	// The out-of-range requests must not have reached either target. These
 	// drains come last because a timed-out read leaves the socket unusable.
-	expectNoAgentMessage(t, agentB, 300*time.Millisecond)
-	expectNoAgentMessage(t, agentC, 300*time.Millisecond)
+	expectNoNodeMessage(t, nodeB, 300*time.Millisecond)
+	expectNoNodeMessage(t, nodeC, 300*time.Millisecond)
 }
 
 // TestDeviceJSONAlwaysIncludesForwardPolicy pins the API contract: the field the
 // console types as required is serialized even when it holds the default.
 func TestDeviceJSONAlwaysIncludesForwardPolicy(t *testing.T) {
 	srv, ts, baseWS := newForwardTestServer(t)
-	_, idA := enrollTestAgent(t, srv, baseWS)
+	_, idA := enrollTestNode(t, srv, baseWS)
 
 	get := func(path string) *http.Response {
 		t.Helper()
@@ -978,8 +978,8 @@ func TestDeviceJSONAlwaysIncludesForwardPolicy(t *testing.T) {
 // the real HTTP router and pins their JSON contract.
 func TestForwardPolicyAndGrantsAPI(t *testing.T) {
 	srv, ts, baseWS := newForwardTestServer(t)
-	_, idA := enrollTestAgent(t, srv, baseWS)
-	_, idB := enrollTestAgent(t, srv, baseWS)
+	_, idA := enrollTestNode(t, srv, baseWS)
+	_, idB := enrollTestNode(t, srv, baseWS)
 
 	call := func(method, path, token, body string) (*http.Response, string) {
 		t.Helper()
@@ -1147,12 +1147,12 @@ func TestScreenRelay(t *testing.T) {
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
 	key := newTestKey(t, srv)
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "screen box",
@@ -1162,7 +1162,7 @@ func TestScreenRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/screen?token=admin-token&device="+key.DeviceID, nil,
@@ -1175,10 +1175,10 @@ func TestScreenRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if relay := readAgentMessage(t, agentWS); relay.Type != protocol.TypeRTCRelay {
+	if relay := readNodeMessage(t, nodeWS); relay.Type != protocol.TypeRTCRelay {
 		t.Fatalf("expected relay switch, got %+v", relay)
 	}
-	start := readAgentMessage(t, agentWS)
+	start := readNodeMessage(t, nodeWS)
 	if start.Type != protocol.TypeScreenStart || start.SessionID == "" {
 		t.Fatalf("unexpected screen start: %+v", start)
 	}
@@ -1212,11 +1212,11 @@ func TestScreenRelay(t *testing.T) {
 	}
 }
 
-func TestAgentConfigEndpoint(t *testing.T) {
+func TestNodeConfigEndpoint(t *testing.T) {
 	srv, err := NewServer(Config{
-		AdminToken:  "admin-token",
-		DataDir:     t.TempDir(),
-		AgentListen: ":18443",
+		AdminToken: "admin-token",
+		DataDir:    t.TempDir(),
+		NodeListen: ":18443",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1225,19 +1225,19 @@ func TestAgentConfigEndpoint(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/api/agent-config")
+	resp, err := http.Get(ts.URL + "/api/node-config")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var cfg struct {
-		AgentWSS string `json:"agentWSS"`
+		NodeWSS string `json:"nodeWSS"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(cfg.AgentWSS, ":18443/ws/agent") {
-		t.Fatalf("unexpected agent endpoint: %s", cfg.AgentWSS)
+	if !strings.HasSuffix(cfg.NodeWSS, ":18443/ws/node") {
+		t.Fatalf("unexpected node endpoint: %s", cfg.NodeWSS)
 	}
 }
 
@@ -1255,12 +1255,12 @@ func TestFileManagerRelay(t *testing.T) {
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
 	key := newTestKey(t, srv)
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "files box",
@@ -1270,7 +1270,7 @@ func TestFileManagerRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/files?token=admin-token&device="+key.DeviceID, nil,
@@ -1283,11 +1283,11 @@ func TestFileManagerRelay(t *testing.T) {
 	if err := browserWS.WriteJSON(protocol.Message{Type: protocol.TypeFileList, Path: "/tmp"}); err != nil {
 		t.Fatal(err)
 	}
-	list := readAgentMessage(t, agentWS)
+	list := readNodeMessage(t, nodeWS)
 	if list.Type != protocol.TypeFileList || list.Path != "/tmp" {
-		t.Fatalf("unexpected file:list forwarded to agent: %+v", list)
+		t.Fatalf("unexpected file:list forwarded to node: %+v", list)
 	}
-	if err := agentWS.WriteJSON(protocol.Message{
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:      protocol.TypeFileListResult,
 		SessionID: list.SessionID,
 		Path:      "/tmp",
@@ -1318,22 +1318,22 @@ func TestFileManagerRejectsUngrantedDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = srv.Close() }()
-	if _, err := srv.reg.Upsert("dev-a", "a", "a", "linux", "amd64", nil); err != nil {
+	if _, err := srv.reg.Upsert("dev-a", "a", "a", "linux", "amd64", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
-	// dev-a is granted to the operator, so it needs a live agent; dev-b is only
+	// dev-a is granted to the operator, so it needs a live node; dev-b is only
 	// ever addressed to prove the authorization gate rejects it first.
 	key := newTestKey(t, srv)
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "scoped box",
@@ -1342,7 +1342,7 @@ func TestFileManagerRejectsUngrantedDevice(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 	grantedID := key.DeviceID
 
 	login := func(username, password string) string {
@@ -1577,7 +1577,7 @@ func TestUpdateUserExpiryPatchAllowsNull(t *testing.T) {
 }
 
 // TestFileManagerRejectsPrivilegedMessageTypes ensures the manager channel is
-// not a generic passthrough to the agent: terminal, tunnel and upload frames
+// not a generic passthrough to the node: terminal, tunnel and upload frames
 // must be refused there even for a fully granted session.
 func TestFileManagerRejectsPrivilegedMessageTypes(t *testing.T) {
 	srv, err := NewServer(Config{
@@ -1593,12 +1593,12 @@ func TestFileManagerRejectsPrivilegedMessageTypes(t *testing.T) {
 	baseWS := "ws" + strings.TrimPrefix(ts.URL, "http")
 
 	key := newTestKey(t, srv)
-	agentWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/agent?token="+key.Token, nil)
+	nodeWS, _, err := websocket.DefaultDialer.Dial(baseWS+"/ws/node?token="+key.Token, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = agentWS.Close() }()
-	if err := agentWS.WriteJSON(protocol.Message{
+	defer func() { _ = nodeWS.Close() }()
+	if err := nodeWS.WriteJSON(protocol.Message{
 		Type:     protocol.TypeHello,
 		DeviceID: key.DeviceID,
 		Name:     "files box",
@@ -1607,7 +1607,7 @@ func TestFileManagerRejectsPrivilegedMessageTypes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitForAgent(t, srv, key.DeviceID)
+	waitForNode(t, srv, key.DeviceID)
 
 	browserWS, _, err := websocket.DefaultDialer.Dial(
 		baseWS+"/ws/files?token=admin-token&device="+key.DeviceID, nil,
@@ -1634,11 +1634,11 @@ func TestFileManagerRejectsPrivilegedMessageTypes(t *testing.T) {
 		}
 	}
 
-	// The agent must never have observed any of the rejected frames.
-	_ = agentWS.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	// The node must never have observed any of the rejected frames.
+	_ = nodeWS.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	var leaked protocol.Message
-	if err := agentWS.ReadJSON(&leaked); err == nil {
-		t.Fatalf("forbidden message reached the agent: %+v", leaked)
+	if err := nodeWS.ReadJSON(&leaked); err == nil {
+		t.Fatalf("forbidden message reached the node: %+v", leaked)
 	}
 }
 
@@ -1688,10 +1688,10 @@ func TestUserDevicePermission(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = srv.Close() }()
-	if _, err := srv.reg.Upsert("dev-a", "a", "a", "linux", "amd64", nil); err != nil {
+	if _, err := srv.reg.Upsert("dev-a", "a", "a", "linux", "amd64", nil, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.reg.Upsert("dev-b", "b", "b", "linux", "amd64", nil); err != nil {
+	if _, err := srv.reg.Upsert("dev-b", "b", "b", "linux", "amd64", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
@@ -1795,16 +1795,16 @@ func TestUserListIncludesEmptyDeviceIDs(t *testing.T) {
 	}
 }
 
-// waitForAgent waits until the relay has registered an agent connection.
+// waitForNode waits until the relay has registered an node connection.
 //
-// A device is marked online by the registry upsert inside handleAgentWS, but
-// the connection is only stored in s.agents a few statements later. A test that
+// A device is marked online by the registry upsert inside handleNodeWS, but
+// the connection is only stored in s.nodes a few statements later. A test that
 // waits on the registry can therefore race ahead and dial a browser endpoint
-// while getAgent still returns nil, which the handler answers with 409
+// while getNode still returns nil, which the handler answers with 409
 // "device offline" and the dialer reports as a bad handshake.
-func waitForAgent(t *testing.T, srv *Server, deviceID string) {
+func waitForNode(t *testing.T, srv *Server, deviceID string) {
 	t.Helper()
-	waitFor(t, func() bool { return srv.getAgent(deviceID) != nil })
+	waitFor(t, func() bool { return srv.getNode(deviceID) != nil })
 }
 
 func waitFor(t *testing.T, fn func() bool) {
@@ -1819,7 +1819,7 @@ func waitFor(t *testing.T, fn func() bool) {
 	t.Fatal("condition not met in time")
 }
 
-func readAgentMessage(t *testing.T, ws *websocket.Conn) protocol.Message {
+func readNodeMessage(t *testing.T, ws *websocket.Conn) protocol.Message {
 	t.Helper()
 	for {
 		var msg protocol.Message

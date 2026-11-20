@@ -14,8 +14,8 @@ import (
 )
 
 // Exercise the same handler selection used by run, not just Server.Handler.
-// The former omitted the agent routes on default single-port deployments.
-func TestPrimaryHandlerAcceptsAgentsOnSingleListener(t *testing.T) {
+// The former omitted the node routes on default single-port deployments.
+func TestPrimaryHandlerAcceptsNodesOnSingleListener(t *testing.T) {
 	for _, tlsEnabled := range []bool{false, true} {
 		name := "HTTP"
 		if tlsEnabled {
@@ -29,7 +29,7 @@ func TestPrimaryHandlerAcceptsAgentsOnSingleListener(t *testing.T) {
 			defer func() { _ = srv.Close() }()
 			handler := primaryHandler(srv, false)
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/api/device-keys", strings.NewReader(`{"name":"test-agent"}`))
+			req := httptest.NewRequest(http.MethodPost, "/api/device-keys", strings.NewReader(`{"name":"test-node"}`))
 			req.Header.Set("Authorization", "Bearer static-admin")
 			handler.ServeHTTP(rec, req)
 			if rec.Code != http.StatusCreated {
@@ -48,29 +48,29 @@ func TestPrimaryHandlerAcceptsAgentsOnSingleListener(t *testing.T) {
 				ts = httptest.NewServer(handler)
 			}
 			defer ts.Close()
-			resp, err := ts.Client().Get(ts.URL + "/api/agent-config")
+			resp, err := ts.Client().Get(ts.URL + "/api/node-config")
 			if err != nil {
 				t.Fatal(err)
 			}
 			var cfg struct {
-				AgentWSS string `json:"agentWSS"`
+				NodeWSS string `json:"nodeWSS"`
 			}
 			err = json.NewDecoder(resp.Body).Decode(&cfg)
 			_ = resp.Body.Close()
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/agent"
-			if cfg.AgentWSS != want {
-				t.Fatalf("discovery=%q, want %q", cfg.AgentWSS, want)
+			want := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/node"
+			if cfg.NodeWSS != want {
+				t.Fatalf("discovery=%q, want %q", cfg.NodeWSS, want)
 			}
 			headers := http.Header{"Authorization": []string{"Bearer " + key.Token}}
-			ws, handshake, err := dialer.Dial(cfg.AgentWSS, headers)
+			ws, handshake, err := dialer.Dial(cfg.NodeWSS, headers)
 			if err != nil {
-				t.Fatalf("agent upgrade: %v (%v)", err, handshake)
+				t.Fatalf("node upgrade: %v (%v)", err, handshake)
 			}
 			defer func() { _ = ws.Close() }()
-			if err := ws.WriteJSON(protocol.Message{Type: protocol.TypeHello, DeviceID: key.DeviceID, Name: "test-agent"}); err != nil {
+			if err := ws.WriteJSON(protocol.Message{Type: protocol.TypeHello, DeviceID: key.DeviceID, Name: "test-node"}); err != nil {
 				t.Fatal(err)
 			}
 			// Verify an authenticated hello registered the device through the
@@ -89,7 +89,7 @@ func TestPrimaryHandlerAcceptsAgentsOnSingleListener(t *testing.T) {
 					break
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("agent did not register: %s", inventory.Body.String())
+					t.Fatalf("node did not register: %s", inventory.Body.String())
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -102,13 +102,13 @@ func TestPrimaryHandlerAcceptsAgentsOnSingleListener(t *testing.T) {
 	}
 }
 
-func TestSeparateListenerKeepsAgentRoutesOffWebPlane(t *testing.T) {
+func TestSeparateListenerKeepsNodeRoutesOffWebPlane(t *testing.T) {
 	srv, err := server.NewServer(server.Config{AdminToken: "static-admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = srv.Close() }()
-	for _, path := range []string{"/ws/agent", "/ws/screen-link"} {
+	for _, path := range []string{"/ws/node", "/ws/screen-link"} {
 		rec := httptest.NewRecorder()
 		primaryHandler(srv, true).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusNotFound {
@@ -116,8 +116,8 @@ func TestSeparateListenerKeepsAgentRoutesOffWebPlane(t *testing.T) {
 		}
 	}
 	link := httptest.NewRecorder()
-	srv.AgentHandler().ServeHTTP(link, httptest.NewRequest(http.MethodGet, "/ws/screen-link", nil))
+	srv.NodeHandler().ServeHTTP(link, httptest.NewRequest(http.MethodGet, "/ws/screen-link", nil))
 	if link.Code != http.StatusUnauthorized {
-		t.Fatalf("separate agent plane missing screen-link: %d", link.Code)
+		t.Fatalf("separate node plane missing screen-link: %d", link.Code)
 	}
 }

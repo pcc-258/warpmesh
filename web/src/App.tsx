@@ -28,7 +28,9 @@ import {
   clearSessionFlag,
   clearToken,
   createDeviceKey,
+  createForwardGrant,
   createUser,
+  deleteForwardGrant,
   deleteInvite,
   deleteUser,
   getAnalytics,
@@ -36,18 +38,26 @@ import {
   listAudit,
   listDeviceKeys,
   listDevices,
+  listForwardGrants,
+  listForwardPolicies,
   listInvites,
   listUsers,
+  listNodeUpdates,
   login,
   logout,
   revokeDeviceKey,
   rotateDeviceKey,
+  setForwardPolicy,
+  startNodeUpdate,
   type AuditEntry,
   type AnalyticsData,
   type ConnectionRecord,
   type Device,
   type DeviceKey,
+  type ForwardGrant,
+  type ForwardPolicyRecord,
   type Invite,
+  type NodeUpdateBuild,
   type UserAccount,
   optionalDate,
   wsUrl,
@@ -102,7 +112,7 @@ function deviceView(kind: DeviceRouteKind, device: Device): View {
 /**
  * Parse a device deep link. The two URL shapes intentionally differ:
  *   path  /devices/<id>/<kind>   (written by openDeviceView)
- *   hash  #/<kind>/<id>          (written by the agent CLI)
+ *   hash  #/<kind>/<id>          (written by the node CLI)
  * Reading one shape with the other's group order silently resolved the wrong
  * device and dropped the operator back on the dashboard.
  */
@@ -365,6 +375,9 @@ function Console({
   const [keys, setKeys] = useState<DeviceKey[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [users, setUsers] = useState<UserAccount[]>([]);
+  const [forwardPolicies, setForwardPolicies] = useState<ForwardPolicyRecord[]>([]);
+  const [forwardGrants, setForwardGrants] = useState<ForwardGrant[]>([]);
+  const [nodeUpdates, setNodeUpdates] = useState<NodeUpdateBuild[]>([]);
   const [canManageUsers, setCanManageUsers] = useState(false);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -437,15 +450,40 @@ function Console({
     }
   }, []);
 
+  const loadForwardAccess = useCallback(async () => {
+    try {
+      const [policies, grants] = await Promise.all([listForwardPolicies(), listForwardGrants()]);
+      setForwardPolicies(policies ?? []);
+      setForwardGrants(grants ?? []);
+    } catch {
+      // Operators can use their granted devices but cannot inspect admin policy.
+    }
+  }, []);
+
+  const loadNodeUpdates = useCallback(async () => {
+    try {
+      setNodeUpdates(await listNodeUpdates());
+    } catch {
+      setNodeUpdates([]);
+    }
+  }, []);
+
+  const refreshInventory = useCallback(async () => {
+    await Promise.all([refresh(), loadForwardAccess(), loadNodeUpdates()]);
+  }, [refresh, loadForwardAccess, loadNodeUpdates]);
+
   useEffect(() => {
     refresh();
     loadKeys();
     loadAudit();
     loadInvites();
     loadUsers();
+    loadForwardAccess();
+    loadNodeUpdates();
     const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
-  }, [refresh, loadKeys, loadAudit, loadInvites, loadUsers]);
+    const updateTimer = setInterval(loadNodeUpdates, 30000);
+    return () => { clearInterval(timer); clearInterval(updateTimer); };
+  }, [refresh, loadKeys, loadAudit, loadInvites, loadUsers, loadForwardAccess, loadNodeUpdates]);
 
   useEffect(() => {
     void loadAnalytics();
@@ -458,7 +496,7 @@ function Console({
     return `Device ID: ${key.deviceId}\nToken: ${key.token}\n\nUse the Add device wizard for guided enrollment.`;
   } });
   const handleRevokeKey = (key: DeviceKey) => setAction({ title: `Revoke key: ${key.name}`, destructive: true, description: "This device will be unable to authenticate on its next connection.", run: async () => { await revokeDeviceKey(key.deviceId); await loadKeys(); } });
-  const handleRotateKey = (key: DeviceKey) => setAction({ title: `Rotate key: ${key.name}`, description: "The old token will stop working. Update the agent with the new token.", run: async () => { const rotated = await rotateDeviceKey(key.deviceId); await loadKeys(); return `New device token:\n${rotated.token}`; } });
+  const handleRotateKey = (key: DeviceKey) => setAction({ title: `Rotate key: ${key.name}`, description: "The old token will stop working. Update the node with the new token.", run: async () => { const rotated = await rotateDeviceKey(key.deviceId); await loadKeys(); return `New device token:\n${rotated.token}`; } });
   const handleCreateInvite = () => setEnrolling(true);
   const handleDeleteInvite = (inv: Invite) => setAction({ title: "Delete invite", destructive: true, description: `Revoke the enrollment invite for ${inv.name}?`, run: async () => { await deleteInvite(inv.code); await loadInvites(); } });
 
@@ -557,7 +595,7 @@ function Console({
             />
           )}
           {page === "devices" && (
-            <DeviceManager devices={devices} canManage={canManageUsers} onChanged={refresh} onAction={setAction} onAdd={() => setEnrolling(true)} onTerminal={onTerminal} onDesktop={onDesktop} onFiles={onFiles} />
+            <DeviceManager devices={devices} nodeUpdates={nodeUpdates} canManage={canManageUsers} onChanged={async () => { await refreshInventory(); await loadNodeUpdates(); }} onAction={setAction} onAdd={() => setEnrolling(true)} onTerminal={onTerminal} onDesktop={onDesktop} onFiles={onFiles} onUpdate={async (device) => startNodeUpdate(device.id)} />
           )}
           {page === "access" && (
             <AccessPage
@@ -565,8 +603,11 @@ function Console({
               invites={invites}
               users={users}
               devices={devices}
+              forwardPolicies={forwardPolicies}
+              forwardGrants={forwardGrants}
               canManageUsers={canManageUsers}
               onUsersChanged={loadUsers}
+              onForwardAccessChanged={loadForwardAccess}
               onAction={setAction}
               onCreate={handleCreateKey}
               onRevoke={handleRevokeKey}
@@ -799,8 +840,11 @@ function AccessPage({
   invites,
   users,
   devices,
+  forwardPolicies,
+  forwardGrants,
   canManageUsers,
   onUsersChanged,
+  onForwardAccessChanged,
   onAction,
   onCreate,
   onRevoke,
@@ -812,8 +856,11 @@ function AccessPage({
   invites: Invite[];
   users: UserAccount[];
   devices: Device[];
+  forwardPolicies: ForwardPolicyRecord[];
+  forwardGrants: ForwardGrant[];
   canManageUsers: boolean;
   onUsersChanged: () => Promise<void>;
+  onForwardAccessChanged: () => Promise<void>;
   onAction: (request: ActionRequest) => void;
   onCreate: () => void;
   onRevoke: (key: DeviceKey) => void;
@@ -885,7 +932,7 @@ function AccessPage({
       <div className="panel-head">
         <div>
           <h3>Device keys</h3>
-          <p>Each agent gets its own credential. Tokens are shown once at creation.</p>
+          <p>Each node gets its own credential. Tokens are shown once at creation.</p>
         </div>
         <button className="primary-btn inline" onClick={onCreate}>
           <ShieldCheck size={15} />
@@ -940,6 +987,15 @@ function AccessPage({
           ))}
         </div>
       )}
+
+      <ForwardAccessManager
+        devices={devices}
+        policies={forwardPolicies}
+        grants={forwardGrants}
+        canManage={canManageUsers}
+        onChanged={onForwardAccessChanged}
+        onAction={onAction}
+      />
 
       {accountNotice && <div className="management-notice" role="status">{accountNotice}<button className="icon-btn" aria-label="Dismiss account notification" onClick={() => setAccountNotice("")}><X size={14} /></button></div>}
       {editingUser && <AccountEditor user={editingUser} devices={devices} onClose={() => setEditingUser(null)} onSaved={async () => { await onUsersChanged(); setAccountNotice("Account saved."); }} />}
@@ -1077,6 +1133,120 @@ function AccessPage({
         </>
       )}
     </section>
+  );
+}
+
+function ForwardAccessManager({
+  devices,
+  policies,
+  grants,
+  canManage,
+  onChanged,
+  onAction,
+}: {
+  devices: Device[];
+  policies: ForwardPolicyRecord[];
+  grants: ForwardGrant[];
+  canManage: boolean;
+  onChanged: () => Promise<void>;
+  onAction: (request: ActionRequest) => void;
+}) {
+  const [source, setSource] = useState("");
+  const [target, setTarget] = useState("*");
+  const [portMin, setPortMin] = useState("22");
+  const [portMax, setPortMax] = useState("22");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!source && devices.length) setSource(devices[0].id);
+  }, [devices, source]);
+
+  if (!canManage) return null;
+
+  const deviceName = (id: string) => id === "*" ? "Any device" : devices.find((device) => device.id === id)?.name || id;
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const min = Number(portMin);
+      const max = Number(portMax);
+      if (!source) throw new Error("Choose a source device.");
+      if (min < 1 || max > 65535 || min > max) throw new Error("Ports must be between 1 and 65535, with min no greater than max.");
+      await createForwardGrant({ sourceDevice: source, targetDevice: target, portMin: min, portMax: max });
+      await onChanged();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "Unable to create link grant.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const togglePolicy = (policy: ForwardPolicyRecord) => onAction({
+    title: `${policy.forwardPolicy === "any" ? "Restrict" : "Allow all"} forwarding for ${policy.name}`,
+    description: policy.forwardPolicy === "any"
+      ? "This device will only reach targets covered by explicit grants."
+      : "This device will be allowed to reach any device and TCP port.",
+    run: async () => {
+      await setForwardPolicy(policy.deviceId, policy.forwardPolicy === "any" ? "restricted" : "any");
+      await onChanged();
+    },
+  });
+  const removeGrant = (grant: ForwardGrant) => onAction({
+    title: "Delete link grant",
+    destructive: true,
+    description: `${deviceName(grant.sourceDevice)} will no longer reach ${deviceName(grant.targetDevice)} on ports ${grant.portMin}-${grant.portMax}.`,
+    run: async () => {
+      await deleteForwardGrant(grant);
+      await onChanged();
+    },
+  });
+
+  return (
+    <div className="forward-access">
+      <div className="panel-head">
+        <div>
+          <h3>Link authorization</h3>
+          <p>Restricted devices can only reach targets and ports covered by an explicit grant.</p>
+        </div>
+        <span className="management-badge">{grants.length} grants</span>
+      </div>
+      <div className="forward-policy-list">
+        {policies.map((policy) => (
+          <div className="forward-policy-row" key={policy.deviceId}>
+            <div>
+              <strong>{policy.name}</strong>
+              <span>{policy.deviceId}</span>
+            </div>
+            <span className={`forward-policy ${policy.forwardPolicy}`}>{policy.forwardPolicy === "any" ? "Any peer" : "Restricted"}</span>
+            <small>{policy.grantCount} grant{policy.grantCount === 1 ? "" : "s"}</small>
+            <button className="secondary-btn" onClick={() => togglePolicy(policy)}>
+              {policy.forwardPolicy === "any" ? "Restrict" : "Allow all"}
+            </button>
+          </div>
+        ))}
+        {!policies.length && <div className="inline-empty">No forwarding policy data available.</div>}
+      </div>
+
+      <form className="forward-grant-form" onSubmit={submit}>
+        <label>Source<select value={source} disabled={busy} onChange={(event) => setSource(event.target.value)}>{devices.map((device) => <option value={device.id} key={device.id}>{device.name}</option>)}</select></label>
+        <label>Target<select value={target} disabled={busy} onChange={(event) => setTarget(event.target.value)}><option value="*">Any device</option>{devices.map((device) => <option value={device.id} key={device.id}>{device.name}</option>)}</select></label>
+        <label>Port min<input type="number" min="1" max="65535" value={portMin} disabled={busy} onChange={(event) => setPortMin(event.target.value)} /></label>
+        <label>Port max<input type="number" min="1" max="65535" value={portMax} disabled={busy} onChange={(event) => setPortMax(event.target.value)} /></label>
+        <button className="primary-btn inline" disabled={busy || !devices.length}>{busy ? "Adding…" : "Add grant"}</button>
+      </form>
+      {error && <div role="alert" className="form-error">{error}</div>}
+      <div className="forward-grant-list">
+        {grants.map((grant) => (
+          <div className="forward-grant-row" key={`${grant.sourceDevice}:${grant.targetDevice}:${grant.portMin}:${grant.portMax}`}>
+            <div><strong>{deviceName(grant.sourceDevice)}</strong><span>to {deviceName(grant.targetDevice)}</span></div>
+            <code>TCP {grant.portMin}{grant.portMax === grant.portMin ? "" : `-${grant.portMax}`}</code>
+            <button className="icon-btn danger" title="Delete grant" onClick={() => removeGrant(grant)}><Trash2 size={14} /></button>
+          </div>
+        ))}
+        {!grants.length && <div className="inline-empty">No explicit link grants. Devices set to “Any peer” do not need one.</div>}
+      </div>
+    </div>
   );
 }
 
@@ -1323,7 +1493,7 @@ function TerminalView({ device, onBack }: { device: Device; onBack: () => void }
         return;
       }
       if (msg.type === "terminal:output" && typeof msg.data === "string") {
-        // The agent can emit welcome output during negotiation. It does not
+        // The node can emit welcome output during negotiation. It does not
         // prove a direct transport and must not cancel its attempt budget.
         receivedOutput = true;
         if (terminalOutputIsLive(directActive, relayActive)) markLive();
@@ -1683,7 +1853,7 @@ function FileManagerView({ device, onBack }: { device: Device; onBack: () => voi
         if (roots.length > 0) {
           await loadDir(roots[0].path);
         } else {
-          setMessage("No allowed file roots configured on the agent.");
+          setMessage("No allowed file roots configured on the node.");
         }
       } catch (err) {
         if (!controller.signal.aborted) setMessage(String(err));

@@ -78,8 +78,8 @@ func (s *Server) handleForwardConnect(sourceID string, msg protocol.Message) {
 		_ = s.sendForwardError(sourceID, msg.SessionID, "invalid forward request")
 		return
 	}
-	source := s.getAgent(sourceID)
-	target := s.getAgent(msg.Target)
+	source := s.getNode(sourceID)
+	target := s.getNode(msg.Target)
 	if source == nil || target == nil {
 		_ = s.sendForwardError(sourceID, msg.SessionID, "target device offline")
 		return
@@ -137,7 +137,7 @@ func (s *Server) getForward(sessionID string) *forwardSession {
 }
 
 func (s *Server) startRelayFallback(msg protocol.Message) {
-	target := s.getAgent(msg.Target)
+	target := s.getNode(msg.Target)
 	if target == nil {
 		s.closeForward(msg.SessionID, "failed")
 		return
@@ -177,8 +177,8 @@ func (s *Server) relayForward(fromID string, msg protocol.Message) {
 	default:
 		return
 	}
-	agent := s.getAgent(toID)
-	if agent == nil {
+	node := s.getNode(toID)
+	if node == nil {
 		s.closeForward(msg.SessionID, "interrupted")
 		return
 	}
@@ -191,7 +191,7 @@ func (s *Server) relayForward(fromID string, msg protocol.Message) {
 			}
 		}
 	}
-	if err := agent.write(msg); err != nil {
+	if err := node.write(msg); err != nil {
 		s.closeForward(msg.SessionID, "interrupted")
 		return
 	}
@@ -205,11 +205,11 @@ func (s *Server) relayForward(fromID string, msg protocol.Message) {
 }
 
 func (s *Server) sendForwardError(deviceID, sessionID, errMsg string) error {
-	agent := s.getAgent(deviceID)
-	if agent == nil {
+	node := s.getNode(deviceID)
+	if node == nil {
 		return nil
 	}
-	return agent.write(protocol.Message{
+	return node.write(protocol.Message{
 		Type:      protocol.TypeForwardError,
 		SessionID: sessionID,
 		Error:     errMsg,
@@ -228,8 +228,8 @@ func (s *Server) closeForward(sessionID, state string) {
 	}
 }
 
-// closeAgentForwards tears down relay sessions when one side goes offline.
-func (s *Server) closeAgentForwards(deviceID string) {
+// closeNodeForwards tears down relay sessions when one side goes offline.
+func (s *Server) closeNodeForwards(deviceID string) {
 	s.sessionsMu.Lock()
 	type closedForward struct {
 		id      string
@@ -252,8 +252,8 @@ func (s *Server) closeAgentForwards(deviceID string) {
 	s.sessionsMu.Unlock()
 	for _, cf := range closed {
 		cf.traffic.Close("interrupted")
-		if agent := s.getAgent(cf.other); agent != nil {
-			_ = agent.write(protocol.Message{Type: protocol.TypeForwardClose, SessionID: cf.id})
+		if node := s.getNode(cf.other); node != nil {
+			_ = node.write(protocol.Message{Type: protocol.TypeForwardClose, SessionID: cf.id})
 		}
 	}
 }

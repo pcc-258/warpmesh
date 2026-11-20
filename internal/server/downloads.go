@@ -7,9 +7,9 @@ import (
 	"strings"
 )
 
-var agentPlatforms = []string{"linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64"}
+var nodePlatforms = []string{"linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64"}
 
-func (s *Server) handleAgentDownloads(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeDownloads(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.authenticate(r); !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
@@ -18,27 +18,27 @@ func (s *Server) handleAgentDownloads(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	platform := strings.TrimPrefix(r.URL.Path, "/api/agent-downloads")
+	platform := strings.TrimPrefix(r.URL.Path, "/api/node-downloads")
 	if platform == "" || platform == "/" {
 		type build struct {
 			Platform  string `json:"platform"`
 			Available bool   `json:"available"`
 		}
-		builds := make([]build, 0, len(agentPlatforms))
-		for _, name := range agentPlatforms {
-			_, ok := s.agentBinary(name)
+		builds := make([]build, 0, len(nodePlatforms))
+		for _, name := range nodePlatforms {
+			_, ok := s.nodeBinary(name)
 			builds = append(builds, build{name, ok})
 		}
 		writeJSON(w, http.StatusOK, builds)
 		return
 	}
 	platform = strings.TrimPrefix(platform, "/")
-	path, ok := s.agentBinary(platform)
+	path, ok := s.nodeBinary(platform)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Agent build is not available for this platform."})
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Node build is not available for this platform."})
 		return
 	}
-	filename := "warpmesh-agent"
+	filename := "warpmesh-node"
 	if strings.HasPrefix(platform, "windows-") {
 		filename += ".exe"
 	}
@@ -48,19 +48,20 @@ func (s *Server) handleAgentDownloads(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
-func (s *Server) agentBinary(platform string) (string, bool) {
-	if s.cfg.AgentDir == "" {
+func (s *Server) nodeBinary(platform string) (string, bool) {
+	dir := s.cfg.NodeDir
+	if dir == "" {
 		return "", false
 	}
-	for _, allowed := range agentPlatforms {
+	for _, allowed := range nodePlatforms {
 		if platform != allowed {
 			continue
 		}
-		name := "warpmesh-agent-" + allowed
+		name := "warpmesh-node-" + allowed
 		if strings.HasPrefix(platform, "windows-") {
 			name += ".exe"
 		}
-		path := filepath.Join(s.cfg.AgentDir, name)
+		path := filepath.Join(dir, name)
 		info, err := os.Stat(path)
 		return path, err == nil && info.Mode().IsRegular()
 	}

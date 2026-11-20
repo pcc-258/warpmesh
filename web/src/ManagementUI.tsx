@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Activity, Download, Monitor, Search, TerminalSquare, X } from "lucide-react";
-import { createInvite, deleteDevice, deleteInvite, listAgentDownloads, optionalDate, setForwardPolicy, updateDevice, updateUser, type Device, type Invite, type UserAccount } from "./api";
+import { createInvite, deleteDevice, deleteInvite, listNodeDownloads, optionalDate, setForwardPolicy, updateDevice, updateUser, type Device, type Invite, type NodeUpdateBuild, type UserAccount } from "./api";
 import { enrollmentCommands, expiryPatch, filterDevices } from "./managementHelpers";
 
 export type ActionRequest = {
@@ -68,9 +68,10 @@ export function ActionDialog({ request, onClose, onSuccess }: { request: ActionR
   </Modal>;
 }
 
-export function DeviceManager({ devices, canManage, onChanged, onAction, onAdd, onTerminal, onDesktop, onFiles }: {
-  devices: Device[]; canManage: boolean; onChanged: () => Promise<void>; onAction: (request: ActionRequest) => void; onAdd: () => void;
+export function DeviceManager({ devices, nodeUpdates, canManage, onChanged, onAction, onAdd, onTerminal, onDesktop, onFiles, onUpdate }: {
+  devices: Device[]; nodeUpdates: NodeUpdateBuild[]; canManage: boolean; onChanged: () => Promise<void>; onAction: (request: ActionRequest) => void; onAdd: () => void;
   onTerminal: (device: Device) => void; onDesktop: (device: Device) => void; onFiles: (device: Device) => void;
+  onUpdate: (device: Device) => Promise<unknown>;
 }) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("all");
@@ -106,6 +107,7 @@ export function DeviceManager({ devices, canManage, onChanged, onAction, onAdd, 
     <button className="secondary-btn" disabled={!device.online || device.capabilities?.desktop === false} title={device.capabilities?.desktopHint} onClick={() => open(device, "desktop")}><Monitor size={15} /> Desktop</button>
     <button className="secondary-btn" disabled={!device.online || device.capabilities?.files === false} onClick={() => open(device, "files")}><Download size={15} /> Files</button>
   </div>;
+  const availableUpdate = (device: Device) => nodeUpdates.find((build) => build.platform === `${device.os}-${device.arch}`);
   return <>
     <div className="management-toolbar">
       <label className="management-search"><Search size={16} /><input aria-label="Search devices" placeholder="Search name, IP, hostname or group" value={query} onChange={(e) => setQuery(e.target.value)} /></label>
@@ -122,14 +124,18 @@ export function DeviceManager({ devices, canManage, onChanged, onAction, onAdd, 
         <div className="management-device-title">{canManage && <input type="checkbox" aria-label={`Select ${device.name}`} checked={selected.includes(device.id)} onChange={(e) => setSelected(e.target.checked ? [...selected, device.id] : selected.filter((id) => id !== device.id))} />}<span className={`status-dot ${device.online ? "online" : "offline"}`} /><button className="management-name" onClick={() => setDetailID(device.id)}>{device.name}</button><span className="management-badge">{device.online ? "Online" : "Offline"}</span></div>
         <p>{device.hostname || device.id} · {device.os}/{device.arch}{device.group ? ` · ${device.group}` : ""}</p>
         <small>{(device.lanIPs ?? []).join(", ") || "No network addresses reported"}</small>
-        {device.online && <p className="management-hint">{!device.capabilities ? "Service status unknown — update the agent for readiness checks." : device.capabilities.desktop ? "VNC reachable · Screen access depends on system permissions" : "Desktop setup required · Terminal and files supported"}</p>}
+        {device.online && <p className="management-hint">{!device.capabilities ? "Service status unknown — update the node for readiness checks." : device.capabilities.desktop ? "VNC reachable · Screen access depends on system permissions" : "Desktop setup required · Terminal and files supported"}</p>}
         {operationButtons(device)}
         <div className="management-actions"><button className="secondary-btn" onClick={() => setDetailID(device.id)}>Details</button>{canManage && <><button className="secondary-btn" onClick={() => edit(device)}>Edit</button><button className="secondary-btn danger" onClick={() => remove(device)}>Remove</button></>}</div>
       </article>)}
     </section>
     {detail && <Modal title={detail.name} onClose={() => setDetailID("")}>
-      <dl className="management-details">{Object.entries({ Status: detail.online ? "Online" : "Offline", Hostname: detail.hostname || "Not reported", System: `${detail.os}/${detail.arch}`, Group: detail.group || "None", "Device ID": detail.id, Addresses: (detail.lanIPs ?? []).join(", ") || "Not reported", "Last seen": new Date(detail.lastSeen).toLocaleString(), Registered: new Date(detail.createdAt).toLocaleString(), Forwarding: detail.forwardPolicy }).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>
-      <h3>Remote access</h3><p>{!detail.online ? "This device is offline. Check that the agent service is running and can reach this server." : detail.capabilities?.desktopHint || "This agent has not reported service readiness. Install the latest agent to enable checks."}</p>
+      <dl className="management-details">{Object.entries({ Status: detail.online ? "Online" : "Offline", Hostname: detail.hostname || "Not reported", System: `${detail.os}/${detail.arch}`, "Node version": detail.version || "Not reported", "Update state": detail.updateState || "idle", "Update target": detail.updateVersion || "None", Group: detail.group || "None", "Device ID": detail.id, Addresses: (detail.lanIPs ?? []).join(", ") || "Not reported", "Last seen": new Date(detail.lastSeen).toLocaleString(), Registered: new Date(detail.createdAt).toLocaleString(), Forwarding: detail.forwardPolicy }).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>
+      {detail.updateError && <div className="form-error" role="alert">{detail.updateError}</div>}
+      {canManage && availableUpdate(detail) && <div className="management-actions">
+        <button className="secondary-btn" disabled={!detail.online || detail.updateState === "downloading" || detail.updateState === "installing" || detail.updateState === "restarting"} onClick={() => { const build = availableUpdate(detail); if (build) onAction({ title: `Update ${detail.name} to ${build.version}`, description: `The node will verify SHA256 ${build.sha256.slice(0, 12)}… before installing.`, run: async () => { setDetailID(""); await onUpdate(detail); await onChanged(); } }); }}>Update node to {availableUpdate(detail)?.version}</button>
+      </div>}
+      <h3>Remote access</h3><p>{!detail.online ? "This device is offline. Check that the node service is running and can reach this server." : detail.capabilities?.desktopHint || "This node has not reported service readiness. Install the latest node package to enable checks."}</p>
       {operationButtons(detail)}
       {canManage && <div className="management-actions"><button className="secondary-btn" onClick={() => edit(detail)}>Edit device</button><button className="secondary-btn" onClick={() => { setDetailID(""); onAction({ title: "Change forwarding access", description: detail.forwardPolicy === "restricted" ? "Allow this device to forward to any device and port?" : "Restrict this device to explicitly granted destinations?", run: async () => { await setForwardPolicy(detail.id, detail.forwardPolicy === "restricted" ? "any" : "restricted"); await onChanged(); } }); }}>Change forwarding access</button></div>}
     </Modal>}
@@ -176,7 +182,7 @@ export function EnrollmentDialog({ devices, onClose, onInvitesChanged }: { devic
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const knownIDs = useRef(new Set(devices.map((d) => d.id)));
-  useEffect(() => { let active = true; listAgentDownloads().then((value) => { if (active) setBuilds(value ?? []); }).catch((failure) => { if (active) setError(String(failure)); }); return () => { active = false; }; }, []);
+  useEffect(() => { let active = true; listNodeDownloads().then((value) => { if (active) setBuilds(value ?? []); }).catch((failure) => { if (active) setError(String(failure)); }); return () => { active = false; }; }, []);
   const added = devices.find((d) => d.online && !knownIDs.current.has(d.id) && d.name === name.trim());
   const ready = builds.find((b) => b.platform === platform)?.available;
   const command = invite ? enrollmentCommands(location.origin, invite.code, name.trim(), platform) : "";
@@ -194,7 +200,7 @@ export function EnrollmentDialog({ devices, onClose, onInvitesChanged }: { devic
     finally { setBusy(false); }
   };
   return <Modal title="Add device" onClose={onClose} busy={busy}>
-    <p>1. Choose a platform. 2. Download the agent. 3. Run the commands on that device.</p>
+    <p>1. Choose a platform. 2. Download the node package. 3. Run the commands on that device.</p>
     <form className="management-form" onSubmit={generate}>
       <label>Device name<input required maxLength={100} value={name} disabled={busy || !!invite} onChange={(e) => setName(e.target.value)} placeholder="Home desktop" /></label>
       <label>System / architecture<select value={platform} onChange={(e) => { setPlatform(e.target.value); setCopied(false); }}><option value="linux-amd64">Linux · Intel / AMD 64-bit</option><option value="linux-arm64">Linux · ARM 64-bit</option><option value="darwin-arm64">macOS · Apple Silicon</option><option value="darwin-amd64">macOS · Intel</option><option value="windows-amd64">Windows · Intel / AMD 64-bit</option></select></label>
@@ -202,11 +208,11 @@ export function EnrollmentDialog({ devices, onClose, onInvitesChanged }: { devic
     </form>
     {invite && <div className="management-form">
       <p>Invite expires {new Date(invite.expiresAt).toLocaleString()}. It can enroll one device.</p>
-      {ready ? <a className="primary-btn inline" href={`/api/agent-downloads/${platform}`} download>Download agent</a> : <div role="status" className="management-hint">This server does not have a downloadable build for this platform yet.</div>}
+      {ready ? <a className="primary-btn inline" href={`/api/node-downloads/${platform}`} download>Download node</a> : <div role="status" className="management-hint">This server does not have a downloadable build for this platform yet.</div>}
       <p>On the target device, open {platform.startsWith("windows") ? "PowerShell" : "a terminal"} in the download folder, then run:</p>
       <textarea aria-label="Enrollment commands" rows={6} readOnly value={command} />
       <button className="secondary-btn" onClick={async () => { try { await navigator.clipboard.writeText(command); setCopied(true); } catch { setError("Clipboard access is unavailable. Select and copy the commands above."); } }}>{copied ? "Copied" : "Copy commands"}</button>
-      <p>Keep the data folder: it stores the device identity. These commands run the agent in the foreground; configure an OS service for unattended startup.</p>
+      <p>Keep the data folder: it stores the device identity. These commands run the node in the foreground; configure an OS service for unattended startup.</p>
       <p>{platform.startsWith("darwin") ? "For desktop access, enable macOS Screen Sharing and check screen access permissions." : platform.startsWith("windows") ? "For desktop access, install and start TightVNC Server." : "For desktop access, use an X11 session with x11vnc, or the WarpMesh desktop container."}</p>
       <div className="management-enrollment-status" role="status"><Activity size={16} />{added ? `${added.name} is online. Open its details to check available services.` : "Waiting for the new device to come online…"}</div>
       <div className="management-actions"><button className="secondary-btn danger" disabled={busy || !!added} onClick={cancelInvite}>Revoke unused invite</button><button className="primary-btn inline" onClick={onClose}>Done</button></div>

@@ -32,12 +32,13 @@ type Config struct {
 	WebFS         fs.FS
 	AdminUser     string
 	AdminPassword string
-	AgentListen   string
+	NodeListen    string
 	KeyTTL        time.Duration
-	AgentDir      string
+	NodeDir       string
+	UpdateService string
 }
 
-type agentConn struct {
+type nodeConn struct {
 	deviceID     string
 	publicIP     string
 	directPort   int
@@ -154,8 +155,8 @@ type Server struct {
 	cfg           Config
 	reg           *Registry
 	upgrader      websocket.Upgrader
-	agentsMu      sync.RWMutex
-	agents        map[string]*agentConn
+	nodesMu       sync.RWMutex
+	nodes         map[string]*nodeConn
 	sessionsMu    sync.RWMutex
 	terms         map[string]*termSession
 	files         map[string]*fileSession
@@ -169,7 +170,7 @@ type Server struct {
 	stop          chan struct{}
 	stopOnce      sync.Once
 	// wsWG tracks every WebSocket handler. Their teardown writes to the registry
-	// (last_seen, agent.offline, connection state) and runs in the handler
+	// (last_seen, node.offline, connection state) and runs in the handler
 	// goroutine, and httptest.Server.Close does not wait for hijacked
 	// connections, so Close must drain them before closing the database.
 	wsWG sync.WaitGroup
@@ -197,7 +198,7 @@ func NewServer(cfg Config) (*Server, error) {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: sameOriginCheck,
 		},
-		agents:        make(map[string]*agentConn),
+		nodes:         make(map[string]*nodeConn),
 		terms:         make(map[string]*termSession),
 		files:         make(map[string]*fileSession),
 		managers:      make(map[string]*managerSession),
@@ -267,13 +268,19 @@ func (s *Server) WebHandler() http.Handler {
 	return s.routes(false)
 }
 
-func (s *Server) routes(includeAgent bool) http.Handler {
+func (s *Server) routes(includeNode bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/logout", s.handleLogout)
 	mux.HandleFunc("/api/devices", s.handleDevices)
-	mux.HandleFunc("/api/devices/", s.handleDeviceByID)
+	mux.HandleFunc("/api/devices/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/update") {
+			s.handleNodeUpdateStart(w, r)
+			return
+		}
+		s.handleDeviceByID(w, r)
+	})
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/analytics", s.handleAnalytics)
 	mux.HandleFunc("/api/device-keys", s.handleDeviceKeys)
@@ -284,32 +291,36 @@ func (s *Server) routes(includeAgent bool) http.Handler {
 	mux.HandleFunc("/api/users", s.handleUsers)
 	mux.HandleFunc("/api/users/", s.handleUserByUsername)
 	mux.HandleFunc("/api/audit", s.handleAudit)
-	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
+	mux.HandleFunc("/api/node-config", s.handleNodeConfig)
 	mux.HandleFunc("/api/ws-ticket", s.handleWSTicket)
-	mux.HandleFunc("/api/agent-downloads", s.handleAgentDownloads)
-	mux.HandleFunc("/api/agent-downloads/", s.handleAgentDownloads)
+	mux.HandleFunc("/api/node-downloads", s.handleNodeDownloads)
+	mux.HandleFunc("/api/node-downloads/", s.handleNodeDownloads)
+	mux.HandleFunc("/api/node-updates", s.handleNodeUpdates)
+	mux.HandleFunc("/api/node-update/download", s.handleNodeUpdateDownload)
 	mux.HandleFunc("/api/forward-policy", s.handleForwardPolicy)
 	mux.HandleFunc("/api/forward-grants", s.handleForwardGrants)
-	if includeAgent {
-		mux.HandleFunc("/ws/agent", s.handleAgentWS)
+	mux.HandleFunc("/api/automation/capabilities", s.handleAutomationCapabilities)
+	mux.HandleFunc("/api/automation/ai-guide", s.handleAutomationAIGuide)
+	if includeNode {
+		mux.HandleFunc("/ws/node", s.handleNodeWS)
 	}
 	mux.HandleFunc("/ws/terminal", s.handleTerminalWS)
 	mux.HandleFunc("/ws/file", s.handleFileWS)
 	mux.HandleFunc("/ws/files", s.handleFilesWS)
 	mux.HandleFunc("/ws/screen", s.handleScreenWS)
-	if includeAgent {
+	if includeNode {
 		mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
 	}
 	mux.HandleFunc("/", s.handleStatic)
 	return s.withRequestLog(mux)
 }
 
-// AgentHandler serves only the agent-facing data plane.
-func (s *Server) AgentHandler() http.Handler {
+// NodeHandler serves only the node-facing data plane.
+func (s *Server) NodeHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
-	mux.HandleFunc("/api/agent-config", s.handleAgentConfig)
-	mux.HandleFunc("/ws/agent", s.handleAgentWS)
+	mux.HandleFunc("/api/node-config", s.handleNodeConfig)
+	mux.HandleFunc("/ws/node", s.handleNodeWS)
 	mux.HandleFunc("/ws/screen-link", s.handleScreenLinkWS)
 	return s.withRequestLog(mux)
 }
@@ -319,7 +330,7 @@ func (s *Server) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
 	// A WebSocket handler only returns once its peer goes away, so close the
 	// live sockets to unblock them. Draining matters because their teardown
-	// writes to the registry (last_seen, agent.offline, connection state), and
+	// writes to the registry (last_seen, node.offline, connection state), and
 	// httptest.Server.Close does not wait for hijacked connections.
 	s.closeWebSockets()
 	s.waitForHandlers(handlerDrainTimeout)
@@ -331,7 +342,7 @@ func (s *Server) Close() error {
 // shutdown forever.
 const handlerDrainTimeout = 5 * time.Second
 
-// closeWebSockets closes every live browser and agent socket.
+// closeWebSockets closes every live browser and node socket.
 func (s *Server) closeWebSockets() {
 	s.sessionsMu.Lock()
 	var conns []*websocket.Conn
@@ -349,11 +360,11 @@ func (s *Server) closeWebSockets() {
 	}
 	s.sessionsMu.Unlock()
 
-	s.agentsMu.RLock()
-	for _, conn := range s.agents {
+	s.nodesMu.RLock()
+	for _, conn := range s.nodes {
 		conns = append(conns, conn.ws)
 	}
-	s.agentsMu.RUnlock()
+	s.nodesMu.RUnlock()
 
 	for _, conn := range conns {
 		_ = conn.Close()
@@ -379,9 +390,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-// handleAgentConfig publishes the agent-plane endpoint so clients do not need
+// handleNodeConfig publishes the node-plane endpoint so nodes do not need
 // to hardcode the relay port.
-func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeConfig(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
 	if h, _, err := net.SplitHostPort(r.Host); err == nil {
 		host = h
@@ -391,10 +402,10 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		scheme = "wss"
 	}
 	// A single-listener deployment advertises the actual request port. A
-	// separate agent listener may be configured as either :port or host:port.
+	// separate node listener may be configured as either :port or host:port.
 	port := ""
-	if s.cfg.AgentListen != "" {
-		_, port, _ = net.SplitHostPort(s.cfg.AgentListen)
+	if listen := s.nodeListen(); listen != "" {
+		_, port, _ = net.SplitHostPort(listen)
 	}
 	if port == "" {
 		_, port, _ = net.SplitHostPort(r.Host)
@@ -407,8 +418,23 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	host = strings.Trim(host, "[]")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"agentWSS": fmt.Sprintf("%s://%s/ws/agent", scheme, net.JoinHostPort(host, port)),
+		"nodeWSS":    fmt.Sprintf("%s://%s/ws/node", scheme, net.JoinHostPort(host, port)),
+		"nodeUpdate": map[string]any{"service": s.updateService()},
 	})
+}
+
+func (s *Server) updateService() string {
+	if validSystemdService(s.cfg.UpdateService) {
+		return s.cfg.UpdateService
+	}
+	return ""
+}
+
+func (s *Server) nodeListen() string {
+	if s.cfg.NodeListen != "" {
+		return s.cfg.NodeListen
+	}
+	return ""
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -536,7 +562,7 @@ func (s *Server) validAdmin(token string) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) == 1
 }
 
-func (s *Server) authorizeAgent(deviceID, token string) bool {
+func (s *Server) authorizeNode(deviceID, token string) bool {
 	return s.reg.ValidateDeviceKey(deviceID, token)
 }
 
@@ -745,43 +771,43 @@ func safeGo(what string, fn func()) {
 	}()
 }
 
-// removeAgent drops the registry entry for a device only if it still points at
+// removeNode drops the registry entry for a device only if it still points at
 // the connection that is shutting down. A reconnect replaces the entry before
 // the old handler unwinds, so an unconditional delete would evict the fresh,
 // healthy connection and mark the device offline.
-func (s *Server) removeAgent(id string, conn *agentConn) bool {
-	s.agentsMu.Lock()
-	current, ok := s.agents[id]
+func (s *Server) removeNode(id string, conn *nodeConn) bool {
+	s.nodesMu.Lock()
+	current, ok := s.nodes[id]
 	if !ok || current != conn {
-		s.agentsMu.Unlock()
+		s.nodesMu.Unlock()
 		return false
 	}
-	delete(s.agents, id)
-	s.agentsMu.Unlock()
+	delete(s.nodes, id)
+	s.nodesMu.Unlock()
 	_ = s.reg.SetOnline(id, false)
 	return true
 }
 
-func (s *Server) getAgent(id string) *agentConn {
-	s.agentsMu.RLock()
-	defer s.agentsMu.RUnlock()
-	return s.agents[id]
+func (s *Server) getNode(id string) *nodeConn {
+	s.nodesMu.RLock()
+	defer s.nodesMu.RUnlock()
+	return s.nodes[id]
 }
 
-// agentOnlineSyncInterval throttles the last_seen write. Terminal and desktop
+// nodeOnlineSyncInterval throttles the last_seen write. Terminal and desktop
 // output produce thousands of inbound frames per second; writing on every one
 // would serialize the whole control plane behind SQLite.
-const agentOnlineSyncInterval = 10 * time.Second
+const nodeOnlineSyncInterval = 10 * time.Second
 
-// touchAgent refreshes a device's liveness without issuing a database write on
+// touchNode refreshes a device's liveness without issuing a database write on
 // every inbound frame.
-func (s *Server) touchAgent(id string) {
-	conn := s.getAgent(id)
+func (s *Server) touchNode(id string) {
+	conn := s.getNode(id)
 	if conn == nil {
 		return
 	}
 	conn.lastSyncMu.Lock()
-	due := time.Since(conn.lastSync) >= agentOnlineSyncInterval
+	due := time.Since(conn.lastSync) >= nodeOnlineSyncInterval
 	if due {
 		conn.lastSync = time.Now()
 	}
@@ -794,10 +820,10 @@ func (s *Server) touchAgent(id string) {
 	}
 }
 
-func (a *agentConn) write(v any) error {
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-	return a.ws.WriteJSON(v)
+func (n *nodeConn) write(v any) error {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	return n.ws.WriteJSON(v)
 }
 
 func newSessionToken() (string, error) {
@@ -809,7 +835,7 @@ func newSessionToken() (string, error) {
 }
 
 // sameOriginCheck accepts browser WebSockets from the page's own host and
-// non-browser clients (agents and tests) that send no Origin header.
+// non-browser clients (nodes and tests) that send no Origin header.
 func sameOriginCheck(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {

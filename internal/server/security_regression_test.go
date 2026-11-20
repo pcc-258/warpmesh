@@ -103,7 +103,7 @@ func TestStatsRespectsDeviceAndAuditVisibility(t *testing.T) {
 	}
 	defer func() { _ = srv.Close() }()
 	for _, id := range []string{"visible", "hidden"} {
-		if _, err := srv.reg.Upsert(id, id, id, "linux", "amd64", nil); err != nil {
+		if _, err := srv.reg.Upsert(id, id, id, "linux", "amd64", nil, ""); err != nil {
 			t.Fatal(err)
 		}
 		if err := srv.reg.SetGroup(id, id+"-group"); err != nil {
@@ -159,32 +159,32 @@ func TestStatsRespectsDeviceAndAuditVisibility(t *testing.T) {
 	}
 }
 
-func TestAgentConfigAdvertisesEffectiveEndpoint(t *testing.T) {
+func TestNodeConfigAdvertisesEffectiveEndpoint(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		requestURL string
 		listen     string
 		want       string
 	}{
-		{"plain request port", "http://example.test:8080/api/agent-config", "", "ws://example.test:8080/ws/agent"},
-		{"plain standard port", "http://example.test/api/agent-config", "", "ws://example.test:80/ws/agent"},
-		{"TLS primary port", "https://example.test:8443/api/agent-config", ":8443", "wss://example.test:8443/ws/agent"},
-		{"TLS standard port", "https://example.test/api/agent-config", "", "wss://example.test:443/ws/agent"},
-		{"separate full address", "https://example.test/api/agent-config", "0.0.0.0:18443", "wss://example.test:18443/ws/agent"},
-		{"IPv6", "https://[::1]:8443/api/agent-config", "[::]:18443", "wss://[::1]:18443/ws/agent"},
+		{"plain request port", "http://example.test:8080/api/node-config", "", "ws://example.test:8080/ws/node"},
+		{"plain standard port", "http://example.test/api/node-config", "", "ws://example.test:80/ws/node"},
+		{"TLS primary port", "https://example.test:8443/api/node-config", ":8443", "wss://example.test:8443/ws/node"},
+		{"TLS standard port", "https://example.test/api/node-config", "", "wss://example.test:443/ws/node"},
+		{"separate full address", "https://example.test/api/node-config", "0.0.0.0:18443", "wss://example.test:18443/ws/node"},
+		{"IPv6", "https://[::1]:8443/api/node-config", "[::]:18443", "wss://[::1]:18443/ws/node"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := &Server{cfg: Config{AgentListen: tc.listen}}
+			srv := &Server{cfg: Config{NodeListen: tc.listen}}
 			rec := httptest.NewRecorder()
-			srv.handleAgentConfig(rec, httptest.NewRequest(http.MethodGet, tc.requestURL, nil))
+			srv.handleNodeConfig(rec, httptest.NewRequest(http.MethodGet, tc.requestURL, nil))
 			var cfg struct {
-				AgentWSS string `json:"agentWSS"`
+				NodeWSS string `json:"nodeWSS"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
 				t.Fatal(err)
 			}
-			if cfg.AgentWSS != tc.want {
-				t.Fatalf("endpoint = %q, want %q", cfg.AgentWSS, tc.want)
+			if cfg.NodeWSS != tc.want {
+				t.Fatalf("endpoint = %q, want %q", cfg.NodeWSS, tc.want)
 			}
 		})
 	}

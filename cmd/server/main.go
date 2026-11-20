@@ -24,7 +24,7 @@ import (
 )
 
 // HTTP timeouts. ReadHeaderTimeout is the slowloris guard; the other values are
-// deliberately generous because the console and the agent plane both carry
+// deliberately generous because the console and the node plane both carry
 // long-lived WebSocket connections alongside ordinary requests.
 const (
 	readHeaderTimeout = 15 * time.Second
@@ -52,10 +52,14 @@ func run() error {
 	adminPassword := flag.String("admin-password", os.Getenv("DEVICE_RELAY_ADMIN_PASSWORD"), "initial console password; required")
 	keyTTL := flag.String("key-ttl", envOr("DEVICE_RELAY_KEY_TTL", "8760h"), "device key lifetime")
 	dataDir := flag.String("data-dir", envOr("DEVICE_RELAY_DATA_DIR", "./data"), "directory for persisted state")
-	agentDir := flag.String("agent-dir", envOr("DEVICE_RELAY_AGENT_DIR", "/opt/warpmesh/agents"), "directory containing downloadable agent binaries")
+	nodeDir := flag.String("node-dir", envOrChain("WARPMESH_NODE_DIR", "DEVICE_RELAY_NODE_DIR", "/opt/warpmesh/nodes"), "directory containing downloadable node binaries")
+	updateService := flag.String("update-service", envOr("WARPMESH_NODE_UPDATE_SERVICE", ""), "systemd service name included in Node update tasks")
 	tlsCert := flag.String("tls-cert", os.Getenv("DEVICE_RELAY_TLS_CERT"), "optional TLS certificate file")
 	tlsKey := flag.String("tls-key", os.Getenv("DEVICE_RELAY_TLS_KEY"), "optional TLS private key file")
 	flag.Parse()
+	if *updateService != "" && !server.ValidUpdateService(*updateService) {
+		return errors.New("update-service must be a plain systemd unit name")
+	}
 	parsedTTL, err := time.ParseDuration(*keyTTL)
 	if err != nil {
 		return fmt.Errorf("parse key-ttl: %w", err)
@@ -78,12 +82,12 @@ func run() error {
 	if *altHTTPSListen != "" && !tlsEnabled {
 		return errors.New("alt-https-listen requires -domain or -tls-cert/-tls-key")
 	}
-	agentListen := *listen
+	nodeListen := *listen
 	if tlsEnabled {
-		agentListen = *httpsListen
+		nodeListen = *httpsListen
 	}
 	if *altHTTPSListen != "" {
-		agentListen = *altHTTPSListen
+		nodeListen = *altHTTPSListen
 	}
 
 	web, err := fs.Sub(relay.WebFS, "web/dist")
@@ -96,15 +100,16 @@ func run() error {
 		WebFS:         web,
 		AdminUser:     *adminUser,
 		AdminPassword: *adminPassword,
-		AgentListen:   agentListen,
+		NodeListen:    nodeListen,
 		KeyTTL:        parsedTTL,
-		AgentDir:      *agentDir,
+		NodeDir:       *nodeDir,
+		UpdateService: *updateService,
 	})
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}
 	handler := primaryHandler(srv, *altHTTPSListen != "")
-	agentHandler := srv.AgentHandler()
+	nodeHandler := srv.NodeHandler()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -114,7 +119,7 @@ func run() error {
 	var starters []tlsServer
 	switch {
 	case *domain != "":
-		starters, servers, err = runCertMagic(ctx, handler, agentHandler, *domain, *acmeEmail, *dataDir, *httpsListen, *altHTTPSListen, *httpListen)
+		starters, servers, err = runCertMagic(ctx, handler, nodeHandler, *domain, *acmeEmail, *dataDir, *httpsListen, *altHTTPSListen, *httpListen)
 		if err != nil {
 			return err
 		}
@@ -132,10 +137,10 @@ func run() error {
 		starters = append(starters, tlsServer{server: webSrv, tls: true})
 		servers = append(servers, webSrv)
 		if *altHTTPSListen != "" {
-			agentSrv := newHTTPServer(*altHTTPSListen, agentHandler, *domain)
-			agentSrv.TLSConfig = tlsConfig
-			starters = append(starters, tlsServer{server: agentSrv, tls: true})
-			servers = append(servers, agentSrv)
+			nodeSrv := newHTTPServer(*altHTTPSListen, nodeHandler, *domain)
+			nodeSrv.TLSConfig = tlsConfig
+			starters = append(starters, tlsServer{server: nodeSrv, tls: true})
+			servers = append(servers, nodeSrv)
 		}
 		log.Printf("warpmesh web plane serving HTTPS on %s", *httpsListen)
 	default:
@@ -151,10 +156,10 @@ func run() error {
 	return nil
 }
 
-// primaryHandler includes the agent routes unless a dedicated TLS listener
-// serves them. Both plain HTTP and single-port HTTPS must accept agents.
-func primaryHandler(srv *server.Server, separateAgentPlane bool) http.Handler {
-	if separateAgentPlane {
+// primaryHandler includes the node routes unless a dedicated TLS listener
+// serves them. Both plain HTTP and single-port HTTPS must accept nodes.
+func primaryHandler(srv *server.Server, separateNodePlane bool) http.Handler {
+	if separateNodePlane {
 		return srv.WebHandler()
 	}
 	return srv.Handler()
@@ -257,7 +262,7 @@ func registrableDomain(host string) string {
 // serveAll runs every listener until the context is cancelled or one of them
 // fails for a reason other than an orderly shutdown. Each entry carries its own
 // mode because the ACME challenge listener must stay plain HTTP while the web
-// and agent planes terminate TLS.
+// and node planes terminate TLS.
 func serveAll(ctx context.Context, servers []tlsServer) {
 	errCh := make(chan error, len(servers))
 	for _, entry := range servers {
@@ -300,7 +305,7 @@ func shutdownServers(servers []*http.Server) {
 	log.Printf("warpmesh stopped")
 }
 
-func runCertMagic(ctx context.Context, webHandler, agentHandler http.Handler, domain, acmeEmail, dataDir, httpsListen, altHTTPSListen, httpListen string) ([]tlsServer, []*http.Server, error) {
+func runCertMagic(ctx context.Context, webHandler, nodeHandler http.Handler, domain, acmeEmail, dataDir, httpsListen, altHTTPSListen, httpListen string) ([]tlsServer, []*http.Server, error) {
 	certDir := filepath.Join(dataDir, "certs")
 	magic := certmagic.NewDefault()
 	magic.Storage = &certmagic.FileStorage{Path: certDir}
@@ -321,11 +326,11 @@ func runCertMagic(ctx context.Context, webHandler, agentHandler http.Handler, do
 	starters := []tlsServer{{server: webSrv, tls: true}}
 	all := []*http.Server{webSrv}
 	if altHTTPSListen != "" {
-		agentSrv := newHTTPServer(altHTTPSListen, agentHandler, domain)
-		agentSrv.TLSConfig = tlsConfig
-		starters = append(starters, tlsServer{server: agentSrv, tls: true})
-		all = append(all, agentSrv)
-		log.Printf("warpmesh agent plane serving HTTPS on %s for %s", altHTTPSListen, domain)
+		nodeSrv := newHTTPServer(altHTTPSListen, nodeHandler, domain)
+		nodeSrv.TLSConfig = tlsConfig
+		starters = append(starters, tlsServer{server: nodeSrv, tls: true})
+		all = append(all, nodeSrv)
+		log.Printf("warpmesh node plane serving HTTPS on %s for %s", altHTTPSListen, domain)
 	}
 
 	// The ACME challenge and redirect listener must stay plain HTTP: ACME
@@ -349,6 +354,18 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envOrChain(keys ...string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	for _, key := range keys[:len(keys)-1] {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return keys[len(keys)-1]
 }
 
 func displayHost(listen string) string {

@@ -23,7 +23,7 @@ cd ..
 
 - server 以 systemd `warpmesh.service` 跑在 VPS 上，环境变量在 `/etc/warpmesh.env`，数据目录 `/var/lib/warpmesh`。
 - 新 server 二进制替换 `/opt/warpmesh/warpmesh-server` 后执行 `systemctl restart warpmesh.service`，不能只提交不部署。
-- 本地设备容器由 Podman 管理：`warpmesh-linux` 是普通 agent，`warpmesh-desktop` 是桌面容器；重建后必须确认设备在 `/api/devices` 中恢复 online。
+- 本地设备容器由 Podman 管理：`warpmesh-linux` 是普通 Node，`warpmesh-desktop` 是桌面容器；重建后必须确认设备在 `/api/devices` 中恢复 online。
 - 涉及远程桌面的改动，修复后要实际打开一个设备的 remote desktop 页面验证，不能只确认容器 running。
 
 ## 容易踩坑的契约

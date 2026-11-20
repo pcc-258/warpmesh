@@ -23,7 +23,7 @@ func TestManagementDeviceContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.reg.Upsert(key.DeviceID, "workstation", "host", "linux", "amd64", nil)
+	_, err = s.reg.Upsert(key.DeviceID, "workstation", "host", "linux", "amd64", nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestManagementDeviceContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, ok := fields["capabilities"]; !ok {
-			t.Fatal("capabilities must be explicitly null for agents without status")
+			t.Fatal("capabilities must be explicitly null for nodes without status")
 		}
 		d, _ := s.reg.Get(key.DeviceID)
 		if body == `{"name":"renamed"}` && d.Group != "Home" {
@@ -68,20 +68,20 @@ func TestManagementDeviceContract(t *testing.T) {
 	}
 }
 
-func TestCapabilitySnapshotAndLegacyAgents(t *testing.T) {
+func TestCapabilitySnapshotAndNodesWithoutStatus(t *testing.T) {
 	s, err := NewServer(Config{AdminToken: "test-token"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.reg.Close(); close(s.stop) }()
-	s.agents["device"] = &agentConn{}
-	s.routeAgentMessage("device", protocol.Message{Type: protocol.TypeStatus, Capabilities: &protocol.DeviceCapabilities{Terminal: true, Files: true, Desktop: false, DesktopHint: "Set up VNC"}})
+	s.nodes["device"] = &nodeConn{}
+	s.routeNodeMessage("device", protocol.Message{Type: protocol.TypeStatus, Capabilities: &protocol.DeviceCapabilities{Terminal: true, Files: true, Desktop: false, DesktopHint: "Set up VNC"}})
 	d := Device{ID: "device", Online: true}
 	s.attachCapabilities(&d)
 	if d.Capabilities == nil || !d.Capabilities.Terminal || d.Capabilities.Desktop {
 		t.Fatalf("unexpected capabilities: %+v", d.Capabilities)
 	}
-	s.routeAgentMessage("device", protocol.Message{Type: protocol.TypeStatus, Capabilities: &protocol.DeviceCapabilities{Terminal: true, Files: true, Desktop: true}})
+	s.routeNodeMessage("device", protocol.Message{Type: protocol.TypeStatus, Capabilities: &protocol.DeviceCapabilities{Terminal: true, Files: true, Desktop: true}})
 	if d.Capabilities.Desktop {
 		t.Fatal("snapshot changed after later report")
 	}
@@ -89,19 +89,19 @@ func TestCapabilitySnapshotAndLegacyAgents(t *testing.T) {
 	if !d.Capabilities.Desktop {
 		t.Fatal("new capability report was not applied")
 	}
-	legacy := Device{ID: "legacy"}
-	s.attachCapabilities(&legacy)
-	if legacy.Capabilities != nil {
-		t.Fatal("must not invent capabilities for legacy agent")
+	withoutStatus := Device{ID: "without-status"}
+	s.attachCapabilities(&withoutStatus)
+	if withoutStatus.Capabilities != nil {
+		t.Fatal("must not invent capabilities for a node without status")
 	}
 }
 
-func TestAgentDownloadsAuthorizationAndPaths(t *testing.T) {
+func TestNodeDownloadsAuthorizationAndPaths(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "warpmesh-agent-linux-amd64"), []byte("test-binary"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "warpmesh-node-linux-amd64"), []byte("test-binary"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewServer(Config{AdminToken: "test-token", AgentDir: dir})
+	s, err := NewServer(Config{AdminToken: "test-token", NodeDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,9 +110,9 @@ func TestAgentDownloadsAuthorizationAndPaths(t *testing.T) {
 		path, token string
 		status      int
 	}{
-		{"/api/agent-downloads", "", 401}, {"/api/agent-downloads/linux-amd64", "", 401},
-		{"/api/agent-downloads", "test-token", 200}, {"/api/agent-downloads/linux-amd64", "test-token", 200},
-		{"/api/agent-downloads/darwin-arm64", "test-token", 404}, {"/api/agent-downloads/not-a-platform", "test-token", 404},
+		{"/api/node-downloads", "", 401}, {"/api/node-downloads/linux-amd64", "", 401},
+		{"/api/node-downloads", "test-token", 200}, {"/api/node-downloads/linux-amd64", "test-token", 200},
+		{"/api/node-downloads/darwin-arm64", "test-token", 404}, {"/api/node-downloads/not-a-platform", "test-token", 404},
 	} {
 		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
 		req.Header.Set("Authorization", "Bearer "+tc.token)
@@ -121,7 +121,7 @@ func TestAgentDownloadsAuthorizationAndPaths(t *testing.T) {
 		if out.Code != tc.status {
 			t.Fatalf("%s: want %d got %d", tc.path, tc.status, out.Code)
 		}
-		if tc.path == "/api/agent-downloads/linux-amd64" && tc.status == 200 && (out.Body.String() != "test-binary" || out.Header().Get("Content-Disposition") == "") {
+		if tc.path == "/api/node-downloads/linux-amd64" && tc.status == 200 && (out.Body.String() != "test-binary" || out.Header().Get("Content-Disposition") == "") {
 			t.Fatal("download body or attachment header missing")
 		}
 	}
@@ -160,13 +160,13 @@ func TestAccountEditProtectsLastAdminAndClearsExpiry(t *testing.T) {
 	}
 }
 
-func TestDeviceRenameAndGroupSurviveAgentReconnect(t *testing.T) {
+func TestDeviceRenameAndGroupSurviveNodeReconnect(t *testing.T) {
 	reg, err := NewRegistry("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = reg.Close() }()
-	if _, err := reg.Upsert("device", "agent-name", "old-host", "linux", "amd64", nil); err != nil {
+	if _, err := reg.Upsert("device", "node-name", "old-host", "linux", "amd64", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.Rename("device", "Managed name"); err != nil {
@@ -175,7 +175,7 @@ func TestDeviceRenameAndGroupSurviveAgentReconnect(t *testing.T) {
 	if err := reg.SetGroup("device", "Home"); err != nil {
 		t.Fatal(err)
 	}
-	device, err := reg.Upsert("device", "agent-name", "new-host", "linux", "amd64", []string{"10.0.0.3"})
+	device, err := reg.Upsert("device", "node-name", "new-host", "linux", "amd64", []string{"10.0.0.3"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

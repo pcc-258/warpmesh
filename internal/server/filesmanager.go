@@ -7,7 +7,7 @@ import (
 )
 
 // managerAllowedTypes is the set of message types the file manager console may
-// send to an agent. Everything else is rejected, so a compromised or curious
+// send to an node. Everything else is rejected, so a compromised or curious
 // console session cannot reach the terminal, tunnel or upload paths through
 // the manager channel.
 var managerAllowedTypes = map[string]bool{
@@ -25,8 +25,8 @@ func (s *Server) handleFilesWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := r.URL.Query().Get("device")
-	agent := s.getAgent(deviceID)
-	if agent == nil {
+	node := s.getNode(deviceID)
+	if node == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "device offline"})
 		return
 	}
@@ -72,7 +72,7 @@ func (s *Server) handleFilesWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		msg.SessionID = sessionID
-		if err := agent.write(msg); err != nil {
+		if err := node.write(msg); err != nil {
 			return
 		}
 	}

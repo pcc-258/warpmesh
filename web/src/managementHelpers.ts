@@ -24,7 +24,7 @@ export function quoteArgument(value: string, windows = false): string {
 export function enrollmentCommands(origin: string, code: string, name: string, platform: string) {
   const windows = platform.startsWith("windows");
   const quote = (value: string) => quoteArgument(value, windows);
-  const binary = windows ? "warpmesh-agent.exe" : "warpmesh-agent";
+  const binary = windows ? "warpmesh-node.exe" : "warpmesh-node";
   // Binary download uses the signed-in browser, not a cookie-less curl process.
   const enroll = `.\\${binary} enroll -server ${quote(origin)} -code ${quote(code)} -name ${quote(name)} -data-dir .\\warpmesh-data`;
   if (windows) return `${enroll}\n.\\${binary} -server ${quote(origin)} -data-dir .\\warpmesh-data`;
